@@ -449,8 +449,55 @@ async fn e2e_full_hardening_paranoid() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Config builder tests
+// E2E: Cover traffic heartbeat
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn e2e_heartbeat_does_not_corrupt_data() {
+    let port = free_port().await;
+    let addr = format!("127.0.0.1:{port}");
+
+    let server_config = ServerConfig::generate()
+        .with_padding(PaddingStrategy::PadToMax);
+    let bridge_cert = server_config.bridge_cert();
+    let listener = Obfs4Listener::bind(&addr, server_config).await.unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        // Server reads data (heartbeats produce empty payloads, silently discarded)
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).await.unwrap();
+        // Send heartbeats back too
+        stream.send_heartbeat().await.unwrap();
+        stream.send_heartbeat().await.unwrap();
+        // Then send real data
+        stream.write_all(&buf).await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stream.shutdown().await.unwrap();
+    });
+
+    let client_config = ClientConfig::from_bridge_cert(&bridge_cert)
+        .unwrap()
+        .with_padding(PaddingStrategy::PadToMax);
+    let mut stream = Obfs4Stream::connect(&addr, client_config).await.unwrap();
+
+    // Client sends heartbeats before real data
+    stream.send_heartbeat().await.unwrap();
+    stream.send_heartbeat().await.unwrap();
+    stream.send_heartbeat().await.unwrap();
+
+    // Then send real data
+    stream.write_all(b"world").await.unwrap();
+    stream.flush().await.unwrap();
+
+    // Read response (heartbeats from server should be silently skipped)
+    let mut response = [0u8; 5];
+    stream.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"world");
+
+    server_handle.await.unwrap();
+}
 
 #[test]
 fn client_config_defaults() {

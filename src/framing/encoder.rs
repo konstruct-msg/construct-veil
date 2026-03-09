@@ -158,6 +158,17 @@ impl FrameEncoder {
         self.encode_frame_padded(pkt_type, payload, pad_len, &mut rand::rngs::OsRng, dst)
     }
 
+    /// Encode a cover-traffic heartbeat frame (empty payload with padding).
+    ///
+    /// The receiver's decoder will see a `Payload(vec![])` which the
+    /// transport layer silently discards. Use this to keep idle connections
+    /// active and generate noise that hinders traffic analysis.
+    pub fn encode_heartbeat(&mut self, dst: &mut BytesMut) -> Result<()> {
+        let mut rng = rand::rngs::OsRng;
+        let pad_len = self.compute_pad_len(0, &mut rng);
+        self.encode_frame_padded(PacketType::Payload, &[], pad_len, &mut rng, dst)
+    }
+
     /// Core frame encoder: builds the secretbox with random-filled padding.
     fn encode_frame_padded(
         &mut self,

@@ -56,4 +56,7 @@ pub const SERVER_MAX_PAD: usize = MAX_HANDSHAKE_LENGTH - SERVER_HANDSHAKE_LEN; /
 /// Result of a completed handshake — session keys ready for framing.
 pub(crate) struct HandshakeResult {
     pub session_keys: SessionKeys,
+    /// Trailing bytes received after the handshake MAC (e.g. inline PRNG seed frame).
+    /// Empty if no excess data was buffered.
+    pub trailing: Vec<u8>,
 }

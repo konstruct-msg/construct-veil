@@ -35,6 +35,18 @@ use crate::{
     replay_filter::ReplayFilter,
 };
 
+/// Convert a 24-byte PRNG seed into the 32-byte seed required by SmallRng.
+/// Uses the first 24 bytes and pads with a simple derivation.
+fn prng_seed_to_rng_seed(seed: &[u8; 24]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..24].copy_from_slice(seed);
+    // Derive remaining 8 bytes via XOR folding
+    for i in 0..8 {
+        out[24 + i] = seed[i] ^ seed[8 + i] ^ seed[16 + i];
+    }
+    out
+}
+
 // ── Client config ────────────────────────────────────────────────────────────
 
 /// Configuration for the obfs4 client.
@@ -283,6 +295,31 @@ impl Obfs4Stream {
         .map_err(|_| crate::Error::HandshakeTimeout)??;
         let keys = result.session_keys;
 
+        let mut decoder = FrameDecoder::new(
+            &keys.s2c_key,
+            &keys.s2c_nonce_prefix,
+            &keys.s2c_siphash_key,
+            &keys.s2c_siphash_iv,
+        );
+
+        // Feed any trailing bytes from the handshake buffer into the decoder.
+        // This handles inline frames (like PRNG seed) sent by the server
+        // immediately after the handshake response.
+        let mut iat_rng = SmallRng::from_entropy();
+        if !result.trailing.is_empty() {
+            decoder.feed(&result.trailing);
+            loop {
+                match decoder.decode_frame() {
+                    Ok(Some(DecodedFrame::PrngSeed(seed))) => {
+                        iat_rng = SmallRng::from_seed(prng_seed_to_rng_seed(&seed));
+                    }
+                    Ok(Some(DecodedFrame::Payload(_))) => {}
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
         Ok(Obfs4Stream {
             inner: tcp,
             encoder: FrameEncoder::new(
@@ -291,20 +328,38 @@ impl Obfs4Stream {
                 &keys.c2s_siphash_key,
                 &keys.c2s_siphash_iv,
             ).with_padding(padding),
-            decoder: FrameDecoder::new(
-                &keys.s2c_key,
-                &keys.s2c_nonce_prefix,
-                &keys.s2c_siphash_key,
-                &keys.s2c_siphash_iv,
-            ),
+            decoder,
             read_buf: BytesMut::new(),
             write_buf: BytesMut::new(),
             iat_mode,
             max_iat_delay,
             iat_chunks: VecDeque::new(),
             iat_sleep: None,
-            iat_rng: SmallRng::from_entropy(),
+            iat_rng,
         })
+    }
+    /// Send a cover-traffic heartbeat frame.
+    ///
+    /// Emits an empty payload frame (with padding if configured) that the
+    /// receiver silently discards. Use this periodically on idle connections
+    /// to mimic HTTP/2 PING frames and make traffic analysis harder.
+    ///
+    /// With `PaddingStrategy::PadToMax`, the heartbeat is indistinguishable
+    /// from a max-sized data frame on the wire.
+    pub async fn send_heartbeat(&mut self) -> std::io::Result<()>
+    where
+        Self: Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+        // Encode a heartbeat directly bypassing the AsyncWrite impl
+        // which skips empty payloads.
+        let mut framed = BytesMut::new();
+        let me = Pin::new(self).project();
+        me.encoder.encode_heartbeat(&mut framed)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let inner = me.inner.get_mut();
+        inner.write_all(&framed).await?;
+        inner.flush().await
     }
 }
 
@@ -343,8 +398,9 @@ impl AsyncRead for Obfs4Stream {
                             Ok(Some(DecodedFrame::Payload(payload))) => {
                                 this.read_buf.extend_from_slice(&payload);
                             }
-                            Ok(Some(DecodedFrame::PrngSeed(_seed))) => {
-                                // TODO: update protocol polymorphism PRNG
+                            Ok(Some(DecodedFrame::PrngSeed(seed))) => {
+                                // Protocol polymorphism: reseed IAT RNG
+                                *this.iat_rng = SmallRng::from_seed(prng_seed_to_rng_seed(&seed));
                                 continue;
                             }
                             Ok(None) => break,
@@ -506,7 +562,7 @@ impl Obfs4Listener {
         .map_err(|_| crate::Error::HandshakeTimeout)??;
         let keys = result.session_keys;
 
-        let stream = Obfs4Stream {
+        let mut stream = Obfs4Stream {
             inner: tcp,
             encoder: FrameEncoder::new(
                 &keys.s2c_key,
@@ -528,6 +584,20 @@ impl Obfs4Listener {
             iat_sleep: None,
             iat_rng: SmallRng::from_entropy(),
         };
+
+        // Protocol polymorphism: send a PRNG seed inline frame so each
+        // connection gets a unique statistical profile.
+        let mut seed = [0u8; 24];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+        let mut seed_frame = BytesMut::new();
+        stream.encoder.encode_prng_seed(&seed, &mut seed_frame)?;
+        {
+            use tokio::io::AsyncWriteExt;
+            stream.inner.write_all(&seed_frame).await?;
+            stream.inner.flush().await?;
+        }
+        // Apply seed to this side's encoder for padding modulation
+        stream.iat_rng = SmallRng::from_seed(prng_seed_to_rng_seed(&seed));
 
         Ok((stream, addr))
     }

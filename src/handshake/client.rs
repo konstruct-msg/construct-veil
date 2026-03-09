@@ -163,7 +163,17 @@ where
     // 9. Derive session keys from KEY_SEED
     let session_keys = SessionKeys::derive(&ntor_result.key_seed)?;
 
-    Ok((stream, HandshakeResult { session_keys }))
+    // 10. Return any trailing bytes that arrived after the handshake MAC.
+    //     This can include inline frames (e.g. PRNG seed) sent by the server
+    //     immediately after the handshake response.
+    let consumed = mac_start + MAC_LEN;
+    let trailing = if resp_len > consumed {
+        resp_buf[consumed..resp_len].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    Ok((stream, HandshakeResult { session_keys, trailing }))
 }
 
 /// Compute HMAC-SHA256-128 (truncated to 16 bytes).

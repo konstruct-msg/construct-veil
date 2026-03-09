@@ -13,10 +13,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use rand::Rng;
 
-/// Maximum IAT delay units (each unit = 100 µs → max = 10 ms).
-/// Matches Go `maxIATDelay = 100`.
-const MAX_IAT_UNITS: u64 = 100;
-
 /// Maximum IAT delay (10 milliseconds).
 pub const MAX_IAT_DELAY: Duration = Duration::from_millis(10);
 
