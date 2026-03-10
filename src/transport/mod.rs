@@ -303,12 +303,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Obfs4Stream<S> {
         let padding = config.padding;
         let max_iat_delay = config.max_iat_delay;
         let timeout = config.handshake_timeout;
-        let (stream, result) = tokio::time::timeout(timeout, client_handshake(
-            stream,
-            &config.server_pubkey,
-            &config.node_id,
-            &mut rand::rngs::OsRng,
-        ))
+        let (stream, result) = tokio::time::timeout(
+            timeout,
+            client_handshake(
+                stream,
+                &config.server_pubkey,
+                &config.node_id,
+                &mut rand::rngs::OsRng,
+            ),
+        )
         .await
         .map_err(|_| crate::Error::HandshakeTimeout)??;
         let keys = result.session_keys;
@@ -345,7 +348,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Obfs4Stream<S> {
                 &keys.c2s_nonce_prefix,
                 &keys.c2s_siphash_key,
                 &keys.c2s_siphash_iv,
-            ).with_padding(padding),
+            )
+            .with_padding(padding),
             decoder,
             read_buf: BytesMut::new(),
             write_buf: BytesMut::new(),
@@ -373,7 +377,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Obfs4Stream<S> {
         // which skips empty payloads.
         let mut framed = BytesMut::new();
         let me = Pin::new(self).project();
-        me.encoder.encode_heartbeat(&mut framed)
+        me.encoder
+            .encode_heartbeat(&mut framed)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         let inner = me.inner.get_mut();
         inner.write_all(&framed).await?;
@@ -509,7 +514,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Obfs4Stream<S> {
                         this.iat_chunks.pop_front();
                         // Schedule delay before the next chunk.
                         if !this.iat_chunks.is_empty() {
-                            let delay: Duration = sample_delay_with_max(this.iat_rng, *this.max_iat_delay);
+                            let delay: Duration =
+                                sample_delay_with_max(this.iat_rng, *this.max_iat_delay);
                             *this.iat_sleep = Some(Box::pin(tokio::time::sleep(delay)));
                         }
                     }
@@ -563,6 +569,31 @@ impl Obfs4Listener {
         })
     }
 
+    /// Create from an already-bound `TcpListener`.
+    ///
+    /// Useful when the caller needs to bind the socket itself (e.g. to set
+    /// socket options or share the listener with other code).
+    pub fn from_listener(listener: TcpListener, config: ServerConfig) -> Self {
+        Obfs4Listener {
+            inner: listener,
+            config,
+            replay_filter: Arc::new(Mutex::new(ReplayFilter::new())),
+        }
+    }
+
+    /// Accept the next incoming TCP connection **without** the obfs4 handshake.
+    ///
+    /// Use this when you need to wrap the TCP stream in another layer (e.g. TLS)
+    /// before calling [`accept_stream`](Self::accept_stream):
+    /// ```rust,ignore
+    /// let (tcp, addr) = listener.accept_tcp().await?;
+    /// let tls = tls_acceptor.accept(tcp).await?;
+    /// let ice = listener.accept_stream(tls).await?;
+    /// ```
+    pub async fn accept_tcp(&self) -> Result<(TcpStream, std::net::SocketAddr)> {
+        Ok(self.inner.accept().await?)
+    }
+
     /// Accept the next incoming obfs4 connection over TCP.
     ///
     /// Performs TCP accept + obfs4 server handshake. Replayed handshakes
@@ -586,12 +617,15 @@ impl Obfs4Listener {
         stream: S,
     ) -> Result<Obfs4Stream<S>> {
         let timeout = self.config.handshake_timeout;
-        let (stream, result) = tokio::time::timeout(timeout, server_handshake(
-            stream,
-            &self.config.keypair,
-            &mut rand::rngs::OsRng,
-            &self.replay_filter,
-        ))
+        let (stream, result) = tokio::time::timeout(
+            timeout,
+            server_handshake(
+                stream,
+                &self.config.keypair,
+                &mut rand::rngs::OsRng,
+                &self.replay_filter,
+            ),
+        )
         .await
         .map_err(|_| crate::Error::HandshakeTimeout)??;
         let keys = result.session_keys;
@@ -603,7 +637,8 @@ impl Obfs4Listener {
                 &keys.s2c_nonce_prefix,
                 &keys.s2c_siphash_key,
                 &keys.s2c_siphash_iv,
-            ).with_padding(self.config.padding),
+            )
+            .with_padding(self.config.padding),
             decoder: FrameDecoder::new(
                 &keys.c2s_key,
                 &keys.c2s_nonce_prefix,
@@ -624,11 +659,15 @@ impl Obfs4Listener {
         let mut seed = [0u8; 24];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
         let mut seed_frame = BytesMut::new();
-        ice_stream.encoder.encode_prng_seed(&seed, &mut seed_frame)?;
+        ice_stream
+            .encoder
+            .encode_prng_seed(&seed, &mut seed_frame)?;
         {
-            use tokio::io::AsyncWriteExt;
             use std::pin::Pin;
-            Pin::new(&mut ice_stream.inner).write_all(&seed_frame).await?;
+            use tokio::io::AsyncWriteExt;
+            Pin::new(&mut ice_stream.inner)
+                .write_all(&seed_frame)
+                .await?;
             Pin::new(&mut ice_stream.inner).flush().await?;
         }
         ice_stream.iat_rng = SmallRng::from_seed(prng_seed_to_rng_seed(&seed));

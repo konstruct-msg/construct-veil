@@ -173,7 +173,13 @@ where
         Vec::new()
     };
 
-    Ok((stream, HandshakeResult { session_keys, trailing }))
+    Ok((
+        stream,
+        HandshakeResult {
+            session_keys,
+            trailing,
+        },
+    ))
 }
 
 /// Compute HMAC-SHA256-128 (truncated to 16 bytes).

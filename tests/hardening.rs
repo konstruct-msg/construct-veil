@@ -8,7 +8,9 @@
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
-use construct_ice::{ClientConfig, IatMode, Obfs4Listener, Obfs4Stream, PaddingStrategy, ServerConfig};
+use construct_ice::{
+    ClientConfig, IatMode, Obfs4Listener, Obfs4Stream, PaddingStrategy, ServerConfig,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -31,10 +33,10 @@ mod framing {
 
     fn test_keys() -> ([u8; 32], [u8; 16], [u8; 16], [u8; 8]) {
         (
-            [0xAA; 32],  // key
-            [0xBB; 16],  // nonce_prefix
-            [0xCC; 16],  // siphash_key
-            [0xDD; 8],   // siphash_iv
+            [0xAA; 32], // key
+            [0xBB; 16], // nonce_prefix
+            [0xCC; 16], // siphash_key
+            [0xDD; 8],  // siphash_iv
         )
     }
 
@@ -77,15 +79,17 @@ mod framing {
         // Encode several different-sized payloads
         let payloads: &[&[u8]] = &[b"a", b"hello world", &[0x42; 100], &[0xFF; 1000]];
         for payload in payloads {
-            let mut enc = FrameEncoder::new(&key, &np, &sk, &si)
-                .with_padding(PaddingStrategy::PadToMax);
+            let mut enc =
+                FrameEncoder::new(&key, &np, &sk, &si).with_padding(PaddingStrategy::PadToMax);
             let mut dst = BytesMut::new();
             enc.encode(payload, &mut dst).unwrap();
             // With PadToMax, every frame should be MAX_FRAME_LENGTH + HEADER = 1448 + 2 = 1450
             assert_eq!(
-                dst.len(), 1450,
+                dst.len(),
+                1450,
                 "PadToMax frame should be 1450 bytes on wire, got {} for payload len {}",
-                dst.len(), payload.len()
+                dst.len(),
+                payload.len()
             );
 
             // Decode and verify payload
@@ -134,8 +138,8 @@ mod framing {
         // Verify that padding bytes are random, not zeros.
         // We encode with PadToMax and check the raw ciphertext is not trivially patterned.
         let (key, np, sk, si) = test_keys();
-        let mut enc = FrameEncoder::new(&key, &np, &sk, &si)
-            .with_padding(PaddingStrategy::PadToMax);
+        let mut enc =
+            FrameEncoder::new(&key, &np, &sk, &si).with_padding(PaddingStrategy::PadToMax);
         let payload = b"x";
         let mut dst = BytesMut::new();
         enc.encode(payload, &mut dst).unwrap();
@@ -186,9 +190,9 @@ mod framing {
 // ─────────────────────────────────────────────────────────────────────────────
 
 mod iat {
-    use construct_ice::iat::{sample_delay_with_max, MAX_IAT_DELAY};
-    use rand::rngs::SmallRng;
+    use construct_ice::iat::{MAX_IAT_DELAY, sample_delay_with_max};
     use rand::SeedableRng;
+    use rand::rngs::SmallRng;
     use std::time::Duration;
 
     #[test]
@@ -232,8 +236,14 @@ mod iat {
 
         // P(u² < 100/500) = P(u < sqrt(0.2)) ≈ 0.447 → ~45% under 100ms
         // Both buckets should be well-populated
-        assert!(under_100ms > 1000, "expected many delays under 100ms, got {under_100ms}");
-        assert!(over_100ms > 1000, "expected many delays over 100ms, got {over_100ms}");
+        assert!(
+            under_100ms > 1000,
+            "expected many delays under 100ms, got {under_100ms}"
+        );
+        assert!(
+            over_100ms > 1000,
+            "expected many delays over 100ms, got {over_100ms}"
+        );
     }
 
     #[test]
@@ -253,8 +263,7 @@ async fn e2e_pad_to_max_round_trip() {
     let port = free_port().await;
     let addr = format!("127.0.0.1:{port}");
 
-    let server_config = ServerConfig::generate()
-        .with_padding(PaddingStrategy::PadToMax);
+    let server_config = ServerConfig::generate().with_padding(PaddingStrategy::PadToMax);
     let bridge_cert = server_config.bridge_cert();
     let listener = Obfs4Listener::bind(&addr, server_config).await.unwrap();
 
@@ -289,8 +298,8 @@ async fn e2e_random_padding_round_trip() {
     let port = free_port().await;
     let addr = format!("127.0.0.1:{port}");
 
-    let server_config = ServerConfig::generate()
-        .with_padding(PaddingStrategy::Random { max_pad: 300 });
+    let server_config =
+        ServerConfig::generate().with_padding(PaddingStrategy::Random { max_pad: 300 });
     let bridge_cert = server_config.bridge_cert();
     let listener = Obfs4Listener::bind(&addr, server_config).await.unwrap();
 
@@ -402,7 +411,10 @@ async fn handshake_timeout_triggers() {
         "error should mention timeout, got: {err:?}"
     );
     // Should have timed out around 500ms, not waited forever
-    assert!(elapsed < Duration::from_secs(5), "took too long: {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "took too long: {elapsed:?}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -457,8 +469,7 @@ async fn e2e_heartbeat_does_not_corrupt_data() {
     let port = free_port().await;
     let addr = format!("127.0.0.1:{port}");
 
-    let server_config = ServerConfig::generate()
-        .with_padding(PaddingStrategy::PadToMax);
+    let server_config = ServerConfig::generate().with_padding(PaddingStrategy::PadToMax);
     let bridge_cert = server_config.bridge_cert();
     let listener = Obfs4Listener::bind(&addr, server_config).await.unwrap();
 
@@ -529,7 +540,10 @@ fn config_builder_chain() {
         .with_max_iat_delay(Duration::from_millis(200));
 
     assert_eq!(config.iat_mode, IatMode::Paranoid);
-    assert!(matches!(config.padding, PaddingStrategy::Random { max_pad: 500 }));
+    assert!(matches!(
+        config.padding,
+        PaddingStrategy::Random { max_pad: 500 }
+    ));
     assert_eq!(config.max_iat_delay, Duration::from_millis(200));
 }
 

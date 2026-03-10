@@ -175,7 +175,13 @@ where
     stream.write_all(&response).await?;
     stream.flush().await?;
 
-    Ok((stream, HandshakeResult { session_keys, trailing: Vec::new() }))
+    Ok((
+        stream,
+        HandshakeResult {
+            session_keys,
+            trailing: Vec::new(),
+        },
+    ))
 }
 
 /// Compute HMAC-SHA256-128 (truncated to 16 bytes).

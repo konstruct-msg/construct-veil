@@ -1,6 +1,6 @@
 [package]
 name = "construct-ice"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "ICE (Intrusion Countermeasures Electronics) — traffic obfuscation transport for Construct messenger"
 license = "MIT"

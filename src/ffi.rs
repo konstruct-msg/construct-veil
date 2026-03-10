@@ -56,19 +56,26 @@ static PROXY: Mutex<Option<ProxyHandle>> = Mutex::new(None);
 /// `port_out`    — output parameter: local TCP port the proxy listens on.
 ///
 /// Returns 0 on success, -1 on failure.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn ice_proxy_start(
     bridge_line: *const c_char,
     relay_addr: *const c_char,
     port_out: *mut u16,
 ) -> i32 {
     let bridge_line = unsafe {
-        match bridge_line.as_ref().and_then(|p| CStr::from_ptr(p).to_str().ok()) {
+        match bridge_line
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+        {
             Some(s) => s.to_owned(),
             None => return -1,
         }
     };
     let relay_addr = unsafe {
-        match relay_addr.as_ref().and_then(|p| CStr::from_ptr(p).to_str().ok()) {
+        match relay_addr
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+        {
             Some(s) => s.to_owned(),
             None => return -1,
         }
@@ -81,14 +88,18 @@ pub extern "C" fn ice_proxy_start(
 
     let rt = get_runtime();
     let result: Result<u16, ()> = rt.block_on(async {
-        let mut guard = PROXY.lock().map_err(|_| ())?;
-        if guard.is_some() {
-            return Err(()); // already running
+        // Check if already running without holding the lock across await
+        {
+            let guard = PROXY.lock().map_err(|_| ())?;
+            if guard.is_some() {
+                return Err(()); // already running
+            }
         }
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|_| ())?;
         let port = listener.local_addr().map_err(|_| ())?.port();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         rt.spawn(proxy_loop(listener, relay_addr, config, shutdown_rx));
+        let mut guard = PROXY.lock().map_err(|_| ())?;
         *guard = Some(ProxyHandle { port, shutdown_tx });
         Ok(port)
     });

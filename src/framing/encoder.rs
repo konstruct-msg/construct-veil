@@ -15,8 +15,8 @@ use crypto_secretbox::{
 use rand::{Rng, RngCore};
 
 use super::{
-    FRAME_HEADER_LEN, MAX_FRAME_LENGTH, MAX_FRAME_PAYLOAD, PacketType,
-    SECRETBOX_NONCE_LEN, SECRETBOX_TAG_LEN, length_dist::LengthObfuscator,
+    FRAME_HEADER_LEN, MAX_FRAME_LENGTH, MAX_FRAME_PAYLOAD, PacketType, SECRETBOX_NONCE_LEN,
+    SECRETBOX_TAG_LEN, length_dist::LengthObfuscator,
 };
 use crate::{Error, Result};
 
@@ -24,9 +24,10 @@ use crate::{Error, Result};
 ///
 /// Padding breaks the correlation between application payload size and
 /// wire frame size, making traffic analysis significantly harder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaddingStrategy {
     /// No padding — frame size = payload + overhead. Matches obfs4 spec default.
+    #[default]
     None,
     /// Pad each frame to the maximum frame size (1448B secretbox).
     /// Maximum obfuscation: all frames are the same size on the wire.
@@ -37,12 +38,6 @@ pub enum PaddingStrategy {
         /// Maximum padding bytes to add (uniformly chosen from `[0, max_pad]`).
         max_pad: usize,
     },
-}
-
-impl Default for PaddingStrategy {
-    fn default() -> Self {
-        PaddingStrategy::None
-    }
 }
 
 /// Encodes plaintext application data into obfs4 frames.
