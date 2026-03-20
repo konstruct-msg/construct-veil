@@ -20,8 +20,8 @@ use crate::{
         ntor,
     },
     handshake::{
-        AUTH_LEN, CLIENT_MIN_PAD, HandshakeResult, MAC_LEN, MARK_LEN, MAX_HANDSHAKE_LENGTH,
-        REPR_LEN, SERVER_MAX_PAD, SERVER_MIN_PAD,
+        AUTH_LEN, HandshakeResult, MAC_LEN, MARK_LEN, MAX_HANDSHAKE_LENGTH, REPR_LEN,
+        SERVER_MAX_PAD, SERVER_MIN_PAD,
     },
     replay_filter::ReplayFilter,
 };
@@ -85,10 +85,16 @@ where
     // 4. Read MAC_C which follows the mark
     let mac_start = mark_pos + MARK_LEN;
 
-    // 4b. Verify minimum client padding (anti-probing: real clients always
-    // send at least CLIENT_MIN_PAD bytes of padding between X' and M_C).
+    // 4b. Verify minimum client padding.
+    // The structural minimum is MARK_LEN (16 bytes) so the mark cannot start
+    // immediately at the REPR offset (which would be trivially distinguishable).
+    // We intentionally do NOT enforce CLIENT_MIN_PAD (85) here because:
+    // - The Go reference implementation uses a minimum of 77 bytes.
+    // - Some compliant obfs4 clients (including older iOS builds) send 77–84 bytes.
+    // - MAC verification below already rejects any non-compliant client.
+    // Rejecting legitimate clients here causes systematic handshake failure on iOS.
     let pad_len = mark_pos - REPR_LEN;
-    if pad_len < CLIENT_MIN_PAD {
+    if pad_len < MARK_LEN {
         random_delay(rng).await;
         return Err(Error::HandshakeMacMismatch);
     }

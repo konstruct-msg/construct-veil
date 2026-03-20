@@ -129,19 +129,29 @@ pub extern "C" fn ice_proxy_start(
 }
 
 #[unsafe(no_mangle)]
-/// Stop the running proxy. Returns 0 on success, -1 if not running.
+/// Stop all running proxies (plain and TLS-wrapped). Returns 0 if at least one
+/// was stopped, -1 if neither was running.
 pub extern "C" fn ice_proxy_stop() -> i32 {
-    let mut guard = match PROXY.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
-    match guard.take() {
-        Some(handle) => {
-            let _ = handle.shutdown_tx.send(());
-            0
-        }
-        None => -1,
+    let mut stopped = false;
+
+    if let Ok(mut guard) = PROXY.lock()
+        && let Some(handle) = guard.take()
+    {
+        let _ = handle.shutdown_tx.send(());
+        stopped = true;
     }
+
+    // Also stop the TLS proxy if it is running — prevents stale handles that
+    // would cause ice_proxy_start_tls to return -1 on the next call.
+    #[cfg(feature = "tls")]
+    if let Ok(mut guard) = PROXY_TLS.lock()
+        && let Some(handle) = guard.take()
+    {
+        let _ = handle.shutdown_tx.send(());
+        stopped = true;
+    }
+
+    if stopped { 0 } else { -1 }
 }
 
 #[unsafe(no_mangle)]
@@ -186,9 +196,17 @@ async fn proxy_loop(
 }
 
 async fn handle_connection(mut local: TcpStream, relay_addr: String, config: ClientConfig) {
-    match Obfs4Stream::connect(&relay_addr, config).await {
-        Ok(mut remote) => {
-            let _ = copy_bidirectional(&mut local, &mut remote).await;
+    match tokio::net::TcpStream::connect(&relay_addr).await {
+        Ok(tcp) => {
+            let _ = tcp.set_nodelay(true);
+            match Obfs4Stream::client_handshake(tcp, config).await {
+                Ok(mut remote) => {
+                    let _ = copy_bidirectional(&mut local, &mut remote).await;
+                }
+                Err(e) => {
+                    eprintln!("ice: obfs4 handshake failed: {e}");
+                }
+            }
         }
         Err(e) => {
             eprintln!("ice: relay connect failed: {e}");
@@ -330,41 +348,58 @@ async fn handle_connection_tls(
     use tokio::net::TcpStream as TokioTcp;
     use tokio_native_tls::TlsConnector;
 
-    // 1. TCP connect to relay
-    let tcp = match TokioTcp::connect(&relay_addr).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("ice-tls: tcp connect failed: {e}");
-            return;
-        }
-    };
+    // Attempt the obfs4-over-TLS connection up to 2 times before giving up.
+    // The server may momentarily reject a handshake (e.g. during restart or
+    // due to clock-skew on epoch boundary); a single retry avoids false
+    // "always relay" fallbacks on iOS.
+    for attempt in 0u8..2 {
+        // 1. TCP connect to relay
+        let tcp = match TokioTcp::connect(&relay_addr).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("ice-tls: tcp connect failed (attempt {attempt}): {e}");
+                break; // TCP failure is unlikely to be transient — stop retrying
+            }
+        };
 
-    // 2. TLS handshake — uses platform native TLS (SecureTransport on iOS/macOS).
-    //    Certificate is verified against the system CA store (Let's Encrypt).
-    //    No custom ALPN or certificate pinning required per spec.
-    let native_connector = match NativeTlsConnector::new() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("ice-tls: TLS connector build failed: {e}");
-            return;
-        }
-    };
-    let connector = TlsConnector::from(native_connector);
-    let tls_stream = match connector.connect(&tls_server_name, tcp).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("ice-tls: TLS handshake failed: {e}");
-            return;
-        }
-    };
+        // Disable Nagle's algorithm so the obfs4 client request is sent
+        // immediately without waiting for a full MSS — critical on iOS cellular
+        // where Nagle can add ~200 ms of artificial latency.
+        let _ = tcp.set_nodelay(true);
 
-    // 3. obfs4 handshake over the TLS stream, then bidirectional proxy
-    match Obfs4Stream::client_handshake_stream(tls_stream, config).await {
-        Ok(mut remote) => {
-            let _ = copy_bidirectional(&mut local, &mut remote).await;
-        }
-        Err(e) => {
-            eprintln!("ice-tls: obfs4 handshake failed: {e}");
+        // 2. TLS handshake — uses platform native TLS (SecureTransport on iOS/macOS).
+        //    Certificate is verified against the system CA store (Let's Encrypt).
+        //    No custom ALPN or certificate pinning required per spec.
+        let native_connector = match NativeTlsConnector::new() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("ice-tls: TLS connector build failed: {e}");
+                break;
+            }
+        };
+        let connector = TlsConnector::from(native_connector);
+        let tls_stream = match connector.connect(&tls_server_name, tcp).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("ice-tls: TLS handshake failed (attempt {attempt}): {e}");
+                break; // TLS failure is not transient
+            }
+        };
+
+        // 3. obfs4 handshake over the TLS stream, then bidirectional proxy
+        match Obfs4Stream::client_handshake_stream(tls_stream, config.clone()).await {
+            Ok(mut remote) => {
+                let _ = copy_bidirectional(&mut local, &mut remote).await;
+                return; // Success — done
+            }
+            Err(e) => {
+                eprintln!("ice-tls: obfs4 handshake failed (attempt {attempt}): {e}");
+                if attempt == 0 {
+                    // Brief pause before retry to avoid hammering the server
+                    // during epoch-boundary MAC window (~1 second is sufficient).
+                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                }
+            }
         }
     }
 }
