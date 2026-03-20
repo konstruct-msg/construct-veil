@@ -20,7 +20,7 @@ use tokio::{io, net::TcpStream, time::timeout};
 /// Result of [`crate::transport::Obfs4Listener::accept_obfs4_or_proxy`].
 pub enum MixedAccept {
     /// A real obfs4 client connection.
-    Obfs4(super::Obfs4Stream<TcpStream>),
+    Obfs4(Box<super::Obfs4Stream<TcpStream>>),
     /// A cover-looking connection that is being proxied to the upstream.
     ///
     /// Await the handle to observe any proxying errors.

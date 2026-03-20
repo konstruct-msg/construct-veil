@@ -627,12 +627,12 @@ impl Obfs4Listener {
             }
             Ok(cover::CoverDecision::TryObfs4) => {
                 let stream = self.accept_stream(tcp).await?;
-                Ok((cover::MixedAccept::Obfs4(stream), addr))
+                Ok((cover::MixedAccept::Obfs4(Box::new(stream)), addr))
             }
             // If peeking fails, fall back to obfs4 behavior (don't leak errors to probers).
             Err(_) => {
                 let stream = self.accept_stream(tcp).await?;
-                Ok((cover::MixedAccept::Obfs4(stream), addr))
+                Ok((cover::MixedAccept::Obfs4(Box::new(stream)), addr))
             }
         }
     }
