@@ -1,43 +1,56 @@
-//! tonic / hyper integration for `Obfs4Stream`.
+//! tonic / hyper интеграция для `Obfs4Stream`.
 //!
-//! Enabled by the `tonic-transport` feature flag.
+//! Включается feature-флагом `tonic-transport` (добавляет tonic, hyper, tower).
 //!
-//! ## Usage
+//! ## Использование — из коробки
 //!
-//! ```rust,ignore
+//! [`Obfs4Channel::channel()`] возвращает готовый `tonic::transport::Channel`,
+//! который можно сразу передать в любой tonic-клиент:
+//!
+//! ```rust,no_run
+//! use construct_ice::{ClientConfig, transport::tonic_compat::Obfs4Channel};
+//!
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = ClientConfig::from_bridge_cert("base64_cert_here")?;
+//! let channel = Obfs4Channel::channel("https://relay.example.com:9443", config).await?;
+//! // let client = MyServiceClient::new(channel);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Расширенная настройка Endpoint
+//!
+//! ```rust,no_run
 //! use construct_ice::{ClientConfig, transport::tonic_compat::Obfs4Channel};
 //! use tonic::transport::Endpoint;
+//! use std::time::Duration;
 //!
-//! let config = ClientConfig::from_bridge_cert("base64_cert")?;
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = ClientConfig::from_bridge_cert("base64_cert_here")?;
 //! let channel = Endpoint::from_static("https://relay.example.com:9443")
+//!     .timeout(Duration::from_secs(10))
 //!     .connect_with_connector(Obfs4Channel::new(config))
 //!     .await?;
-//!
-//! // let client = MyServiceClient::new(channel);
+//! # Ok(())
+//! # }
 //! ```
 //!
-//! ## Architecture
+//! ## Стек соединения
 //!
 //! ```text
-//! tonic / gRPC
-//!   └─ Endpoint::connect_with_connector(Obfs4Channel)
-//!        └─ tower::Service<Uri> (Obfs4Channel)
-//!             └─ TCP connect + obfs4 handshake
-//!                  └─ HyperObfs4Io  (implements hyper::rt::Read + Write)
+//! tonic (gRPC / HTTP2)
+//!   └─ tonic::transport::Channel
+//!        └─ Obfs4Channel  (tower::Service<Uri>)
+//!             └─ TCP connect + obfs4 Ntor handshake
+//!                  └─ HyperObfs4Io  (hyper::rt::Read + Write)
 //!                       └─ Obfs4Stream<TcpStream>
 //! ```
-//!
-//! `HyperObfs4Io` is a thin adapter between tokio's `AsyncRead`/`AsyncWrite`
-//! and hyper 1.x's `hyper::rt::Read`/`hyper::rt::Write` traits.  It does not
-//! copy data; all I/O is forwarded through a `Pin<&mut Obfs4Stream<TcpStream>>`.
-//! The single `unsafe` block is required by `hyper::rt::ReadBufCursor::advance`,
-//! which is marked unsafe to prevent callers from claiming more filled bytes
-//! than were actually written; here we advance exactly by the count returned
-//! by tokio's `ReadBuf::filled().len()`.
 
-// `hyper::rt::ReadBufCursor::advance` is inherently unsafe (it marks uninitialised
-// memory as initialised).  We use it correctly here — advance is called with
-// exactly the number of bytes written into the slice by tokio's `poll_read`.
+// `hyper::rt::ReadBufCursor::advance` is inherently unsafe — it marks uninitialised
+// memory as initialised. We use it correctly: advance is called with exactly the
+// byte count written by tokio's poll_read into the same slice.
 #![allow(unsafe_code)]
 
 use std::{
@@ -50,27 +63,26 @@ use std::{
 use http::Uri;
 use hyper::rt::{Read, ReadBufCursor, Write};
 use tokio::net::TcpStream;
+use tonic::transport::{Channel, Endpoint};
 use tower::Service;
 
 use crate::{ClientConfig, Obfs4Stream};
 
 // ── HyperObfs4Io ─────────────────────────────────────────────────────────────
 
-/// Adapts [`Obfs4Stream<TcpStream>`] to the `hyper::rt::Read` + `hyper::rt::Write`
-/// traits required by hyper 1.x connections.
+/// Адаптер `Obfs4Stream<TcpStream>` → `hyper::rt::Read + Write`.
 ///
-/// This is the type returned by [`Obfs4Channel`]'s `Service::call`.  You
-/// normally do not construct it directly — tonic / hyper receive it through the
-/// service response.
+/// Тип ответа [`Obfs4Channel`] в `Service::call`. Обычно вы не создаёте
+/// его напрямую — его получает tonic/hyper через сервис.
 pub struct HyperObfs4Io(Obfs4Stream<TcpStream>);
 
 impl HyperObfs4Io {
-    /// Wrap an already-connected stream.
+    /// Обернуть уже подключённый стрим.
     pub fn new(stream: Obfs4Stream<TcpStream>) -> Self {
         Self(stream)
     }
 
-    /// Unwrap the inner stream.
+    /// Извлечь внутренний стрим.
     pub fn into_inner(self) -> Obfs4Stream<TcpStream> {
         self.0
     }
@@ -84,10 +96,8 @@ impl Read for HyperObfs4Io {
     ) -> Poll<io::Result<()>> {
         use tokio::io::{AsyncRead, ReadBuf};
 
-        // SAFETY: We only advance the cursor by `n`, which is exactly the
-        // number of bytes that tokio's `poll_read` placed into `slice`.
-        // The slice starts uninitialised; after `poll_read` the filled portion
-        // (first `n` bytes) is fully initialised.
+        // SAFETY: We advance the cursor by exactly `n` — the byte count
+        // reported by tokio's poll_read as written into `slice`.
         let n = {
             let slice = unsafe {
                 let raw = buf.as_mut();
@@ -128,19 +138,38 @@ impl Write for HyperObfs4Io {
 
 // ── Obfs4Channel ─────────────────────────────────────────────────────────────
 
-/// A `tower::Service<Uri>` that establishes obfs4-obfuscated connections.
+/// Коннектор obfs4 для tonic — реализует `tower::Service<Uri>`.
 ///
-/// Pass to `tonic::transport::Endpoint::connect_with_connector()` to use
-/// gRPC over obfs4.
+/// # Простой путь
 ///
-/// ```rust,ignore
+/// ```rust,no_run
+/// use construct_ice::{ClientConfig, transport::tonic_compat::Obfs4Channel};
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = ClientConfig::from_bridge_cert("base64_cert_here")?;
+/// let channel = Obfs4Channel::channel("https://relay.example.com:9443", config).await?;
+/// // let client = MyServiceClient::new(channel);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # С настройкой Endpoint
+///
+/// ```rust,no_run
 /// use construct_ice::{ClientConfig, transport::tonic_compat::Obfs4Channel};
 /// use tonic::transport::Endpoint;
+/// use std::time::Duration;
 ///
-/// let config = ClientConfig::from_bridge_cert("base64_cert")?;
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = ClientConfig::from_bridge_cert("base64_cert_here")?;
 /// let channel = Endpoint::from_static("https://relay.example.com:9443")
+///     .timeout(Duration::from_secs(10))
 ///     .connect_with_connector(Obfs4Channel::new(config))
 ///     .await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone)]
 pub struct Obfs4Channel {
@@ -148,9 +177,33 @@ pub struct Obfs4Channel {
 }
 
 impl Obfs4Channel {
-    /// Create a new channel using the given client configuration.
+    /// Создать коннектор с заданной конфигурацией obfs4.
     pub fn new(config: ClientConfig) -> Self {
         Self { config }
+    }
+
+    /// Подключиться к `url` и вернуть готовый `tonic::transport::Channel`.
+    ///
+    /// Самый удобный способ — не требует ручной работы с `Endpoint`.
+    ///
+    /// ```rust,no_run
+    /// use construct_ice::{ClientConfig, transport::tonic_compat::Obfs4Channel};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = ClientConfig::from_bridge_cert("base64_cert_here")?;
+    /// let channel = Obfs4Channel::channel("https://relay.example.com:9443", config).await?;
+    /// // let client = MyServiceClient::new(channel);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn channel(
+        url: &'static str,
+        config: ClientConfig,
+    ) -> Result<Channel, tonic::transport::Error> {
+        Endpoint::from_static(url)
+            .connect_with_connector(Self::new(config))
+            .await
     }
 }
 
@@ -160,7 +213,7 @@ impl Service<Uri> for Obfs4Channel {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        // TCP connections are established on demand — always ready.
+        // TCP соединения создаются по требованию — всегда готов.
         Poll::Ready(Ok(()))
     }
 

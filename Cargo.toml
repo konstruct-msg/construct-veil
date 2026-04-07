@@ -47,6 +47,7 @@ pin-project-lite = "0.2"
 
 # Error handling
 thiserror = "1"
+tonic = { version = "0.14.5", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -63,7 +64,8 @@ tls = ["dep:native-tls", "dep:tokio-native-tls"]
 # ffi + tls combined (used by iOS build)
 ffi-tls = ["ffi", "tls"]
 # Enable tonic/hyper transport wrappers (optional — pulls in heavy deps)
-tonic-transport = ["dep:hyper", "dep:http", "dep:tower"]
+# Includes tower::Service<Uri> connector + full tonic::transport::Channel API.
+tonic-transport = ["dep:hyper", "dep:http", "dep:tower", "dep:tonic"]
 
 [dependencies.hyper]
 version = "1"
