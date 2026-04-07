@@ -21,9 +21,10 @@ path = "examples/interop_server.rs"
 name = "interop_client"
 path = "examples/interop_client.rs"
 
-[[bench]]
-name = "framing"
-harness = false
+[[example]]
+name = "grpc_obfs4_client"
+path = "examples/grpc_obfs4_client.rs"
+required-features = ["tonic-transport"]
 
 [dependencies]
 # Crypto
@@ -62,7 +63,7 @@ tls = ["dep:native-tls", "dep:tokio-native-tls"]
 # ffi + tls combined (used by iOS build)
 ffi-tls = ["ffi", "tls"]
 # Enable tonic/hyper transport wrappers (optional — pulls in heavy deps)
-tonic-transport = ["dep:hyper", "dep:http"]
+tonic-transport = ["dep:hyper", "dep:http", "dep:tower"]
 
 [dependencies.hyper]
 version = "1"
@@ -71,6 +72,11 @@ optional = true
 
 [dependencies.http]
 version = "1"
+optional = true
+
+[dependencies.tower]
+version = "0.5"
+features = ["util"]
 optional = true
 
 [dependencies.native-tls]

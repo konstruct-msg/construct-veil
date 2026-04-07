@@ -7,6 +7,9 @@
 /// Cover traffic helpers (TLS/HTTP probing → proxy to upstream).
 pub mod cover;
 
+#[cfg(feature = "tonic-transport")]
+pub mod tonic_compat;
+
 use std::{
     collections::VecDeque,
     io,
@@ -37,6 +40,9 @@ use crate::{
     iat::{IatMode, sample_delay_with_max, split_for_iat},
     replay_filter::ReplayFilter,
 };
+
+#[cfg(feature = "tls")]
+use {native_tls, tokio_native_tls};
 
 /// Convert a 24-byte PRNG seed into the 32-byte seed required by SmallRng.
 /// Uses the first 24 bytes and pads with a simple derivation.
@@ -290,6 +296,54 @@ impl Obfs4Stream<TcpStream> {
     /// Perform client handshake over an existing TCP stream.
     pub async fn client_handshake(tcp: TcpStream, config: ClientConfig) -> Result<Self> {
         Self::client_handshake_stream(tcp, config).await
+    }
+}
+
+#[cfg(feature = "tls")]
+impl Obfs4Stream<tokio_native_tls::TlsStream<TcpStream>> {
+    /// Connect to an obfs4 relay using **TLS-over-TCP** as the outer transport.
+    ///
+    /// The connection stack is:
+    ///
+    /// ```text
+    /// App  ↔  Obfs4Stream  ─── obfs4 framing ──→  TLS  ─── encrypted TCP ──→  relay
+    /// ```
+    ///
+    /// This is the recommended mode for production deployments: the TLS layer
+    /// makes the connection look like ordinary HTTPS to DPI systems, and the
+    /// obfs4 layer provides indistinguishability *inside* that envelope.
+    ///
+    /// `relay_addr` — TCP address of the relay (e.g. `"relay.example.com:443"`)  
+    /// `tls_server_name` — SNI / certificate hostname for TLS verification  
+    /// `config` — obfs4 client configuration (bridge cert + node ID)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if TCP connect, TLS handshake, or obfs4 handshake fails.
+    /// On obfs4 handshake failure the function **does not retry** — callers
+    /// should implement their own retry/backoff strategy.
+    pub async fn connect_tls(
+        relay_addr: &str,
+        tls_server_name: &str,
+        config: ClientConfig,
+    ) -> Result<Self> {
+        use native_tls::TlsConnector as NativeTlsConnector;
+        use tokio_native_tls::TlsConnector;
+
+        let tcp = TcpStream::connect(relay_addr).await?;
+        // Disable Nagle's algorithm — critical on cellular links where Nagle
+        // can add ~200 ms of latency waiting for a full MSS.
+        let _ = tcp.set_nodelay(true);
+
+        let native_connector =
+            NativeTlsConnector::new().map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+        let connector = TlsConnector::from(native_connector);
+        let tls = connector
+            .connect(tls_server_name, tcp)
+            .await
+            .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+
+        Self::client_handshake_stream(tls, config).await
     }
 }
 

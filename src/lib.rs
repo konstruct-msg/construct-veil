@@ -83,5 +83,8 @@ pub use framing::PaddingStrategy;
 pub use iat::IatMode;
 pub use transport::{ClientConfig, Obfs4Listener, Obfs4Stream, ServerConfig};
 
+#[cfg(feature = "tonic-transport")]
+pub use transport::tonic_compat::{HyperObfs4Io, Obfs4Channel};
+
 /// Result type for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
