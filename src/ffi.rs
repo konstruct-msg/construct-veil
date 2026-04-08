@@ -265,9 +265,14 @@ async fn handle_connection(mut local: TcpStream, relay_addr: String, config: Cli
 
 // ── TLS-wrapped proxy ─────────────────────────────────────────────────────────
 //
-// `ice_proxy_start_tls` starts a second proxy instance that establishes an
-// outer TLS connection to the relay before the obfs4 handshake. This makes
-// the traffic look like normal HTTPS to DPI systems.
+// `ice_proxy_start_tls` — backward-compat: TLS with SNI, no cert pinning.
+// `ice_proxy_start_tls_pinned` — full DPI evasion: fake/empty SNI + SPKI pin.
+//
+// Both use rustls via `crate::tls_pinned::build_connector`.
+//
+// Supported SNI modes (set from Swift via Constants.swift):
+//   sni = ""                         → no SNI extension (IP-based ServerName)
+//   sni = "storage.yandexcloud.net"  → fake SNI, REALITY-style
 //
 // The `tls` Cargo feature must be enabled for these symbols to be compiled.
 
@@ -341,6 +346,103 @@ pub extern "C" fn ice_proxy_start_tls(
             listener,
             relay_addr,
             tls_server_name,
+            String::new(), // no SPKI pin — backward-compat (CA chain not checked either,
+            // but SNI is still sent so the server cert domain must match)
+            config,
+            shutdown_rx,
+        ));
+        let mut guard = PROXY_TLS.lock().map_err(|_| ())?;
+        *guard = Some(ProxyHandle { port, shutdown_tx });
+        Ok(port)
+    });
+
+    match result {
+        Ok(p) => {
+            if !port_out.is_null() {
+                unsafe { *port_out = p };
+            }
+            0
+        }
+        Err(()) => -1,
+    }
+}
+
+#[cfg(feature = "tls")]
+#[unsafe(no_mangle)]
+/// Start the TLS-wrapped obfs4 proxy with SPKI certificate pinning.
+///
+/// Connections flow: local TCP → TLS (SNI=`tls_sni`) → obfs4 → relay.
+///
+/// `bridge_line`  — bridge parameters (`"cert=<base64> iat-mode=<n>"`).
+/// `relay_addr`   — relay IP:port (`"158.160.140.67:443"`).
+/// `tls_sni`      — SNI for ClientHello. Empty string → no SNI (IP-based ServerName).
+///                  Set to `"storage.yandexcloud.net"` for REALITY-style fake SNI.
+/// `spki_hex`     — lowercase hex SHA-256 of DER SubjectPublicKeyInfo. Empty → no pinning.
+/// `port_out`     — local TCP port the proxy listens on.
+///
+/// Returns 0 on success, -1 on failure.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn ice_proxy_start_tls_pinned(
+    bridge_line: *const c_char,
+    relay_addr: *const c_char,
+    tls_sni: *const c_char,
+    spki_hex: *const c_char,
+    port_out: *mut u16,
+) -> i32 {
+    let bridge_line = unsafe {
+        match bridge_line
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+        {
+            Some(s) => s.to_owned(),
+            None => return -1,
+        }
+    };
+    let relay_addr = unsafe {
+        match relay_addr
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+        {
+            Some(s) => s.to_owned(),
+            None => return -1,
+        }
+    };
+    let tls_sni = unsafe {
+        tls_sni
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let spki_hex = unsafe {
+        spki_hex
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    };
+
+    let config = match ClientConfig::from_bridge_line(&bridge_line) {
+        Ok(c) => c,
+        Err(_) => return -1,
+    };
+
+    let rt = get_runtime();
+    let result: Result<u16, ()> = rt.block_on(async {
+        {
+            let guard = PROXY_TLS.lock().map_err(|_| ())?;
+            if guard.is_some() {
+                return Err(()); // already running
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|_| ())?;
+        let port = listener.local_addr().map_err(|_| ())?.port();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        rt.spawn(proxy_loop_tls(
+            listener,
+            relay_addr,
+            tls_sni,
+            spki_hex,
             config,
             shutdown_rx,
         ));
@@ -365,6 +467,7 @@ async fn proxy_loop_tls(
     listener: TcpListener,
     relay_addr: String,
     tls_server_name: String,
+    tls_spki_hex: String,
     config: ClientConfig,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
@@ -376,8 +479,9 @@ async fn proxy_loop_tls(
                     Ok((local, _)) => {
                         let addr = relay_addr.clone();
                         let sni  = tls_server_name.clone();
+                        let spki = tls_spki_hex.clone();
                         let cfg  = config.clone();
-                        tokio::spawn(handle_connection_tls(local, addr, sni, cfg));
+                        tokio::spawn(handle_connection_tls(local, addr, sni, spki, cfg));
                     }
                     Err(_) => break,
                 }
@@ -391,18 +495,29 @@ async fn handle_connection_tls(
     mut local: TcpStream,
     relay_addr: String,
     tls_server_name: String,
+    tls_spki_hex: String,
     config: ClientConfig,
 ) {
-    use native_tls::TlsConnector as NativeTlsConnector;
     use tokio::net::TcpStream as TokioTcp;
-    use tokio_native_tls::TlsConnector;
+
+    // Build rustls connector with SPKI pinning + SNI control.
+    // sni = ""   → IP-based ServerName, no SNI extension in ClientHello (Path 1).
+    // sni = name → sends as SNI; cert verified by SPKI pin, not CA chain (Path 2).
+    let (connector, server_name) =
+        match crate::tls_pinned::build_connector(&tls_server_name, &tls_spki_hex, &relay_addr) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("ice-tls: connector build failed: {e}");
+                return;
+            }
+        };
 
     // Attempt the obfs4-over-TLS connection up to 2 times before giving up.
     // The server may momentarily reject a handshake (e.g. during restart or
     // due to clock-skew on epoch boundary); a single retry avoids false
     // "always relay" fallbacks on iOS.
     for attempt in 0u8..2 {
-        // 1. TCP connect to relay
+        // 1. TCP connect to relay (IP string — no DNS lookup)
         let tcp = match TokioTcp::connect(&relay_addr).await {
             Ok(t) => t,
             Err(e) => {
@@ -416,18 +531,11 @@ async fn handle_connection_tls(
         // where Nagle can add ~200 ms of artificial latency.
         let _ = tcp.set_nodelay(true);
 
-        // 2. TLS handshake — uses platform native TLS (SecureTransport on iOS/macOS).
-        //    Certificate is verified against the system CA store (Let's Encrypt).
-        //    No custom ALPN or certificate pinning required per spec.
-        let native_connector = match NativeTlsConnector::new() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("ice-tls: TLS connector build failed: {e}");
-                break;
-            }
-        };
-        let connector = TlsConnector::from(native_connector);
-        let tls_stream = match connector.connect(&tls_server_name, tcp).await {
+        // 2. TLS handshake via rustls.
+        //    With SPKI pinning: ignores CA chain, verifies public key hash.
+        //    With fake SNI: sends the configured domain in ClientHello but
+        //    cert validation is still by pin — no domain match required.
+        let tls_stream = match connector.connect(server_name.clone(), tcp).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("ice-tls: TLS handshake failed (attempt {attempt}): {e}");

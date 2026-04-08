@@ -1,0 +1,44 @@
+[package]
+name = "construct-ice-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.construct-ice]
+path = ".."
+
+[workspace]
+members = ["."]
+
+# ── Fuzz targets ──────────────────────────────────────────────────────────────
+
+[[bin]]
+name = "fuzz_frame_decoder"
+path = "fuzz_targets/fuzz_frame_decoder.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_cover_classify"
+path = "fuzz_targets/fuzz_cover_classify.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_length_obfuscator"
+path = "fuzz_targets/fuzz_length_obfuscator.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_replay_filter"
+path = "fuzz_targets/fuzz_replay_filter.rs"
+doc = false
+
+[profile.release]
+opt-level = 3
+debug = true

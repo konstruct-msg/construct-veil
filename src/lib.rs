@@ -76,6 +76,9 @@ pub mod transport;
 #[allow(unsafe_code)]
 pub mod ffi;
 
+#[cfg(feature = "tls")]
+pub(crate) mod tls_pinned;
+
 mod error;
 
 pub use error::Error;

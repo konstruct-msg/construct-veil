@@ -42,7 +42,7 @@ use crate::{
 };
 
 #[cfg(feature = "tls")]
-use {native_tls, tokio_native_tls};
+use tokio_rustls;
 
 /// Convert a 24-byte PRNG seed into the 32-byte seed required by SmallRng.
 /// Uses the first 24 bytes and pads with a simple derivation.
@@ -306,7 +306,7 @@ impl Obfs4Stream<TcpStream> {
 }
 
 #[cfg(feature = "tls")]
-impl Obfs4Stream<tokio_native_tls::TlsStream<TcpStream>> {
+impl Obfs4Stream<tokio_rustls::client::TlsStream<TcpStream>> {
     /// Connect to an obfs4 relay using **TLS-over-TCP** as the outer transport.
     ///
     /// The connection stack is:
@@ -315,37 +315,24 @@ impl Obfs4Stream<tokio_native_tls::TlsStream<TcpStream>> {
     /// App  ↔  Obfs4Stream  ─── obfs4 framing ──→  TLS  ─── encrypted TCP ──→  relay
     /// ```
     ///
-    /// This is the recommended mode for production deployments: the TLS layer
-    /// makes the connection look like ordinary HTTPS to DPI systems, and the
-    /// obfs4 layer provides indistinguishability *inside* that envelope.
-    ///
-    /// `relay_addr` — TCP address of the relay (e.g. `"relay.example.com:443"`)  
-    /// `tls_server_name` — SNI / certificate hostname for TLS verification  
-    /// `config` — obfs4 client configuration (bridge cert + node ID)
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if TCP connect, TLS handshake, or obfs4 handshake fails.
-    /// On obfs4 handshake failure the function **does not retry** — callers
-    /// should implement their own retry/backoff strategy.
+    /// `relay_addr`      — TCP address of the relay (`"158.160.140.67:443"`)
+    /// `tls_server_name` — SNI to send in ClientHello; empty = no SNI (IP-based name)
+    /// `spki_hex`        — hex SHA-256 of DER SPKI for pinning; empty = no pinning
+    /// `config`          — obfs4 client configuration (bridge cert + node ID)
     pub async fn connect_tls(
         relay_addr: &str,
         tls_server_name: &str,
+        spki_hex: &str,
         config: ClientConfig,
     ) -> Result<Self> {
-        use native_tls::TlsConnector as NativeTlsConnector;
-        use tokio_native_tls::TlsConnector;
+        let (connector, server_name) =
+            crate::tls_pinned::build_connector(tls_server_name, spki_hex, relay_addr)
+                .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
 
         let tcp = TcpStream::connect(relay_addr).await?;
-        // Disable Nagle's algorithm — critical on cellular links where Nagle
-        // can add ~200 ms of latency waiting for a full MSS.
         let _ = tcp.set_nodelay(true);
-
-        let native_connector =
-            NativeTlsConnector::new().map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
-        let connector = TlsConnector::from(native_connector);
         let tls = connector
-            .connect(tls_server_name, tcp)
+            .connect(server_name, tcp)
             .await
             .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
 

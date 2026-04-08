@@ -58,9 +58,9 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 default = []
 # Enable C FFI proxy (ice_proxy_start/stop/is_running) — required for iOS
 ffi = []
-# Enable TLS wrapping (outer TLS before obfs4) — required for DPI evasion
-# Uses the platform native TLS stack (SecureTransport on Apple, SChannel on Windows)
-tls = ["dep:native-tls", "dep:tokio-native-tls"]
+# Enable TLS wrapping (outer TLS before obfs4) — required for DPI evasion.
+# Uses rustls with a custom SPKI-pinning verifier for full SNI and cert control.
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:x509-cert"]
 # ffi + tls combined (used by iOS build)
 ffi-tls = ["ffi", "tls"]
 # Enable tonic/hyper transport wrappers (optional — pulls in heavy deps)
@@ -81,12 +81,23 @@ version = "0.5"
 features = ["util"]
 optional = true
 
-[dependencies.native-tls]
-version = "0.2"
+[dependencies.rustls]
+version = "0.23"
+features = ["ring"]
 optional = true
 
-[dependencies.tokio-native-tls]
-version = "0.3"
+[dependencies.tokio-rustls]
+version = "0.26"
+optional = true
+
+[dependencies.rustls-pki-types]
+version = "1"
+optional = true
+
+[dependencies.x509-cert]
+version = "0.2"
+default-features = false
+features = ["std"]
 optional = true
 
 [profile.release]
