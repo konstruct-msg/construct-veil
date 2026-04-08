@@ -218,3 +218,112 @@
 | 9 | Zero-copy | низкий | средняя | — |
 | 11 | PaddingStrategy | низкий | низкая | — |
 | 12 | Graceful shutdown | низкий | низкая | — |
+
+---
+
+## 13. TLS fingerprint mimicry (uTLS) ← NEW
+
+**Статус:** planned  
+**Приоритет:** критический
+
+ТСПУ (Россия) и GFW (Китай) классифицируют трафик по TLS ClientHello fingerprint. Стандартный `native-tls`/`rustls` ClientHello отличается от браузерных — это надёжный сигнал для DPI.
+
+**Что нужно:**
+- `TlsFingerprint` enum: `Chrome120`, `Firefox121`, `Safari17`, `Random`
+- Кастомный `rustls::ClientConfig` с cipher suites, extensions, curves в порядке реального браузера
+- Включается через `ClientConfig::with_tls_fingerprint(fingerprint)`
+- Тесты: сравнить wire bytes ClientHello с эталонными значениями (JA3 hash)
+
+**Затронутые файлы:** `src/transport/mod.rs`, `src/transport/tls_fingerprint.rs` (новый), `Cargo.toml` (добавить `rustls` как альтернативу `native-tls` под feature flag)
+
+---
+
+## 14. Domain fronting / CDN camouflage ← NEW
+
+**Статус:** planned  
+**Приоритет:** высокий
+
+obfs4 подключается к relay IP напрямую — ТСПУ блокирует по IP-адресу. Domain fronting через Cloudflare скрывает реальный destination: DPI видит `CONNECT cdn-edge.cloudflare.com`, а не relay IP.
+
+**Что нужно:**
+- `DomainFrontedConfig`: `cdn_host`, `origin_host`, feature flag `cdn-fronting`
+- `Obfs4Stream::connect_fronted(cdn_host, origin_host, config)` — HTTPS CONNECT → CDN → relay → obfs4
+- Пример в `examples/fronted_client.rs`
+- Документация: настройка Cloudflare Workers/Fastly для forwarding
+
+**Зависимость:** #13 TLS fingerprint mimicry (CDN требует правдоподобного TLS ClientHello)
+
+---
+
+## 15. Active probing resistance tests ← NEW
+
+**Статус:** planned  
+**Приоритет:** высокий
+
+obfs4 имеет anti-probing защиту, но нет автоматических тестов имитирующих GFW/ТСПУ probing patterns.
+
+**Что нужно:**
+- `tests/probing.rs` test suite:
+  - probe с неверным cert → timeout/garbage, не TCP RST
+  - probe с верным cert но неверным MAC → non-deterministic timing
+  - sequential probes → разные response timings (не fingerprint-able)
+  - HTTP GET probe → binary garbage в ответ
+- CI: запускать в каждом PR (быстрые, < 30s)
+
+**Затронутые файлы:** `tests/probing.rs` (новый)
+
+---
+
+## 16. Pluggable transport multiplexing ← NEW
+
+**Статус:** planned  
+**Приоритет:** средний
+
+ТСПУ адаптируется — сегодня obfs4 работает, завтра может быть заблокирован. Нужна архитектура fallback без изменения клиентского кода.
+
+**Что нужно:**
+- `TransportKind` enum: `Obfs4`, `WebSocket`, `Meek`, `Quic`
+- `TransportDialer` trait: `async fn dial(addr, config) -> Box<dyn AsyncRead + AsyncWrite>`
+- `IceClient` с priority list + automatic fallback
+- `ice_proxy_start` получает опциональный `transport_kind` параметр
+- Начать с WebSocket (наименее блокируемый через CDN)
+
+**Зависимость:** #7 улучшенная типизация ошибок (для правильного fallback)
+
+---
+
+## 17. Traffic analysis resistance — constant-rate channel ← NEW
+
+**Статус:** planned  
+**Приоритет:** средний
+
+IAT modes существуют, но нет padding на уровне сессии. Объём трафика + паттерн отправки выдают мессенджер vs web-browsing даже при IAT=Paranoid.
+
+**Что нужно:**
+- PADDING frames когда нет реальных данных → constant bitrate (configurable `target_kbps`)
+- Опционально — `PaddingStrategy::ConstantRate { kbps: u32 }` в `IATMode::Paranoid`
+- Feature flag `session-padding` (чтобы не дренировать батарею на мобиле)
+- Бенчмарк: entropy до/после на реальном трафике
+
+**Зависимость:** #16 multiplexing (padding должен применяться поверх любого transport)
+
+---
+
+## Приоритизация (обновлено)
+
+| # | Задача | Приоритет | Статус |
+|---|--------|-----------|--------|
+| iOS CI | iOS FFI CI + UDL gate | критический | planned |
+| 15 | Active probing tests | высокий | planned |
+| 13 | TLS fingerprint mimicry | высокий | planned |
+| 8 | Fuzz-тесты | высокий | planned |
+| 14 | Domain fronting | высокий | planned |
+| 7 | Error typing | средний | planned |
+| 16 | PT multiplexing | средний | planned |
+| 17 | Session padding | средний | planned |
+| 3 | Метрики/tracing | средний | planned |
+| 4 | Бенчмарки | средний | planned |
+| 5 | Документация | средний | planned |
+| 6 | ReplayFilter | **done** ✅ | — |
+| 1 | tonic интеграция | **done** ✅ | — |
+| 2 | TLS wrapper API | **done** ✅ | — |
