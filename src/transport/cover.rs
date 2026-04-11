@@ -81,7 +81,11 @@ pub async fn decide_cover(stream: &TcpStream, cfg: &CoverProxyConfig) -> io::Res
 
 /// Heuristic classifier for active-probing traffic.
 pub fn classify_peeked_bytes(peeked: &[u8]) -> CoverDecision {
-    if looks_like_tls_client_hello(peeked) || looks_like_http_request(peeked) {
+    if looks_like_tls_client_hello(peeked)
+        || looks_like_http_request(peeked)
+        || looks_like_ssh_banner(peeked)
+        || looks_like_smtp_command(peeked)
+    {
         CoverDecision::ProxyToUpstream
     } else {
         CoverDecision::TryObfs4
@@ -112,6 +116,17 @@ fn looks_like_http_request(b: &[u8]) -> bool {
         b"CONNECT ",
     ];
     METHODS.iter().any(|m| b.starts_with(m))
+}
+
+/// Returns true if the bytes look like an SSH banner (`SSH-2.0-` or `SSH-1.`).
+fn looks_like_ssh_banner(b: &[u8]) -> bool {
+    b.starts_with(b"SSH-2.0-") || b.starts_with(b"SSH-1.")
+}
+
+/// Returns true if the bytes look like a plaintext SMTP command.
+fn looks_like_smtp_command(b: &[u8]) -> bool {
+    const COMMANDS: [&[u8]; 5] = [b"EHLO ", b"HELO ", b"MAIL ", b"RCPT ", b"QUIT\r"];
+    COMMANDS.iter().any(|c| b.starts_with(c))
 }
 
 /// Proxy `client` to `cfg.upstream_addr` until EOF in either direction.

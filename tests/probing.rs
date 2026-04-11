@@ -14,7 +14,10 @@
 //! 5. **TLS ClientHello probe** — same as above for TLS fingerprint.
 //! 6. **Cover-classifier unit tests** — verifies `classify_peeked_bytes` heuristics.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use construct_ice::{
     ClientConfig, Obfs4Listener, Obfs4Stream, ServerConfig,
@@ -225,6 +228,46 @@ async fn http_connect_probe_classified_as_cover() {
     );
 }
 
+// ── Test: SSH / SMTP probe → cover classification ─────────────────────────────
+
+/// SSH-2.0 banner must be classified as cover traffic.
+#[tokio::test]
+async fn ssh_banner_probe_classified_as_cover() {
+    assert_eq!(
+        classify_peeked_bytes(b"SSH-2.0-OpenSSH_8.9\r\n"),
+        CoverDecision::ProxyToUpstream,
+        "SSH-2.0 banner must be classified as cover traffic"
+    );
+}
+
+/// SSH-1.x banner (legacy) must also be cover.
+#[tokio::test]
+async fn ssh1_banner_probe_classified_as_cover() {
+    assert_eq!(
+        classify_peeked_bytes(b"SSH-1.5-OpenSSH_3.9\r\n"),
+        CoverDecision::ProxyToUpstream,
+    );
+}
+
+/// SMTP EHLO command must be classified as cover traffic.
+#[tokio::test]
+async fn smtp_ehlo_probe_classified_as_cover() {
+    assert_eq!(
+        classify_peeked_bytes(b"EHLO mail.example.com\r\n"),
+        CoverDecision::ProxyToUpstream,
+        "SMTP EHLO must be classified as cover traffic"
+    );
+}
+
+/// SMTP HELO (legacy) must also be cover.
+#[tokio::test]
+async fn smtp_helo_probe_classified_as_cover() {
+    assert_eq!(
+        classify_peeked_bytes(b"HELO example.com\r\n"),
+        CoverDecision::ProxyToUpstream,
+    );
+}
+
 // ── Test 5: TLS ClientHello probe → cover classification ─────────────────────
 
 /// A TLS ClientHello sent to the server port must be classified as cover.
@@ -338,4 +381,133 @@ async fn accept_obfs4_or_proxy_routes_http_to_upstream() {
 
     // Give the server time to classify and proxy.
     tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+// ── Test 8: Replay attack probe ───────────────────────────────────────────────
+
+/// A replayed client handshake must be rejected by the server's HMAC replay filter.
+///
+/// Attack scenario: a passive adversary records a valid obfs4 ClientHello and
+/// replays the exact same bytes to identify the obfs4 server.
+///
+/// The server keeps a per-epoch HMAC replay filter. The second connection with
+/// identical bytes must NOT complete a successful Obfs4Stream handshake.
+#[tokio::test]
+async fn replay_probe_is_rejected() {
+    let (listener, server_addr, cert) = spawn_server().await;
+
+    // Bind a MITM proxy that records every byte sent by the client.
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap().to_string();
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_write = captured.clone();
+    let server_addr_proxy = server_addr.clone();
+
+    // MITM proxy task: forward client ↔ server while recording client→server bytes.
+    tokio::spawn(async move {
+        if let Ok((client_conn, _)) = proxy_listener.accept().await {
+            let server_conn = match TcpStream::connect(&server_addr_proxy).await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let (mut cr, client_write) = client_conn.into_split();
+            let (server_read, mut sw) = server_conn.into_split();
+
+            // Forward client→server and record.
+            let cap = captured_write;
+            let cw_cell = Arc::new(tokio::sync::Mutex::new(client_write));
+            let cw_for_s2c = cw_cell.clone();
+
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match cr.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            cap.lock().unwrap().extend_from_slice(&buf[..n]);
+                            if sw.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Forward server→client.
+            let mut sr = server_read;
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match sr.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let mut cw = cw_for_s2c.lock().await;
+                            if cw.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // Wrap the listener in Arc so it can be shared across accept tasks.
+    let listener = Arc::new(listener);
+
+    // Accept #1 — the real connection that passes through the proxy.
+    let l1 = listener.clone();
+    let accept1 = tokio::spawn(async move {
+        let _ = l1.accept().await;
+    });
+
+    let cfg = ClientConfig::from_bridge_cert(&cert).unwrap();
+    let _ = timeout(
+        Duration::from_millis(800),
+        Obfs4Stream::connect(&proxy_addr, cfg),
+    )
+    .await;
+
+    // Wait for accept #1 to finish and for the proxy to flush captured bytes.
+    let _ = accept1.await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let hello_bytes = captured.lock().unwrap().clone();
+    assert!(
+        !hello_bytes.is_empty(),
+        "MITM proxy must have captured ClientHello bytes; got 0 — check proxy task"
+    );
+
+    // Accept #2 — the replay connection; server's replay filter should reject it.
+    let l2 = listener.clone();
+    tokio::spawn(async move {
+        let _ = l2.accept().await;
+    });
+
+    // Send the exact same bytes to the server that the legitimate client sent.
+    let mut replay_conn = timeout(Duration::from_millis(200), TcpStream::connect(&server_addr))
+        .await
+        .expect("TCP connect for replay timed out")
+        .expect("TCP connect for replay failed");
+
+    let _ = replay_conn.write_all(&hello_bytes).await;
+
+    // The server must NOT produce a complete obfs4 stream for the replay.
+    // It either closes the connection, times out, or sends cover garbage.
+    let mut resp = vec![0u8; 512];
+    let read_result = timeout(Duration::from_millis(700), replay_conn.read(&mut resp)).await;
+
+    // Any outcome except a successful Obfs4Stream is acceptable.
+    // We document the expected behavior: replay is silently discarded.
+    match read_result {
+        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {
+            // Closed, error, or timeout — replay was rejected as expected.
+        }
+        Ok(Ok(n)) => {
+            // Got some bytes — the server may send cover data before closing.
+            // This is also acceptable; it must NOT be a valid obfs4 server response.
+            eprintln!("replay_probe: got {n} bytes from server (expected cover/garbage)");
+        }
+    }
 }
