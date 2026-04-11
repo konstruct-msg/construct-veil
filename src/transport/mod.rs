@@ -39,6 +39,7 @@ use crate::{
     handshake::{DEFAULT_HANDSHAKE_TIMEOUT, client::client_handshake, server::server_handshake},
     iat::{IatMode, sample_delay_with_max, split_for_iat},
     replay_filter::ReplayFilter,
+    traffic_mode::TrafficMode,
 };
 
 #[cfg(feature = "tls")]
@@ -83,6 +84,12 @@ pub struct ClientConfig {
     /// or [`TlsProfile::Firefox128`] to mimic browser cipher/ALPN ordering.
     #[cfg(feature = "tls")]
     pub tls_profile: crate::tls_fingerprint::TlsProfile,
+    /// Cover traffic mode for traffic analysis resistance.
+    ///
+    /// Defaults to [`TrafficMode::Normal`] (no cover traffic). Set to
+    /// [`TrafficMode::ConstantRate`] or [`TrafficMode::Mimicry`] to inject
+    /// cover frames when the connection is idle.
+    pub traffic_mode: TrafficMode,
 }
 
 impl ClientConfig {
@@ -99,6 +106,7 @@ impl ClientConfig {
             max_iat_delay: crate::iat::MAX_IAT_DELAY,
             #[cfg(feature = "tls")]
             tls_profile: crate::tls_fingerprint::TlsProfile::default(),
+            traffic_mode: TrafficMode::default(),
         })
     }
 
@@ -128,6 +136,7 @@ impl ClientConfig {
             max_iat_delay: crate::iat::MAX_IAT_DELAY,
             #[cfg(feature = "tls")]
             tls_profile: crate::tls_fingerprint::TlsProfile::default(),
+            traffic_mode: TrafficMode::default(),
         })
     }
 
@@ -142,6 +151,7 @@ impl ClientConfig {
             max_iat_delay: crate::iat::MAX_IAT_DELAY,
             #[cfg(feature = "tls")]
             tls_profile: crate::tls_fingerprint::TlsProfile::default(),
+            traffic_mode: TrafficMode::default(),
         }
     }
 
@@ -173,6 +183,15 @@ impl ClientConfig {
         self.tls_profile = profile;
         self
     }
+
+    /// Set the cover traffic mode for traffic analysis resistance.
+    ///
+    /// Use [`TrafficMode::ConstantRate`] to maintain a minimum wire rate,
+    /// or [`TrafficMode::Mimicry`] to shape traffic like a known application.
+    pub fn with_traffic_mode(mut self, mode: TrafficMode) -> Self {
+        self.traffic_mode = mode;
+        self
+    }
 }
 
 // ── Server config ────────────────────────────────────────────────────────────
@@ -188,6 +207,8 @@ pub struct ServerConfig {
     pub padding: PaddingStrategy,
     /// Maximum IAT delay per chunk.
     pub max_iat_delay: Duration,
+    /// Cover traffic mode for traffic analysis resistance (default: `Normal`).
+    pub traffic_mode: TrafficMode,
 }
 
 impl ServerConfig {
@@ -199,6 +220,7 @@ impl ServerConfig {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             padding: PaddingStrategy::default(),
             max_iat_delay: crate::iat::MAX_IAT_DELAY,
+            traffic_mode: TrafficMode::default(),
         }
     }
 
@@ -210,6 +232,7 @@ impl ServerConfig {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             padding: PaddingStrategy::default(),
             max_iat_delay: crate::iat::MAX_IAT_DELAY,
+            traffic_mode: TrafficMode::default(),
         }
     }
 
@@ -234,6 +257,12 @@ impl ServerConfig {
     /// Set the maximum IAT delay per chunk.
     pub fn with_max_iat_delay(mut self, delay: Duration) -> Self {
         self.max_iat_delay = delay;
+        self
+    }
+
+    /// Set the cover traffic mode for traffic analysis resistance.
+    pub fn with_traffic_mode(mut self, mode: TrafficMode) -> Self {
+        self.traffic_mode = mode;
         self
     }
 
@@ -279,6 +308,7 @@ impl ServerConfig {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             padding: PaddingStrategy::default(),
             max_iat_delay: crate::iat::MAX_IAT_DELAY,
+            traffic_mode: TrafficMode::default(),
         })
     }
 }
@@ -312,6 +342,7 @@ pin_project! {
         iat_chunks: VecDeque<Bytes>,
         iat_sleep: Option<Pin<Box<Sleep>>>,
         iat_rng: SmallRng,
+        traffic_mode: TrafficMode,
     }
 }
 
@@ -376,6 +407,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Obfs4Stream<S> {
         let iat_mode = config.iat_mode;
         let padding = config.padding;
         let max_iat_delay = config.max_iat_delay;
+        let traffic_mode = config.traffic_mode;
         let timeout = config.handshake_timeout;
         let (stream, result) = tokio::time::timeout(
             timeout,
@@ -432,7 +464,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Obfs4Stream<S> {
             iat_chunks: VecDeque::new(),
             iat_sleep: None,
             iat_rng,
+            traffic_mode,
         })
+    }
+
+    /// Returns the cover traffic mode configured for this stream.
+    ///
+    /// Use this to create a [`CoverTrafficScheduler`][crate::traffic_mode::CoverTrafficScheduler]
+    /// for autonomous cover frame injection.
+    pub fn traffic_mode(&self) -> TrafficMode {
+        self.traffic_mode
     }
     /// Send a cover-traffic heartbeat frame.
     ///
@@ -756,6 +797,7 @@ impl Obfs4Listener {
             iat_chunks: VecDeque::new(),
             iat_sleep: None,
             iat_rng: SmallRng::from_entropy(),
+            traffic_mode: self.config.traffic_mode,
         };
 
         // Protocol polymorphism: send a PRNG seed inline frame so each

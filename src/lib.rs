@@ -70,6 +70,7 @@ pub mod framing;
 pub mod handshake;
 pub mod iat;
 pub mod replay_filter;
+pub mod traffic_mode;
 pub mod transport;
 
 #[cfg(feature = "ffi")]
@@ -87,6 +88,7 @@ mod error;
 pub use error::Error;
 pub use framing::PaddingStrategy;
 pub use iat::IatMode;
+pub use traffic_mode::{MimicryProfile, TrafficMode};
 pub use transport::{ClientConfig, Obfs4Listener, Obfs4Stream, ServerConfig};
 
 #[cfg(feature = "tls")]
