@@ -7,6 +7,9 @@
 /// Cover traffic helpers (TLS/HTTP probing → proxy to upstream).
 pub mod cover;
 
+/// Pluggable transport multiplexing.
+pub mod mux;
+
 #[cfg(feature = "tonic-transport")]
 pub mod tonic_compat;
 

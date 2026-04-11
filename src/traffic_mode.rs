@@ -18,7 +18,7 @@
 //! use construct_ice::{ClientConfig, Obfs4Stream};
 //! use construct_ice::traffic_mode::{TrafficMode, MimicryProfile, CoverTrafficScheduler};
 //!
-//! # async fn example() -> std::io::Result<()> {
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = ClientConfig::from_bridge_cert("...")
 //!     .unwrap()
 //!     .with_traffic_mode(TrafficMode::Mimicry(MimicryProfile::WebBrowsing));
