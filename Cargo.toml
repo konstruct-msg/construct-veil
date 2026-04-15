@@ -1,11 +1,11 @@
 [package]
 name = "construct-ice"
-version = "0.2.4"
+version = "2.1.0"
 edition = "2024"
 description = "ICE (Intrusion Countermeasures Electronics) — traffic obfuscation transport for Construct messenger"
 license = "MIT"
 repository = "https://github.com/maximeliseyev/construct-ice"
-keywords = ["obfs4", "pluggable-transport", "censorship-resistance", "tor"]
+keywords = ["web-tunnel", "pluggable-transport", "censorship-resistance", "tor"]
 
 [lib]
 name = "construct_ice"
@@ -66,6 +66,15 @@ tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:x509-cert"
 utls = ["tls", "dep:md-5"]
 # ffi + tls combined (used by iOS build)
 ffi-tls = ["ffi", "tls"]
+# WebTunnel transport — WebSocket (RFC 6455) over TLS.
+# Disguises traffic as wss:// connections; stronger DPI resistance than obfs4.
+# Requires tls. The relay server must support WebSocket proxy mode.
+webtunnel = ["tls"]
+# ffi + webtunnel combined (used by iOS build for WebTunnel transport)
+ffi-webtunnel = ["ffi", "webtunnel"]
+# Server-side WebTunnel: accept incoming WebSocket upgrades (relay / server use).
+# Implies webtunnel. Adds sha1 for Sec-WebSocket-Accept computation (RFC 6455 §4.2.2).
+server = ["webtunnel", "dep:sha1"]
 # Enable tonic/hyper transport wrappers (optional — pulls in heavy deps)
 # Includes tower::Service<Uri> connector + full tonic::transport::Channel API.
 tonic-transport = ["dep:hyper", "dep:http", "dep:tower", "dep:tonic"]
@@ -104,6 +113,10 @@ features = ["std"]
 optional = true
 
 [dependencies.md-5]
+version = "0.10"
+optional = true
+
+[dependencies.sha1]
 version = "0.10"
 optional = true
 

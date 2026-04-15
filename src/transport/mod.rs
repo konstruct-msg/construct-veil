@@ -1,6 +1,6 @@
-//! High-level transport API: Obfs4Stream and Obfs4Listener.
+//! High-level transport API: Obfs4Stream, Obfs4Listener, and WebTunnelStream.
 //!
-//! These types wrap a TCP stream with the obfs4 handshake and framing,
+//! These types wrap a TCP stream with the appropriate handshake and framing,
 //! presenting a standard `AsyncRead + AsyncWrite` interface to callers.
 //! This means they're directly compatible with tonic and hyper.
 
@@ -12,6 +12,13 @@ pub mod mux;
 
 #[cfg(feature = "tonic-transport")]
 pub mod tonic_compat;
+
+/// WebTunnel transport — WebSocket (RFC 6455) over TLS.
+///
+/// Disguises traffic as standard `wss://` connections to bypass DPI.
+/// Supports domain fronting: SNI can differ from the HTTP Host header.
+#[cfg(feature = "webtunnel")]
+pub mod webtunnel;
 
 use std::{
     collections::VecDeque,

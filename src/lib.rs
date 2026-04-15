@@ -94,6 +94,11 @@ pub use transport::{ClientConfig, Obfs4Listener, Obfs4Stream, ServerConfig};
 #[cfg(feature = "tls")]
 pub use tls_fingerprint::TlsProfile;
 
+#[cfg(feature = "server")]
+pub use transport::webtunnel::WebTunnelServerStream;
+#[cfg(feature = "webtunnel")]
+pub use transport::webtunnel::WebTunnelStream;
+
 #[cfg(feature = "tonic-transport")]
 pub use transport::tonic_compat::{HyperObfs4Io, Obfs4Channel};
 

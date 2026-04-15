@@ -675,3 +675,195 @@ pub extern "C" fn ice_proxy_start_tls_profiled(
         Err(()) => -1,
     }
 }
+
+// ── WebTunnel proxy ───────────────────────────────────────────────────────────
+
+#[cfg(feature = "webtunnel")]
+static PROXY_WEBTUNNEL: Mutex<Option<ProxyHandle>> = Mutex::new(None);
+
+#[cfg(feature = "webtunnel")]
+#[unsafe(no_mangle)]
+/// Start the WebTunnel (WebSocket-over-TLS) proxy for DPI evasion.
+///
+/// Traffic flow: local TCP → TLS (SNI=`tls_sni`) → WebSocket upgrade → relay.
+///
+/// `relay_addr`  — relay IP:port (`"158.160.140.67:443"`).
+/// `tls_sni`     — SNI for TLS ClientHello; set to CDN domain for fronting.
+///                 Empty → IP-based ServerName (no SNI extension).
+/// `spki_hex`    — lowercase hex SHA-256 of DER SubjectPublicKeyInfo. Empty → no pinning.
+/// `host_header` — HTTP `Host` header for WebSocket upgrade. Can differ from `tls_sni`.
+/// `path`        — WebSocket resource path (e.g. `"/construct-ice"`).
+/// `port_out`    — local TCP port the proxy listens on.
+///
+/// Returns 0 on success, -1 on failure. Stop with `ice_proxy_stop`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn ice_proxy_start_webtunnel(
+    relay_addr: *const c_char,
+    tls_sni: *const c_char,
+    spki_hex: *const c_char,
+    host_header: *const c_char,
+    path: *const c_char,
+    port_out: *mut u16,
+) -> i32 {
+    fn parse_req(ptr: *const c_char) -> Option<String> {
+        unsafe { ptr.as_ref() }
+            .and_then(|p| unsafe { CStr::from_ptr(p) }.to_str().ok())
+            .map(|s| s.to_owned())
+    }
+    fn parse_opt(ptr: *const c_char) -> String {
+        unsafe { ptr.as_ref() }
+            .and_then(|p| unsafe { CStr::from_ptr(p) }.to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    }
+
+    let relay_addr = match parse_req(relay_addr) {
+        Some(s) => s,
+        None => return -1,
+    };
+    let tls_sni = parse_opt(tls_sni);
+    let spki_hex = parse_opt(spki_hex);
+    let host = parse_opt(host_header);
+    let path_s = {
+        let p = parse_opt(path);
+        if p.is_empty() { "/".to_owned() } else { p }
+    };
+
+    let rt = get_runtime();
+    let result: Result<u16, ()> = rt.block_on(async {
+        {
+            let guard = PROXY_WEBTUNNEL.lock().map_err(|_| ())?;
+            if guard.is_some() {
+                return Err(());
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|_| ())?;
+        let port = listener.local_addr().map_err(|_| ())?.port();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        rt.spawn(proxy_loop_webtunnel(
+            listener,
+            relay_addr,
+            tls_sni,
+            spki_hex,
+            host,
+            path_s,
+            shutdown_rx,
+        ));
+        let mut guard = PROXY_WEBTUNNEL.lock().map_err(|_| ())?;
+        *guard = Some(ProxyHandle { port, shutdown_tx });
+        Ok(port)
+    });
+
+    match result {
+        Ok(p) => {
+            if !port_out.is_null() {
+                unsafe { *port_out = p };
+            }
+            0
+        }
+        Err(()) => -1,
+    }
+}
+
+#[cfg(feature = "webtunnel")]
+#[unsafe(no_mangle)]
+/// Returns the local port the WebTunnel proxy is listening on (0 = not running).
+pub extern "C" fn ice_proxy_port_webtunnel() -> u16 {
+    PROXY_WEBTUNNEL
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|h| h.port))
+        .unwrap_or(0)
+}
+
+#[cfg(feature = "webtunnel")]
+#[allow(clippy::too_many_arguments)]
+async fn proxy_loop_webtunnel(
+    listener: TcpListener,
+    relay_addr: String,
+    tls_sni: String,
+    tls_spki_hex: String,
+    host_header: String,
+    path: String,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut shutdown_rx => break,
+            result = listener.accept() => {
+                match result {
+                    Ok((local, _)) => {
+                        let (addr, sni, spki, host, p) = (
+                            relay_addr.clone(), tls_sni.clone(), tls_spki_hex.clone(),
+                            host_header.clone(), path.clone(),
+                        );
+                        tokio::spawn(handle_connection_webtunnel(local, addr, sni, spki, host, p));
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "webtunnel")]
+async fn handle_connection_webtunnel(
+    mut local: TcpStream,
+    relay_addr: String,
+    tls_sni: String,
+    tls_spki_hex: String,
+    host_header: String,
+    path: String,
+) {
+    use crate::transport::webtunnel::WebTunnelStream;
+    use tokio::net::TcpStream as TokioTcp;
+
+    let (connector, server_name) = match crate::tls_pinned::build_connector(
+        &tls_sni,
+        &tls_spki_hex,
+        &relay_addr,
+        crate::tls_fingerprint::TlsProfile::Chrome131,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("webtunnel: connector build failed: {e}");
+            return;
+        }
+    };
+
+    for attempt in 0u8..2 {
+        let tcp = match TokioTcp::connect(&relay_addr).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("webtunnel: tcp connect failed (attempt {attempt}): {e}");
+                if attempt == 0 && e.kind() == std::io::ErrorKind::ConnectionRefused {
+                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                    continue;
+                }
+                break;
+            }
+        };
+        let _ = tcp.set_nodelay(true);
+
+        let tls_stream = match connector.connect(server_name.clone(), tcp).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("webtunnel: TLS failed (attempt {attempt}): {e}");
+                break;
+            }
+        };
+
+        match WebTunnelStream::connect(tls_stream, &host_header, &path).await {
+            Ok(mut ws) => {
+                let _ = copy_bidirectional(&mut local, &mut ws).await;
+                return;
+            }
+            Err(e) => {
+                eprintln!("webtunnel: WS upgrade failed (attempt {attempt}): {e}");
+                if attempt == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                }
+            }
+        }
+    }
+}
