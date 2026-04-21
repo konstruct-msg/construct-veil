@@ -419,12 +419,19 @@ const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 #[cfg(feature = "server")]
 impl<S: AsyncRead + AsyncWrite + Unpin> WebTunnelServerStream<S> {
-    /// Perform the HTTP/1.1 WebSocket server handshake.
+    /// Perform the HTTP/1.1 WebSocket server handshake with a path validator.
     ///
-    /// Reads the upgrade request, validates `Upgrade: websocket`,
-    /// computes `Sec-WebSocket-Accept` via SHA-1 (RFC 6455 §4.2.2),
-    /// and writes the `101 Switching Protocols` response.
-    pub async fn accept(mut inner: S, _path: &str) -> io::Result<Self> {
+    /// Reads the upgrade request, passes the request path to `path_ok`.
+    /// If `path_ok` returns `false`, sends a `403 Forbidden` response and
+    /// returns an error — the caller should log and drop the connection.
+    ///
+    /// Validates `Upgrade: websocket`, computes `Sec-WebSocket-Accept` via
+    /// SHA-1 (RFC 6455 §4.2.2), and writes the `101 Switching Protocols`
+    /// response on success.
+    pub async fn accept_validated(
+        mut inner: S,
+        path_ok: impl Fn(&str) -> bool,
+    ) -> io::Result<Self> {
         use sha1::{Digest, Sha1};
 
         let mut hdr_buf = vec![0u8; 4096];
@@ -455,6 +462,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebTunnelServerStream<S> {
                 "webtunnel-srv: non-UTF8 headers",
             )
         })?;
+
+        // Extract the request path from the first line: "GET /path HTTP/1.1"
+        let request_path = headers
+            .lines()
+            .next()
+            .and_then(|line| {
+                let mut parts = line.splitn(3, ' ');
+                parts.next(); // method
+                parts
+                    .next() // path (may include query string — strip it)
+                    .map(|p| p.split('?').next().unwrap_or(p))
+            })
+            .unwrap_or("/");
+
+        if !path_ok(request_path) {
+            let _ = inner
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            let _ = inner.flush().await;
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "webtunnel-srv: path auth failed",
+            ));
+        }
 
         let headers_lc = headers.to_lowercase();
         if !headers_lc.contains("upgrade: websocket") {
@@ -505,6 +538,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebTunnelServerStream<S> {
             write_buf: BytesMut::with_capacity(4096),
             closed: false,
         })
+    }
+
+    /// Accept on a fixed path — backward-compatible wrapper around
+    /// [`accept_validated`].
+    pub async fn accept(inner: S, path: &str) -> io::Result<Self> {
+        Self::accept_validated(inner, |p| p == path).await
     }
 }
 
