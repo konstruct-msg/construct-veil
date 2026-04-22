@@ -10,6 +10,7 @@
 //! obfuscated_length = length ^ Mask[n]
 //! ```
 
+use sha2::{Digest, Sha256};
 use siphasher::sip::SipHasher24;
 use std::hash::Hasher;
 
@@ -50,6 +51,18 @@ impl LengthObfuscator {
         let mask = self.next_mask();
         let unmasked = [obfuscated[0] ^ mask[0], obfuscated[1] ^ mask[1]];
         u16::from_be_bytes(unmasked)
+    }
+
+    /// Re-key the obfuscator from a 24-byte PRNG seed (protocol polymorphism).
+    ///
+    /// Called on both sides after a `PrngSeed` frame is exchanged, so every
+    /// connection gets a unique length-obfuscation key derived from the seed.
+    /// Uses SHA-256 to derive 24 bytes: key0(8) || key1(8) || iv(8).
+    pub fn reset(&mut self, seed: &[u8; 24]) {
+        let digest = Sha256::digest(seed);
+        self.key0 = u64::from_le_bytes(digest[0..8].try_into().unwrap());
+        self.key1 = u64::from_le_bytes(digest[8..16].try_into().unwrap());
+        self.iv = u64::from_le_bytes(digest[16..24].try_into().unwrap());
     }
 }
 

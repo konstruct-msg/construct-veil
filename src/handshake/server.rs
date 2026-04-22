@@ -122,10 +122,18 @@ where
 
     // 5b. Replay check — reject replayed handshakes (active probing defence).
     // Guard must be dropped before any .await — extract the bool first.
-    let is_replay = {
+    let (is_replay, evicted) = {
         let mut filter = replay_filter.lock().expect("replay filter mutex poisoned");
-        filter.test_and_set(received_mac)
+        let prev_evictions = filter.evictions();
+        let is_replay = filter.test_and_set(received_mac);
+        (is_replay, filter.evictions() > prev_evictions)
     };
+    #[cfg(feature = "metrics")]
+    if evicted {
+        crate::metrics::ICE_REPLAY_EVICTIONS_TOTAL.inc();
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = evicted;
     if is_replay {
         random_delay(rng).await;
         return Err(Error::HandshakeMacMismatch);

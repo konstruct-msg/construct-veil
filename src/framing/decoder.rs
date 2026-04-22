@@ -72,6 +72,12 @@ impl FrameDecoder {
         self.buf.extend_from_slice(data);
     }
 
+    /// Re-key the length obfuscator from a 24-byte PRNG seed (protocol polymorphism).
+    /// Must be called after parsing a `PrngSeed` frame to stay in sync with the encoder.
+    pub fn reseed_length_obf(&mut self, seed: &[u8; 24]) {
+        self.length_obf.reset(seed);
+    }
+
     /// Try to decode one complete frame from the internal buffer.
     ///
     /// Returns:

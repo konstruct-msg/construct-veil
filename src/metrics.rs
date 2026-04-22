@@ -82,6 +82,16 @@ pub static ICE_REPLAY_REJECTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     .expect("Failed to register ICE_REPLAY_REJECTIONS_TOTAL")
 });
 
+/// Incremented when the replay filter bucket overflows and an entry is evicted.
+/// A sustained increase indicates a flood/DoS attempt on the handshake endpoint.
+pub static ICE_REPLAY_EVICTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(opts!(
+        "ice_replay_evictions_total",
+        "Total replay filter evictions (bucket overflow — possible DoS indicator)"
+    ))
+    .expect("Failed to register ICE_REPLAY_EVICTIONS_TOTAL")
+});
+
 // ============================================================================
 // Helper functions called from transport layer
 // ============================================================================

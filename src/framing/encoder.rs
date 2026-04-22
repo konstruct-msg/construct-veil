@@ -215,4 +215,10 @@ impl FrameEncoder {
     pub fn encode_prng_seed(&mut self, seed: &[u8; 24], dst: &mut BytesMut) -> Result<()> {
         self.encode_frame(PacketType::PrngSeed, seed, 0, dst)
     }
+
+    /// Re-key the length obfuscator from a 24-byte PRNG seed (protocol polymorphism).
+    /// Must be called after sending a `PrngSeed` frame so both sides advance in sync.
+    pub fn reseed_length_obf(&mut self, seed: &[u8; 24]) {
+        self.length_obf.reset(seed);
+    }
 }

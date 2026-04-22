@@ -453,7 +453,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Obfs4Stream<S> {
             loop {
                 match decoder.decode_frame() {
                     Ok(Some(DecodedFrame::PrngSeed(seed))) => {
+                        // Protocol polymorphism: reseed both IAT RNG and length obfuscator.
                         iat_rng = SmallRng::from_seed(prng_seed_to_rng_seed(&seed));
+                        decoder.reseed_length_obf(&seed);
                     }
                     Ok(Some(DecodedFrame::Payload(_))) => {}
                     Ok(None) => break,
@@ -552,8 +554,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Obfs4Stream<S> {
                                 this.read_buf.extend_from_slice(&payload);
                             }
                             Ok(Some(DecodedFrame::PrngSeed(seed))) => {
-                                // Protocol polymorphism: reseed IAT RNG
+                                // Protocol polymorphism: reseed IAT RNG and length obfuscator.
+                                // Both sides must advance in sync — decoder re-keys here,
+                                // encoder was re-keyed on the sender side after encode_prng_seed().
                                 *this.iat_rng = SmallRng::from_seed(prng_seed_to_rng_seed(&seed));
+                                this.decoder.reseed_length_obf(&seed);
                                 continue;
                             }
                             Ok(None) => break,
@@ -831,7 +836,10 @@ impl Obfs4Listener {
                 .await?;
             Pin::new(&mut ice_stream.inner).flush().await?;
         }
+        // Re-key both IAT RNG and length obfuscator to match what the client will do
+        // after decoding the PrngSeed frame.
         ice_stream.iat_rng = SmallRng::from_seed(prng_seed_to_rng_seed(&seed));
+        ice_stream.encoder.reseed_length_obf(&seed);
 
         Ok(ice_stream)
     }
