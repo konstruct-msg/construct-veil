@@ -192,7 +192,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebTunnelStream<S> {
     /// # Parameters
     /// - `inner`       — TLS-connected stream to the relay.
     /// - `host_header` — HTTP `Host` header value (relay domain or CDN front domain).
-    /// - `path`        — WebSocket resource path (e.g. `"/construct-ice"`).
+    /// - `path`        — WebSocket resource path (e.g. `"/api/stream"`).
     pub async fn connect(inner: S, host_header: &str, path: &str) -> io::Result<Self> {
         let mut stream = Self {
             inner,
@@ -206,6 +206,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebTunnelStream<S> {
         let key_bytes: [u8; 16] = random::<[u8; 16]>();
         let key = B64.encode(key_bytes);
 
+        // Browser-realistic HTTP/1.1 Upgrade request.
+        // Absent User-Agent / Origin / Accept headers are a strong DPI fingerprint —
+        // every real browser WebSocket includes them.  We mimic iOS 18 Safari.
         let request = format!(
             "GET {path} HTTP/1.1\r\n\
              Host: {host_header}\r\n\
@@ -213,6 +216,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebTunnelStream<S> {
              Connection: Upgrade\r\n\
              Sec-WebSocket-Key: {key}\r\n\
              Sec-WebSocket-Version: 13\r\n\
+             Origin: https://{host_header}\r\n\
+             User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4.1 Mobile/15E148 Safari/604.1\r\n\
+             Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7\r\n\
+             Accept-Encoding: gzip, deflate, br\r\n\
+             Cache-Control: no-cache\r\n\
+             Pragma: no-cache\r\n\
              \r\n"
         );
 

@@ -55,17 +55,17 @@ use std::sync::Arc;
 /// [`crate::transport::Obfs4Stream::connect_tls`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TlsProfile {
-    /// rustls defaults — recognizable TLS fingerprint.
+    /// rustls defaults — recognizable TLS fingerprint. Use only in tests.
     ///
     /// JA3 ciphers: 4867-4866-4865-52393-52392-49199-49200-49195-49196
-    #[default]
     Rustls,
 
-    /// Chrome 131 cipher suite ordering + key groups.
+    /// Chrome 131 cipher suite ordering + key groups. **Default for production.**
     ///
     /// JA3 ciphers: 4865-4866-4867-49195-49199-49196-49200-52393-52392
     /// (Chrome additionally sends 49171,49172,156,157,47,53 — CBC and RSA
     /// key-exchange suites not available in the rustls ring provider.)
+    #[default]
     Chrome131,
 
     /// Firefox 128 cipher suite ordering + key groups.
