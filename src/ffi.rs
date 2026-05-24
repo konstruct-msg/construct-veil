@@ -708,24 +708,31 @@ static PROXY_WEBTUNNEL: Mutex<Option<ProxyHandle>> = Mutex::new(None);
 #[unsafe(no_mangle)]
 /// Start the WebTunnel (WebSocket-over-TLS) proxy for DPI evasion.
 ///
-/// Traffic flow: local TCP → TLS (SNI=`tls_sni`) → WebSocket upgrade → relay.
+/// Traffic flow: local TCP → TLS (SNI=`tls_sni`) → WebSocket → relay.
 ///
-/// `relay_addr`  — relay IP:port (`"158.160.140.67:443"`).
-/// `tls_sni`     — SNI for TLS ClientHello; set to CDN domain for fronting.
-///                 Empty → IP-based ServerName (no SNI extension).
-/// `spki_hex`    — lowercase hex SHA-256 of DER SubjectPublicKeyInfo. Empty → no pinning.
-/// `host_header` — HTTP `Host` header for WebSocket upgrade. Can differ from `tls_sni`.
-/// `path`        — WebSocket resource path (e.g. `"/construct-ice"`).
-/// `port_out`    — local TCP port the proxy listens on.
+/// `relay_addr`   — relay IP:port (`"158.160.140.67:443"`).
+/// `tls_sni`      — SNI for TLS ClientHello; set to CDN domain for fronting.
+///                  Empty → IP-based ServerName (no SNI extension).
+/// `spki_hex`     — lowercase hex SHA-256 of DER SubjectPublicKeyInfo. Empty → no pinning.
+/// `host_header`  — HTTP `Host` header for WebSocket upgrade. Can differ from `tls_sni`.
+/// `bridge_cert`  — base64-encoded obfs4 bridge cert from relay manifest (used for token derivation).
+/// `wt_base_path` — WebSocket resource base path (e.g. `"/api/stream"`), without the token.
+/// `port_out`     — local TCP port the proxy listens on.
 ///
+/// The auth token is computed per-connection from `bridge_cert` and the current time period.
 /// Returns 0 on success, -1 on failure. Stop with `ice_proxy_stop`.
+///
+/// TODO(refactor): 7 raw C pointers is fragile — group into `WebTunnelConfig` struct passed by
+/// pointer, mirroring the pattern used by the bridging header on the Swift side. This also makes
+/// adding future fields (e.g. obfs4 iat-mode, circuit isolation) a non-breaking change.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn ice_proxy_start_webtunnel(
     relay_addr: *const c_char,
     tls_sni: *const c_char,
     spki_hex: *const c_char,
     host_header: *const c_char,
-    path: *const c_char,
+    bridge_cert: *const c_char,
+    wt_base_path: *const c_char,
     port_out: *mut u16,
 ) -> i32 {
     fn parse_req(ptr: *const c_char) -> Option<String> {
@@ -747,8 +754,9 @@ pub extern "C" fn ice_proxy_start_webtunnel(
     let tls_sni = parse_opt(tls_sni);
     let spki_hex = parse_opt(spki_hex);
     let host = parse_opt(host_header);
-    let path_s = {
-        let p = parse_opt(path);
+    let bridge_cert = parse_opt(bridge_cert);
+    let wt_base_path = {
+        let p = parse_opt(wt_base_path);
         if p.is_empty() { "/".to_owned() } else { p }
     };
 
@@ -769,7 +777,8 @@ pub extern "C" fn ice_proxy_start_webtunnel(
             tls_sni,
             spki_hex,
             host,
-            path_s,
+            bridge_cert,
+            wt_base_path,
             shutdown_rx,
         ));
         let mut guard = PROXY_WEBTUNNEL.lock().map_err(|_| ())?;
@@ -807,7 +816,8 @@ async fn proxy_loop_webtunnel(
     tls_sni: String,
     tls_spki_hex: String,
     host_header: String,
-    path: String,
+    bridge_cert: String,
+    wt_base_path: String,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     loop {
@@ -816,11 +826,11 @@ async fn proxy_loop_webtunnel(
             result = listener.accept() => {
                 match result {
                     Ok((local, _)) => {
-                        let (addr, sni, spki, host, p) = (
+                        let (addr, sni, spki, host, bc, bp) = (
                             relay_addr.clone(), tls_sni.clone(), tls_spki_hex.clone(),
-                            host_header.clone(), path.clone(),
+                            host_header.clone(), bridge_cert.clone(), wt_base_path.clone(),
                         );
-                        tokio::spawn(handle_connection_webtunnel(local, addr, sni, spki, host, p));
+                        tokio::spawn(handle_connection_webtunnel(local, addr, sni, spki, host, bc, bp));
                     }
                     Err(_) => break,
                 }
@@ -836,10 +846,33 @@ async fn handle_connection_webtunnel(
     tls_sni: String,
     tls_spki_hex: String,
     host_header: String,
-    path: String,
+    bridge_cert: String,
+    wt_base_path: String,
 ) {
     use crate::transport::webtunnel::WebTunnelStream;
     use tokio::net::TcpStream as TokioTcp;
+
+    // Compute auth token for the current time period.
+    // Token = SHA-256(bridge_cert || "webtunnel-v1" || period_be)[:8] as lowercase hex.
+    // Period = unix_seconds / 300 (5-minute windows).
+    let auth_token = {
+        use sha2::{Digest, Sha256};
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let period = now / 300;
+        let mut hasher = Sha256::new();
+        hasher.update(bridge_cert.as_bytes());
+        hasher.update(b"webtunnel-v1");
+        hasher.update(period.to_be_bytes());
+        let hash = hasher.finalize();
+        hash[..8]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>()
+    };
+    let path = format!("{}/{}", wt_base_path.trim_end_matches('/'), auth_token);
 
     let (connector, server_name) = match crate::tls_pinned::build_connector(
         &tls_sni,
