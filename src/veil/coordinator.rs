@@ -23,8 +23,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::veil::fsm::{
-    VeilConfig, VeilEffect, VeilEvent, VeilState, MethodId, MethodSet, NetworkFingerprint,
-    ProbeFailureReason, TransportFailureKind, reduce,
+    MethodId, MethodSet, NetworkFingerprint, ProbeFailureReason, TransportFailureKind, VeilConfig,
+    VeilEffect, VeilEvent, VeilState, reduce,
 };
 use crate::veil::obfuscator::{Obfuscator, ObfuscatorError, ProbeRequest};
 use crate::veil::scoring::{CachedScoreLookup, PersistentScores};
@@ -150,7 +150,9 @@ impl VeilCoordinator {
                     }
                     VeilEvent::CooldownElapsed
                 }
-                VeilState::Active { .. } | VeilState::Probing { .. } | VeilState::Degraded { .. } => {
+                VeilState::Active { .. }
+                | VeilState::Probing { .. }
+                | VeilState::Degraded { .. } => {
                     break;
                 }
             };

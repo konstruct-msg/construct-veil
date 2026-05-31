@@ -993,7 +993,7 @@ pub struct VeilStartResult {
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -> i32 {
     use crate::veil::{
-        VeilConfig, VeilCoordinator, MethodSet, NetworkFingerprint, Obfs4Obfuscator,
+        MethodSet, NetworkFingerprint, Obfs4Obfuscator, VeilConfig, VeilCoordinator,
         WebTunnelObfuscator, scoring::PersistentScores,
     };
 

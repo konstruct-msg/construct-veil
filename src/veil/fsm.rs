@@ -728,7 +728,9 @@ pub fn reduce(
             }
         }
 
-        (VeilState::Active { .. }, VeilEvent::Stop) => (VeilState::Idle, vec![VeilEffect::StopActive]),
+        (VeilState::Active { .. }, VeilEvent::Stop) => {
+            (VeilState::Idle, vec![VeilEffect::StopActive])
+        }
 
         (VeilState::Active { .. }, _) => {
             // Ignore other events in Active.
