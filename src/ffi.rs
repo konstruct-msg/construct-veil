@@ -1056,7 +1056,7 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
     let config = VeilConfig::default();
 
     let rt = get_runtime();
-    let result: Result<VeilStartResult, ()> = rt.block_on(async {
+    let result: Result<VeilStartResult, String> = rt.block_on(async {
         // Stop any existing session first.
         if let Some(coord) = COORDINATOR.get() {
             let _ = coord.stop().await;
@@ -1073,15 +1073,15 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
                 if !path_str.is_empty() {
                     PersistentScores::open_default(path_str)
                         .await
-                        .map_err(|_| ())?
+                        .map_err(|e| format!("scores open failed: {e}"))?
                 } else {
-                    return Err(());
+                    return Err("scores_path empty".to_string());
                 }
             } else {
                 // In-memory SQLite for testing.
                 PersistentScores::open_default(":memory:")
                     .await
-                    .map_err(|_| ())?
+                    .map_err(|e| format!("scores open (memory) failed: {e}"))?
             };
 
             let mut coordinator = VeilCoordinator::new(config, scores);
@@ -1089,7 +1089,9 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
             coordinator.register(Box::new(WebTunnelObfuscator::new()));
 
             let arc = std::sync::Arc::new(coordinator);
-            COORDINATOR.set(arc.clone()).map_err(|_| ())?;
+            COORDINATOR
+                .set(arc.clone())
+                .map_err(|_| "COORDINATOR already set (race)".to_string())?;
             arc
         };
 
@@ -1123,7 +1125,7 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
                 method: r.method as u8,
                 latency_ms: r.latency_ms,
             }),
-            Err(_) => Err(()),
+            Err(e) => Err(format!("start_session: {e}")),
         }
     });
 
@@ -1134,7 +1136,12 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
             }
             0
         }
-        Err(()) => -1,
+        Err(reason) => {
+            tracing::error!(target: "veil::ffi", "veil_start failed: {}", reason);
+            // Also emit to stderr so iOS unified-log captures it even without tracing-subscriber.
+            eprintln!("[veil_start] FAILED: {}", reason);
+            -1
+        }
     }
 }
 

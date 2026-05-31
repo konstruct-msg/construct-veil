@@ -27,7 +27,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use sqlx::{Row, SqlitePool};
+use sqlx::{
+    Row, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
 
 use crate::veil::fsm::{MethodId, NetworkFingerprint, ScoreEntry, ScoreLookup, ScoreOutcome};
 
@@ -46,14 +49,29 @@ impl PersistentScores {
         path: impl AsRef<Path>,
         max_fingerprints: usize,
     ) -> Result<Self, ScoringError> {
-        let url = format!("sqlite:{}", path.as_ref().display());
-        let pool = SqlitePool::connect(&url).await.map_err(|e| {
-            ScoringError::DbError(format!(
-                "failed to connect to {}: {}",
-                path.as_ref().display(),
-                e
-            ))
-        })?;
+        let path_ref = path.as_ref();
+        // `SqlitePool::connect("sqlite:PATH")` opens the file read-write but does
+        // NOT create it if absent — sqlx returns SQLITE_CANTOPEN(14). On iOS the
+        // first launch always misses, so we must opt in to creation explicitly.
+        // `:memory:` is a special token: keep the URL form for that case.
+        let pool = if path_ref.as_os_str() == ":memory:" {
+            SqlitePool::connect("sqlite::memory:").await.map_err(|e| {
+                ScoringError::DbError(format!("failed to connect to :memory:: {e}"))
+            })?
+        } else {
+            let opts = SqliteConnectOptions::new()
+                .filename(path_ref)
+                .create_if_missing(true);
+            SqlitePoolOptions::new()
+                .connect_with(opts)
+                .await
+                .map_err(|e| {
+                    ScoringError::DbError(format!(
+                        "failed to connect to {}: {e}",
+                        path_ref.display(),
+                    ))
+                })?
+        };
 
         Self::migrate(&pool).await?;
 

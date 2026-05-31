@@ -613,12 +613,24 @@ impl VeilCoordinator {
                     .await;
             }
 
-            // Start proxy loop.
-            let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+            // Start proxy loop. shutdown_tx must be stored in ActiveSession —
+            // dropping it here would cancel run_proxy_loop's shutdown_rx.await
+            // immediately, exit the accept loop, drop the listener, and leave
+            // the iOS gRPC client with an unreachable 127.0.0.1:port (ECONNREFUSED).
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let active = self.active.clone();
             let proxy_method = winning_method;
             let relay_addr = relay.to_owned();
             let bundle_str = bundle.to_owned();
+
+            {
+                let mut guard = self.active.lock().await;
+                *guard = Some(ActiveSession {
+                    port,
+                    method: proxy_method,
+                    shutdown_tx,
+                });
+            }
 
             tokio::spawn(async move {
                 run_proxy_loop(listener, relay_addr, bundle_str, shutdown_rx, proxy_method).await;
@@ -719,12 +731,22 @@ impl VeilCoordinator {
             }
         }
 
-        // Start the proxy loop.
-        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        // Start the proxy loop. shutdown_tx must outlive this scope — see the
+        // parallel-probe path for the failure mode if it doesn't.
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let active = self.active.clone();
         let proxy_method = method;
         let relay_addr = relay.to_owned();
         let bundle_str = bundle.to_owned();
+
+        {
+            let mut guard = self.active.lock().await;
+            *guard = Some(ActiveSession {
+                port,
+                method: proxy_method,
+                shutdown_tx,
+            });
+        }
 
         tokio::spawn(async move {
             run_proxy_loop(listener, relay_addr, bundle_str, shutdown_rx, proxy_method).await;
