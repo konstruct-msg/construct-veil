@@ -92,7 +92,7 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for ObfuscatorError {
 }
 
 /// Information passed to an obfuscator to start a probe.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ProbeRequest {
     /// Relay address (e.g. "relay.example.com:443").
     pub relay_addr: String,
@@ -106,6 +106,9 @@ pub struct ProbeRequest {
     pub host_header: String,
     /// WebTunnel: WebSocket base path.
     pub wt_base_path: String,
+    /// VeilFront: base64-encoded 65-byte ticket blob.
+    /// Empty string = no ticket (probe will fail, as expected without auth).
+    pub veil_front_ticket_b64: String,
 }
 
 /// Trait that every obfuscation method must implement.

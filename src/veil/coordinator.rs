@@ -475,11 +475,12 @@ impl VeilCoordinator {
                 let probe_start = Instant::now();
                 let req = ProbeRequest {
                     relay_addr: relay_str,
-                    bundle: bundle_str,
+                    bundle: bundle_str.clone(),
                     tls_sni: tls_sni_str,
                     spki_hex: spki_hex_str,
                     host_header: host_header_str,
                     wt_base_path: wt_base_path_str,
+                    veil_front_ticket_b64: bundle_str, // PoC: ticket embedded in bundle
                 };
 
                 let handle = match obf.start(&req, cancel.clone()).await {
@@ -850,6 +851,7 @@ impl VeilCoordinator {
             spki_hex: spki_hex.to_owned(),
             host_header: host_header.to_owned(),
             wt_base_path: wt_base_path.to_owned(),
+            veil_front_ticket_b64: bundle.to_owned(), // PoC: ticket embedded in bundle
         };
         let cancel = CancellationToken::new();
 

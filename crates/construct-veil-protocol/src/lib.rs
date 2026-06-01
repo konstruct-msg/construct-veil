@@ -25,7 +25,7 @@
 
 mod auth;
 mod framing;
-mod ticket;
+pub mod ticket;
 mod varint;
 
 pub use auth::*;

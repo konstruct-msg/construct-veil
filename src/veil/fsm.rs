@@ -22,12 +22,16 @@ pub enum MethodId {
     WebTunnel = 1,
     /// Masque — HTTP/3 DATAGRAM (future).
     Masque = 2,
+    /// VeilFront — honest-front HTTPS relay with session-bound ticket auth.
+    /// Client opens standard TLS 1.3, sends auth record in first application data.
+    /// Relay routes to tunnel (valid ticket) or real site (everything else).
+    VeilFront = 3,
 }
 
 impl MethodId {
     /// All known methods, in priority order for scoring.
     pub fn all() -> &'static [Self] {
-        &[Self::Obfs4, Self::WebTunnel, Self::Masque]
+        &[Self::Obfs4, Self::WebTunnel, Self::Masque, Self::VeilFront]
     }
 
     /// Convert to the bitmask bit position.
@@ -41,6 +45,7 @@ impl MethodId {
             Self::Obfs4 => "obfs4",
             Self::WebTunnel => "webtunnel",
             Self::Masque => "masque",
+            Self::VeilFront => "veil-front",
         }
     }
 }

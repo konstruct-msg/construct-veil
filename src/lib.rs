@@ -1,6 +1,6 @@
 //! # construct-veil
 //!
-//! ICE (Intrusion Countermeasures Electronics) — obfs4 pluggable transport for Construct Messenger.
+//! VEIL — (Variable Encoded Interface Layer) obfs4 pluggable transport for Construct Messenger.
 //!
 //! obfs4 makes traffic indistinguishable from random noise, providing
 //! resistance against Deep Packet Inspection (DPI) systems.
