@@ -1,10 +1,21 @@
-[package]
-name = "construct-veil"
+[workspace]
+members = [
+    ".",
+    "crates/construct-veil-protocol",
+]
+resolver = "2"
+
+[workspace.package]
 version = "3.0.0"
 edition = "2024"
-description = "VEIL — (Variable Encoded Interface Layer) — traffic obfuscation transport for Construct messenger"
 license = "MIT"
 repository = "https://github.com/construct-msg/construct-veil"
+
+[package]
+name = "construct-veil"
+version.workspace = true
+edition.workspace = true
+description = "VEIL — (Variable Encoded Interface Layer) — traffic obfuscation transport for Construct messenger"
 keywords = ["web-tunnel", "pluggable-transport", "censorship-resistance", "tor"]
 
 [lib]
@@ -27,6 +38,9 @@ path = "examples/grpc_obfs4_client.rs"
 required-features = ["tonic-transport"]
 
 [dependencies]
+# Shared veil-front protocol types (tickets, auth, framing)
+construct-veil-protocol = { path = "crates/construct-veil-protocol" }
+
 # Crypto
 curve25519-elligator2 = { version = "0.1.0-alpha.2", features = ["elligator2", "rand_core"] }
 sha2 = "0.10"
