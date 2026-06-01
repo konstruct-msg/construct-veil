@@ -35,10 +35,10 @@ pub mod scoring;
 
 #[cfg(feature = "tls")]
 pub mod obfs4_adapter;
-#[cfg(feature = "webtunnel")]
-pub mod webtunnel_adapter;
 #[cfg(feature = "utls")]
 pub mod veil_front_adapter;
+#[cfg(feature = "webtunnel")]
+pub mod webtunnel_adapter;
 
 pub use coordinator::*;
 pub use fsm::*;
@@ -47,7 +47,7 @@ pub use scoring::*;
 
 #[cfg(feature = "tls")]
 pub use obfs4_adapter::Obfs4Obfuscator;
-#[cfg(feature = "webtunnel")]
-pub use webtunnel_adapter::WebTunnelObfuscator;
 #[cfg(feature = "utls")]
 pub use veil_front_adapter::VeilFrontObfuscator;
+#[cfg(feature = "webtunnel")]
+pub use webtunnel_adapter::WebTunnelObfuscator;

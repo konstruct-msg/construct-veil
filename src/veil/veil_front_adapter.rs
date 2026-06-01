@@ -17,14 +17,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::veil::fsm::MethodId;
 use crate::veil::obfuscator::{Obfuscator, ObfuscatorError, ObfuscatorHandle, ProbeRequest};
-use construct_veil_protocol::{
-    AuthRecord, Frame, VeilFrontCodec,
-    AUTH_PAYLOAD_LEN, EXPORTER_LABEL, EXPORTER_LEN, FRAME_TYPE_AUTH, FRAME_TYPE_CHAFF,
-    FRAME_TYPE_DATA,
-};
 use construct_veil_protocol::ticket::{
-    ticket_from_bytes, ticket_to_bytes, AuthKey, Ticket, AUTH_KEY_LEN, TICKET_ID_LEN,
-    TICKET_WIRE_LEN,
+    AUTH_KEY_LEN, AuthKey, TICKET_ID_LEN, TICKET_WIRE_LEN, Ticket, ticket_from_bytes,
+    ticket_to_bytes,
+};
+use construct_veil_protocol::{
+    AUTH_PAYLOAD_LEN, AuthRecord, EXPORTER_LABEL, EXPORTER_LEN, FRAME_TYPE_AUTH, FRAME_TYPE_CHAFF,
+    FRAME_TYPE_DATA, Frame, VeilFrontCodec,
 };
 
 /// VeilFront probe adapter.
@@ -169,9 +168,7 @@ async fn probe_veil_front(req: &ProbeRequest) -> Result<(), ObfuscatorError> {
                     }
                     FRAME_TYPE_AUTH => {
                         // Relay sent AUTH back — protocol error.
-                        return Err(ObfuscatorError::Handshake(
-                            "relay echoed AUTH frame".into(),
-                        ));
+                        return Err(ObfuscatorError::Handshake("relay echoed AUTH frame".into()));
                     }
                     other => {
                         return Err(ObfuscatorError::Handshake(format!(
@@ -220,24 +217,21 @@ async fn dial_utls_tcp(
     )
     .map_err(|e| ObfuscatorError::Tls(e.to_string()))?;
 
-    connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| {
-            let err_str = e.to_string();
-            if (err_str.contains("alert") && err_str.contains("40"))
-                || err_str.contains("handshake_failure")
-            {
-                ObfuscatorError::FingerprintBlocked
-            } else if err_str.contains("cert")
-                || err_str.contains("verify")
-                || err_str.contains("certificate")
-            {
-                ObfuscatorError::CertProblem(err_str)
-            } else {
-                ObfuscatorError::Tls(err_str)
-            }
-        })
+    connector.connect(server_name, tcp).await.map_err(|e| {
+        let err_str = e.to_string();
+        if (err_str.contains("alert") && err_str.contains("40"))
+            || err_str.contains("handshake_failure")
+        {
+            ObfuscatorError::FingerprintBlocked
+        } else if err_str.contains("cert")
+            || err_str.contains("verify")
+            || err_str.contains("certificate")
+        {
+            ObfuscatorError::CertProblem(err_str)
+        } else {
+            ObfuscatorError::Tls(err_str)
+        }
+    })
 }
 
 /// Derive the TLS exporter keying material (32 bytes).

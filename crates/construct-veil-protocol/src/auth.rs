@@ -20,9 +20,9 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
-use crate::ticket::{Ticket, TICKET_ID_LEN};
-use crate::varint::{decode_varint, encode_varint};
 use crate::FRAME_TYPE_AUTH;
+use crate::ticket::{TICKET_ID_LEN, Ticket};
+use crate::varint::{decode_varint, encode_varint};
 
 /// Length of the HMAC-SHA256 authcode in bytes.
 pub const AUTHCODE_LEN: usize = 32;
@@ -149,8 +149,8 @@ pub fn constant_time_verify(actual: &[u8; AUTHCODE_LEN], expected: &[u8; AUTHCOD
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ticket::AuthKey;
     use crate::AUTH_KEY_LEN;
+    use crate::ticket::AuthKey;
     use tokio_util::codec::{Decoder, Encoder};
 
     /// Create a test ticket with known values.

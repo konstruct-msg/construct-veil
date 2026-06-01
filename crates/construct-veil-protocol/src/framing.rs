@@ -158,7 +158,10 @@ impl Decoder for VeilFrontCodec {
         if payload_len as usize > self.max_payload {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("frame payload too large: {} bytes (max {})", payload_len, self.max_payload),
+                format!(
+                    "frame payload too large: {} bytes (max {})",
+                    payload_len, self.max_payload
+                ),
             ));
         }
 
@@ -176,7 +179,10 @@ impl Decoder for VeilFrontCodec {
         // Extract payload.
         let payload = src.split_to(payload_len as usize).freeze();
 
-        Ok(Some(Frame { frame_type, payload }))
+        Ok(Some(Frame {
+            frame_type,
+            payload,
+        }))
     }
 
     fn decode_eof(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -222,7 +228,10 @@ mod tests {
         let mut buf = BytesMut::new();
         codec.encode(frame, &mut buf).unwrap();
 
-        let decoded = codec.decode(&mut buf).unwrap().expect("decode returned None");
+        let decoded = codec
+            .decode(&mut buf)
+            .unwrap()
+            .expect("decode returned None");
         assert_eq!(decoded.frame_type, FRAME_TYPE_DATA);
         assert_eq!(decoded.payload, payload);
         assert!(buf.is_empty());
@@ -237,7 +246,10 @@ mod tests {
         let mut buf = BytesMut::new();
         codec.encode(frame.clone(), &mut buf).unwrap();
 
-        let decoded = codec.decode(&mut buf).unwrap().expect("decode returned None");
+        let decoded = codec
+            .decode(&mut buf)
+            .unwrap()
+            .expect("decode returned None");
         assert_eq!(decoded, frame);
     }
 
@@ -256,7 +268,10 @@ mod tests {
         let mut buf = BytesMut::new();
         codec.encode(frame.clone(), &mut buf).unwrap();
 
-        let decoded = codec.decode(&mut buf).unwrap().expect("decode returned None");
+        let decoded = codec
+            .decode(&mut buf)
+            .unwrap()
+            .expect("decode returned None");
         assert!(decoded.is_auth());
         assert_eq!(decoded.payload, payload);
     }
@@ -297,7 +312,10 @@ mod tests {
         }
 
         for expected in &frames {
-            let decoded = codec.decode(&mut buf).unwrap().expect("decode returned None");
+            let decoded = codec
+                .decode(&mut buf)
+                .unwrap()
+                .expect("decode returned None");
             assert_eq!(decoded, *expected);
         }
 

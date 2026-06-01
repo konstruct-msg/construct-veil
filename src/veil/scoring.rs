@@ -55,9 +55,9 @@ impl PersistentScores {
         // first launch always misses, so we must opt in to creation explicitly.
         // `:memory:` is a special token: keep the URL form for that case.
         let pool = if path_ref.as_os_str() == ":memory:" {
-            SqlitePool::connect("sqlite::memory:").await.map_err(|e| {
-                ScoringError::DbError(format!("failed to connect to :memory:: {e}"))
-            })?
+            SqlitePool::connect("sqlite::memory:")
+                .await
+                .map_err(|e| ScoringError::DbError(format!("failed to connect to :memory:: {e}")))?
         } else {
             let opts = SqliteConnectOptions::new()
                 .filename(path_ref)
