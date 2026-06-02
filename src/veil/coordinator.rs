@@ -374,6 +374,8 @@ impl VeilCoordinator {
                         fingerprint,
                         relay,
                         bundle,
+                        tls_sni,
+                        spki_hex,
                         state,
                         scores_cache,
                     )
@@ -621,8 +623,13 @@ impl VeilCoordinator {
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
             let active = self.active.clone();
             let proxy_method = winning_method;
-            let relay_addr = relay.to_owned();
-            let bundle_str = bundle.to_owned();
+            let proxy_params = ProxyParams {
+                method: winning_method,
+                relay_addr: relay.to_owned(),
+                bundle: bundle.to_owned(),
+                tls_sni: tls_sni.to_owned(),
+                spki_hex: spki_hex.to_owned(),
+            };
 
             {
                 let mut guard = self.active.lock().await;
@@ -634,7 +641,7 @@ impl VeilCoordinator {
             }
 
             tokio::spawn(async move {
-                run_proxy_loop(listener, relay_addr, bundle_str, shutdown_rx, proxy_method).await;
+                run_proxy_loop(listener, proxy_params, shutdown_rx).await;
                 let mut guard = active.lock().await;
                 *guard = None;
             });
@@ -675,6 +682,7 @@ impl VeilCoordinator {
     }
 
     /// Handle a successful probe: transition FSM, record score, start proxy.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_probe_success(
         &self,
         method: MethodId,
@@ -682,6 +690,8 @@ impl VeilCoordinator {
         fingerprint: &NetworkFingerprint,
         relay: &str,
         bundle: &str,
+        tls_sni: &str,
+        spki_hex: &str,
         state: &mut VeilState,
         scores_cache: &CachedScoreLookup,
     ) -> Result<(), CoordinatorError> {
@@ -737,8 +747,13 @@ impl VeilCoordinator {
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let active = self.active.clone();
         let proxy_method = method;
-        let relay_addr = relay.to_owned();
-        let bundle_str = bundle.to_owned();
+        let proxy_params = ProxyParams {
+            method,
+            relay_addr: relay.to_owned(),
+            bundle: bundle.to_owned(),
+            tls_sni: tls_sni.to_owned(),
+            spki_hex: spki_hex.to_owned(),
+        };
 
         {
             let mut guard = self.active.lock().await;
@@ -750,7 +765,7 @@ impl VeilCoordinator {
         }
 
         tokio::spawn(async move {
-            run_proxy_loop(listener, relay_addr, bundle_str, shutdown_rx, proxy_method).await;
+            run_proxy_loop(listener, proxy_params, shutdown_rx).await;
             let mut guard = active.lock().await;
             *guard = None;
         });
@@ -907,31 +922,38 @@ impl VeilCoordinator {
     }
 }
 
-/// Run the proxy loop: accept local connections and forward through obfs4.
+/// Parameters needed to run the data-plane proxy for the winning method.
+#[derive(Clone)]
+struct ProxyParams {
+    /// Winning obfuscation method — selects the data-plane path.
+    method: MethodId,
+    /// Relay address (`host:port`).
+    relay_addr: String,
+    /// Bridge/cert bundle (obfs4) — also the veil-front ticket blob (PoC).
+    bundle: String,
+    /// TLS SNI (TLS-wrapped methods). Read only by the veil-front (utls) path.
+    #[cfg_attr(not(feature = "utls"), allow(dead_code))]
+    tls_sni: String,
+    /// SPKI hex pin (TLS-wrapped methods). Read only by the veil-front (utls) path.
+    #[cfg_attr(not(feature = "utls"), allow(dead_code))]
+    spki_hex: String,
+}
+
+/// Run the proxy loop: accept local connections and forward through the winning
+/// method's data plane.
 async fn run_proxy_loop(
     listener: TcpListener,
-    relay_addr: String,
-    bundle: String,
+    params: ProxyParams,
     mut shutdown_rx: oneshot::Receiver<()>,
-    _method: MethodId,
 ) {
-    let config = match crate::ClientConfig::from_bridge_line(&bundle) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("ice: coordinator: invalid bundle: {e}");
-            return;
-        }
-    };
-
     loop {
         tokio::select! {
             _ = &mut shutdown_rx => break,
             result = listener.accept() => {
                 match result {
                     Ok((local, _)) => {
-                        let addr = relay_addr.clone();
-                        let cfg = config.clone();
-                        tokio::spawn(handle_proxy_connection(local, addr, cfg));
+                        let params = params.clone();
+                        tokio::spawn(handle_proxy_connection(local, params));
                     }
                     Err(_) => break,
                 }
@@ -940,13 +962,42 @@ async fn run_proxy_loop(
     }
 }
 
-/// Handle a single proxy connection: local → obfs4 → relay.
-async fn handle_proxy_connection(
-    mut local: TcpStream,
-    relay_addr: String,
-    config: crate::ClientConfig,
-) {
-    match TcpStream::connect(&relay_addr).await {
+/// Handle a single proxy connection by dispatching to the winning method's
+/// data plane: local → <method> → relay.
+async fn handle_proxy_connection(local: TcpStream, params: ProxyParams) {
+    match params.method {
+        #[cfg(feature = "utls")]
+        MethodId::VeilFront => {
+            // veil-front: framed h2c ferry over the authenticated TLS tunnel.
+            // PoC: the ticket blob is carried in `bundle`.
+            if let Err(e) = crate::veil::veil_front_adapter::run_veil_front_ferry(
+                local,
+                &params.relay_addr,
+                &params.tls_sni,
+                &params.spki_hex,
+                &params.bundle,
+            )
+            .await
+            {
+                eprintln!("ice: coordinator: veil-front ferry failed: {e}");
+            }
+        }
+        // obfs4 (and any non-veil-front method) — obfs4 data plane.
+        _ => forward_obfs4(local, params).await,
+    }
+}
+
+/// obfs4 data plane: local → obfs4 handshake → relay.
+async fn forward_obfs4(mut local: TcpStream, params: ProxyParams) {
+    let config = match crate::ClientConfig::from_bridge_line(&params.bundle) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ice: coordinator: invalid bundle: {e}");
+            return;
+        }
+    };
+
+    match TcpStream::connect(&params.relay_addr).await {
         Ok(tcp) => {
             let _ = tcp.set_nodelay(true);
             match crate::Obfs4Stream::client_handshake_stream(tcp, config).await {

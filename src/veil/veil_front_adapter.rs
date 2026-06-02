@@ -4,27 +4,35 @@
 //! 1. TCP connect to relay
 //! 2. TLS 1.3 handshake (uTLS browser profile + SPKI pin)
 //! 3. Derive TLS exporter keying material
-//! 4. Parse ticket from bundle, build AuthRecord
-//! 5. Send AUTH frame as first application data
-//! 6. Read first frame back — if DATA, tunnel is live; if not, probe failed
+//! 4. Parse ticket from bundle, build AuthRecord, send AUTH frame
+//! 5. Send the HTTP/2 client preface inside a DATA frame to drive the h2c backend
+//! 6. Read a framed DATA response back — its arrival proves the tunnel is live
+//!
+//! After a probe wins the race, the coordinator runs [`run_veil_front_ferry`] on
+//! a fresh local listener: it re-dials + re-auths and ferries the gRPC client's
+//! h2c bytes as `DATA` frames (sketch §7), dropping any `CHAFF` from the relay.
 
 use std::time::Duration;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Bytes, BytesMut};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder};
 use tokio_util::sync::CancellationToken;
 
 use crate::veil::fsm::MethodId;
 use crate::veil::obfuscator::{Obfuscator, ObfuscatorError, ObfuscatorHandle, ProbeRequest};
-use construct_veil_protocol::ticket::{
-    AUTH_KEY_LEN, AuthKey, TICKET_ID_LEN, TICKET_WIRE_LEN, Ticket, ticket_from_bytes,
-    ticket_to_bytes,
-};
+use construct_veil_protocol::ticket::{TICKET_WIRE_LEN, Ticket, ticket_from_bytes};
 use construct_veil_protocol::{
-    AUTH_PAYLOAD_LEN, AuthRecord, EXPORTER_LABEL, EXPORTER_LEN, FRAME_TYPE_AUTH, FRAME_TYPE_CHAFF,
-    FRAME_TYPE_DATA, Frame, VeilFrontCodec,
+    AuthRecord, EXPORTER_LABEL, EXPORTER_LEN, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, Frame,
+    VeilFrontCodec,
 };
+
+/// HTTP/2 client connection preface (RFC 7540 §3.5) + an empty SETTINGS frame.
+/// Sent inside the first DATA frame so the h2c backend responds, giving the
+/// probe a real end-to-end first byte without a full gRPC exchange.
+const H2_PREFACE_AND_SETTINGS: &[u8] =
+    b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00";
 
 /// VeilFront probe adapter.
 pub struct VeilFrontObfuscator;
@@ -74,10 +82,16 @@ impl Obfuscator for VeilFrontObfuscator {
     }
 }
 
-/// Execute the veil-front probe: TCP + TLS + auth record.
-async fn probe_veil_front(req: &ProbeRequest) -> Result<(), ObfuscatorError> {
-    let relay_addr = &req.relay_addr;
-
+/// Dial the relay, complete TLS (uTLS + SPKI pin), and send the AUTH frame.
+///
+/// Returns the authenticated TLS stream with the AUTH frame already written and
+/// flushed. The caller drives the tunnel (probe round-trip or data ferry).
+async fn dial_and_authenticate(
+    relay_addr: &str,
+    tls_sni: &str,
+    spki_hex: &str,
+    ticket_b64: &str,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ObfuscatorError> {
     // TCP connect with timeout.
     let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(relay_addr))
         .await
@@ -89,115 +103,169 @@ async fn probe_veil_front(req: &ProbeRequest) -> Result<(), ObfuscatorError> {
                 ObfuscatorError::Io(e)
             }
         })?;
-
-    tcp.set_nodelay(true).map_err(|e| ObfuscatorError::Io(e))?;
+    tcp.set_nodelay(true).map_err(ObfuscatorError::Io)?;
 
     // TLS handshake with SPKI pinning.
-    let tls_sni = &req.tls_sni;
-    let spki_hex = &req.spki_hex;
+    let mut tls_stream = dial_utls_tcp(tcp, tls_sni, spki_hex, relay_addr).await?;
 
-    let tls_stream = dial_utls_tcp(tcp, tls_sni, spki_hex, relay_addr).await?;
+    // Parse ticket (PoC: bundle is base64-encoded 65-byte ticket).
+    let ticket = parse_ticket(ticket_b64)?;
 
-    // Parse ticket from the bundle (PoC: bundle is base64-encoded 65-byte ticket).
-    let ticket = parse_ticket(&req.veil_front_ticket_b64)?;
-
-    // Derive TLS exporter keying material (32 bytes).
+    // Derive TLS exporter keying material (32 bytes) and build the auth record:
+    // HMAC(auth_key, exporter || ticket_id || not_after).
     let exporter = derive_exporter(&tls_stream)?;
-
-    // Build auth record: HMAC(auth_key, exporter || ticket_id || not_after).
     let auth = AuthRecord::from_ticket(&ticket, &exporter);
-    let auth_frame = Frame::auth({
-        let mut buf = BytesMut::with_capacity(AUTH_PAYLOAD_LEN);
-        buf.put_slice(&auth.ticket_id);
-        buf.put_slice(&auth.authcode);
-        buf.freeze()
-    });
 
-    // Send AUTH frame as first application data.
+    // Send AUTH frame as the first application record.
+    // `AuthRecord::encode` yields the complete framed record (type+varint+payload).
+    let auth_frame = auth.encode();
+    tls_stream
+        .write_all(&auth_frame)
+        .await
+        .map_err(ObfuscatorError::Io)?;
+    tls_stream.flush().await.map_err(ObfuscatorError::Io)?;
+
+    Ok(tls_stream)
+}
+
+/// Execute the veil-front probe: auth, then drive a real end-to-end round-trip.
+///
+/// The relay never signals its branch decision (sketch §10), so we cannot infer
+/// success from a relay-emitted marker. Instead we send the HTTP/2 client preface
+/// inside a DATA frame; a valid tunnel forwards it to the h2c backend, whose
+/// SETTINGS reply comes back wrapped in a DATA frame. Receiving that DATA frame
+/// proves the tunnel is live. If auth failed we were routed to the cover site,
+/// whose bytes do not decode as a DATA frame → probe fails.
+async fn probe_veil_front(req: &ProbeRequest) -> Result<(), ObfuscatorError> {
+    let tls_stream = dial_and_authenticate(
+        &req.relay_addr,
+        &req.tls_sni,
+        &req.spki_hex,
+        &req.veil_front_ticket_b64,
+    )
+    .await?;
+
     let (mut reader, mut writer) = tokio::io::split(tls_stream);
     let mut codec = VeilFrontCodec::default();
+
+    // Drive the h2c backend: send the preface inside a DATA frame.
     let mut tx_buf = BytesMut::new();
     codec
-        .encode(auth_frame, &mut tx_buf)
-        .map_err(|e| ObfuscatorError::Io(e))?;
-    tokio::io::AsyncWriteExt::write_all(&mut writer, &tx_buf)
+        .encode(
+            Frame::data(Bytes::from_static(H2_PREFACE_AND_SETTINGS)),
+            &mut tx_buf,
+        )
+        .map_err(ObfuscatorError::Io)?;
+    writer
+        .write_all(&tx_buf)
         .await
-        .map_err(|e| ObfuscatorError::Io(e))?;
-    tokio::io::AsyncWriteExt::flush(&mut writer)
-        .await
-        .map_err(|e| ObfuscatorError::Io(e))?;
+        .map_err(ObfuscatorError::Io)?;
+    writer.flush().await.map_err(ObfuscatorError::Io)?;
 
-    // Read the first frame back from the relay.
-    // If the relay recognised our auth, it will send DATA frames (tunnel).
-    // If not, it will send site content — which won't parse as valid frames
-    // or will come as unexpected data.
+    // Read frames back; a DATA frame confirms the tunnel.
     let mut rx_buf = BytesMut::with_capacity(4096);
     let mut total_read = 0;
     loop {
-        let n = tokio::time::timeout(
-            Duration::from_secs(3),
-            tokio::io::AsyncReadExt::read_buf(&mut reader, &mut rx_buf),
-        )
-        .await
-        .map_err(|_| ObfuscatorError::Timeout)?
-        .map_err(|e| ObfuscatorError::Io(e))?;
+        let n = tokio::time::timeout(Duration::from_secs(3), reader.read_buf(&mut rx_buf))
+            .await
+            .map_err(|_| ObfuscatorError::Timeout)?
+            .map_err(ObfuscatorError::Io)?;
 
         if n == 0 {
-            // EOF — relay closed connection without sending tunnel data.
             return Err(ObfuscatorError::Handshake(
                 "relay closed connection after auth".into(),
             ));
         }
-
         total_read += n;
 
-        // Try to decode a frame.
-        let mut decode_buf = rx_buf.clone();
-        match codec.decode(&mut decode_buf) {
-            Ok(Some(frame)) => {
-                match frame.frame_type {
-                    FRAME_TYPE_DATA => {
-                        // Tunnel is live — relay forwarded backend data as DATA frame.
-                        return Ok(());
-                    }
-                    FRAME_TYPE_CHAFF => {
-                        // Relay sent chaff — this is suspicious but could be a relay-side
-                        // padding mode. Continue reading.
-                        rx_buf = decode_buf;
-                        continue;
-                    }
-                    FRAME_TYPE_AUTH => {
-                        // Relay sent AUTH back — protocol error.
-                        return Err(ObfuscatorError::Handshake("relay echoed AUTH frame".into()));
-                    }
-                    other => {
-                        return Err(ObfuscatorError::Handshake(format!(
-                            "unexpected frame type: 0x{:02x}",
-                            other
-                        )));
-                    }
+        match codec.decode(&mut rx_buf) {
+            Ok(Some(frame)) => match frame.frame_type {
+                FRAME_TYPE_DATA => return Ok(()),
+                FRAME_TYPE_CHAFF => continue, // relay-side cover, keep reading
+                other => {
+                    return Err(ObfuscatorError::Handshake(format!(
+                        "unexpected frame type after auth: 0x{other:02x} (routed to site?)"
+                    )));
                 }
-            }
+            },
             Ok(None) => {
-                // Need more data — continue reading.
                 if total_read > 65536 {
-                    // Received >64KB without a valid frame — likely site content.
                     return Err(ObfuscatorError::Handshake(
-                        "received >64KB without valid frame (likely routed to site)".into(),
+                        "received >64KB without a DATA frame (likely routed to site)".into(),
                     ));
                 }
-                rx_buf = decode_buf;
                 continue;
             }
             Err(e) => {
-                // Decoding error — the data is not valid veil-front frames.
-                // This means the relay routed us to the site (auth failed).
                 return Err(ObfuscatorError::Handshake(format!(
                     "frame decode error (routed to site): {e}"
                 )));
             }
         }
     }
+}
+
+/// Run the veil-front data ferry for one accepted local connection.
+///
+/// Re-dials the relay, re-authenticates, then bridges the local h2c gRPC stream
+/// and the tunnel: local bytes → `DATA` frames → relay; relay `DATA` frames →
+/// local (payload only); relay `CHAFF` frames are dropped (sketch §7).
+pub async fn run_veil_front_ferry(
+    local: TcpStream,
+    relay_addr: &str,
+    tls_sni: &str,
+    spki_hex: &str,
+    ticket_b64: &str,
+) -> Result<(), ObfuscatorError> {
+    let tls_stream = dial_and_authenticate(relay_addr, tls_sni, spki_hex, ticket_b64).await?;
+
+    let (mut relay_rd, mut relay_wr) = tokio::io::split(tls_stream);
+    let (mut local_rd, mut local_wr) = local.into_split();
+
+    // local h2c → DATA frames → relay
+    let up = async {
+        let mut codec = VeilFrontCodec::default();
+        let mut rbuf = [0u8; 8192];
+        loop {
+            let n = local_rd.read(&mut rbuf).await?;
+            if n == 0 {
+                break;
+            }
+            let mut out = BytesMut::with_capacity(n + 4);
+            codec.encode(Frame::data(Bytes::copy_from_slice(&rbuf[..n])), &mut out)?;
+            relay_wr.write_all(&out).await?;
+            relay_wr.flush().await?;
+        }
+        relay_wr.shutdown().await
+    };
+
+    // relay DATA frames → local; drop CHAFF
+    let down = async {
+        let mut codec = VeilFrontCodec::default();
+        let mut buf = BytesMut::with_capacity(4096);
+        loop {
+            loop {
+                match codec.decode(&mut buf)? {
+                    Some(frame) => match frame.frame_type {
+                        FRAME_TYPE_DATA => local_wr.write_all(&frame.payload).await?,
+                        FRAME_TYPE_CHAFF => { /* cover traffic — discard */ }
+                        _ => { /* AUTH/unknown mid-stream — ignore */ }
+                    },
+                    None => break,
+                }
+            }
+            let n = relay_rd.read_buf(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+        }
+        local_wr.shutdown().await
+    };
+
+    let (r1, r2): (std::io::Result<()>, std::io::Result<()>) = tokio::join!(up, down);
+    r1.map_err(ObfuscatorError::Io)?;
+    r2.map_err(ObfuscatorError::Io)?;
+    Ok(())
 }
 
 /// Dial TLS using uTLS with SPKI pinning.
@@ -273,6 +341,7 @@ fn parse_ticket(bundle_b64: &str) -> Result<Ticket, ObfuscatorError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use construct_veil_protocol::ticket::{AUTH_KEY_LEN, AuthKey, TICKET_ID_LEN, ticket_to_bytes};
 
     #[test]
     fn method_id_is_veil_front() {

@@ -9,10 +9,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use construct_veil_protocol::AuthRecord;
 use construct_veil_protocol::ticket::{Ticket, ticket_from_bytes};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 
 /// A veil-front ticket store. Thread-safe, read-optimised.
@@ -97,11 +95,13 @@ impl TicketStore {
             return None;
         }
 
-        // Recompute expected authcode.
-        let expected = compute_authcode(&ticket, exporter);
-
-        // Constant-time comparison — non-negotiable.
-        if expected.ct_eq(authcode).into() {
+        // Verify using the shared protocol codec — single source of truth for
+        // the authcode derivation, constant-time compare inside `verify`.
+        let record = AuthRecord {
+            ticket_id: *ticket_id,
+            authcode: *authcode,
+        };
+        if record.verify(&ticket, exporter) {
             Some(ticket)
         } else {
             None
@@ -120,29 +120,15 @@ impl Default for TicketStore {
     }
 }
 
-/// Compute the HMAC-SHA256 authcode for a ticket + exporter pair.
-///
-/// `authcode = HMAC-SHA256(auth_key, exporter || ticket_id || not_after)`
-fn compute_authcode(ticket: &Ticket, exporter: &[u8; 32]) -> [u8; 32] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(ticket.auth_key.as_bytes())
-        .expect("HMAC-SHA256 accepts any key length");
-
-    mac.update(exporter);
-    mac.update(&ticket.ticket_id);
-    mac.update(&ticket.not_after.to_le_bytes());
-
-    let result = mac.finalize();
-    let code_bytes = result.into_bytes();
-
-    let mut authcode = [0u8; 32];
-    authcode.copy_from_slice(&code_bytes);
-    authcode
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use construct_veil_protocol::ticket::{AUTH_KEY_LEN, AuthKey, TICKET_ID_LEN};
+
+    /// Compute the authcode for a ticket + exporter via the shared protocol codec.
+    fn compute_authcode(ticket: &Ticket, exporter: &[u8; 32]) -> [u8; 32] {
+        AuthRecord::from_ticket(ticket, exporter).authcode
+    }
 
     fn make_test_ticket() -> Ticket {
         let now = SystemTime::now()

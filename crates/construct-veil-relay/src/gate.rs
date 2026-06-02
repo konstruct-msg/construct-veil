@@ -12,7 +12,7 @@
 //! The cover app's own behaviour is the ONLY timing on the unauth branch.
 
 use bytes::BytesMut;
-use construct_veil_protocol::{AUTH_PAYLOAD_LEN, VeilFrontCodec};
+use construct_veil_protocol::{AUTH_PAYLOAD_LEN, EXPORTER_LABEL, VeilFrontCodec};
 use tokio::io::AsyncReadExt;
 use tokio_rustls::server::TlsStream;
 use tokio_util::codec::Decoder;
@@ -52,8 +52,7 @@ pub async fn gate_with_exporter(
     let exporter = {
         let (_, conn) = tls_stream.get_ref();
         let mut exp = [0u8; 32];
-        if let Err(e) =
-            conn.export_keying_material(&mut exp, b"construct veil-front auth v1", Some(&[]))
+        if let Err(e) = conn.export_keying_material(&mut exp, EXPORTER_LABEL.as_bytes(), Some(&[]))
         {
             warn!(error = %e, "TLS exporter failed, routing to site");
             // Can't validate without exporter → site.

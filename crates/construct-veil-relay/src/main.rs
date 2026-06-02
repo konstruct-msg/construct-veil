@@ -27,12 +27,9 @@ mod tunnel;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::BytesMut;
 use clap::Parser;
 use gate::{GateResult, gate_with_exporter};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio_rustls::server::TlsStream;
 use tracing::{info, warn};
 
 use crate::tickets::TicketStore;
@@ -207,7 +204,7 @@ async fn handle_connection(
             // Forward raw bytes to the cover site backend.
             // The constant-shape requirement: we do NOT close/silence/delay differently.
             // The cover app's own error timing is the only timing on this branch.
-            match forward_to_site(stream, first_bytes, site_addr).await {
+            match site::forward_to_site(stream, first_bytes, site_addr).await {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::debug!(peer = %peer, error = %e, "site forwarding ended");
@@ -219,53 +216,5 @@ async fn handle_connection(
         }
     }
 
-    Ok(())
-}
-
-/// Forward to cover site backend.
-async fn forward_to_site(
-    tls_stream: TlsStream<tokio::net::TcpStream>,
-    first_bytes: BytesMut,
-    site_addr: SocketAddr,
-) -> Result<(), std::io::Error> {
-    // Connect to the cover site.
-    let mut site_conn = tokio::net::TcpStream::connect(site_addr).await?;
-    site_conn.set_nodelay(true)?;
-
-    // Forward the first bytes (already-read client data).
-    site_conn.write_all(&first_bytes).await?;
-
-    // Bidirectional copy.
-    let (mut client_rd, mut client_wr) = tokio::io::split(tls_stream);
-    let (mut site_rd, mut site_wr) = site_conn.into_split();
-
-    let client_to_site = async {
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = client_rd.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            site_wr.write_all(&buf[..n]).await?;
-        }
-        site_wr.shutdown().await
-    };
-
-    let site_to_client = async {
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = site_rd.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            client_wr.write_all(&buf[..n]).await?;
-        }
-        client_wr.shutdown().await
-    };
-
-    let (r1, r2): (Result<_, std::io::Error>, Result<_, std::io::Error>) =
-        tokio::join!(client_to_site, site_to_client);
-    r1?;
-    r2?;
     Ok(())
 }

@@ -64,6 +64,14 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// Create a new frame with the given type and payload.
+    pub fn new(frame_type: u8, payload: Bytes) -> Self {
+        Self {
+            frame_type,
+            payload,
+        }
+    }
+
     /// Create a DATA frame.
     pub fn data(payload: Bytes) -> Self {
         Self {

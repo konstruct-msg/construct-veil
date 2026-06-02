@@ -32,6 +32,7 @@ pub mod coordinator;
 pub mod fsm;
 pub mod obfuscator;
 pub mod scoring;
+pub mod veil_front; // Padding modes shared between client and relay
 
 #[cfg(feature = "tls")]
 pub mod obfs4_adapter;
