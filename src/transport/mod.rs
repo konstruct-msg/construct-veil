@@ -31,7 +31,13 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use pin_project_lite::pin_project;
-use rand::{SeedableRng, rngs::SmallRng};
+use rand::SeedableRng;
+// Pin to Xoshiro256PlusPlus directly. `rand::rngs::SmallRng` aliases this on
+// 64-bit but switches to Xoshiro128PlusPlus on 32-bit (16-byte seed) — the
+// type mismatch broke armv7 Android builds, and the algorithm divergence
+// would have meant identical seeds produce different IAT timing across
+// platforms (a subtle but real fingerprinting risk).
+use rand_xoshiro::Xoshiro256PlusPlus as SmallRng;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{TcpListener, TcpStream},

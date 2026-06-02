@@ -52,6 +52,11 @@ subtle = "2.5"
 zeroize = { version = "1.7", features = ["derive"] }
 rand_chacha = "0.3"
 rand = { version = "0.8", features = ["small_rng"] }
+# Pinned explicitly so the IAT RNG algorithm is platform-independent.
+# `rand::SmallRng` aliases to Xoshiro256PlusPlus on 64-bit targets but
+# Xoshiro128PlusPlus on 32-bit (e.g. Android armv7) — same seed → different
+# wire timing → cross-platform-fingerprinting risk + build failure on armv7.
+rand_xoshiro = "0.6"
 crypto_secretbox = "0.1"
 base64 = "0.22"
 

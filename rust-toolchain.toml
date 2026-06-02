@@ -1,0 +1,19 @@
+# Pinned toolchain. Must match construct-core/rust-toolchain.toml — these two
+# crates form a path-dependency workspace, and a version skew makes
+# `cargo metadata` (used by fmt/clippy) non-deterministic across builds.
+#
+# When bumping: also bump construct-core/rust-toolchain.toml in the same PR.
+
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = [
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+    "x86_64-apple-ios",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "x86_64-linux-android",
+]
