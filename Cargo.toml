@@ -2,6 +2,7 @@
 members = [
     ".",
     "crates/construct-veil-protocol",
+    "crates/construct-veil-relay",
 ]
 resolver = "2"
 

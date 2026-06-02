@@ -1,0 +1,51 @@
+[package]
+name = "construct-veil-relay"
+version.workspace = true
+edition.workspace = true
+description = "Veil-front relay — honest-front HTTPS server with session-bound ticket authentication"
+
+[[bin]]
+name = "construct-veil-relay"
+path = "src/main.rs"
+
+[dependencies]
+construct-veil-protocol = { path = "../construct-veil-protocol" }
+
+# TLS
+rustls = { version = "0.23", features = ["ring", "std"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+rcgen = "0.13"
+
+# Async I/O
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+tokio-rustls = "0.26"
+
+# HTTP/2
+h2 = "0.4"
+http = "1"
+
+# Bytes
+bytes = "1.6"
+
+# Error handling
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+# Crypto (for ticket store — in-memory HMAC verification)
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2.5"
+
+# Time
+chrono = "0.4"
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
