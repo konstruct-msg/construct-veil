@@ -1,0 +1,71 @@
+# construct-veil-relay one-VPS deployment.
+# See ./README.md for bootstrap instructions.
+
+services:
+  cover:
+    build:
+      context: ./cover-site
+      dockerfile: ../Dockerfile.cover
+    image: veil-front/cover:latest
+    container_name: veil-front-cover
+    restart: unless-stopped
+    # :80 exposed on host for ACME http-01 + redirect-to-https.
+    # :8080 internal — relay forwards unauth traffic here over the docker network.
+    ports:
+      - "80:80"
+    expose:
+      - "8080"
+    volumes:
+      - certbot-www:/var/www/certbot:ro
+
+  certbot:
+    image: certbot/certbot:latest
+    container_name: veil-front-certbot
+    # No `command` — invoked manually via `docker compose run`.
+    entrypoint: certbot
+    volumes:
+      - letsencrypt:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    # Override default restart so this container doesn't loop on completion.
+    restart: "no"
+
+  relay:
+    build:
+      context: ..                       # construct-veil repo root
+      dockerfile: deploy/Dockerfile.relay
+    image: veil-front/relay:latest
+    container_name: veil-front-relay
+    restart: unless-stopped
+    depends_on:
+      cover:
+        condition: service_started
+    ports:
+      - "443:443"
+    volumes:
+      - letsencrypt:/etc/letsencrypt:ro
+      - ./data/tickets:/etc/veil-front:ro
+    environment:
+      RUST_LOG: "${RUST_LOG:-info}"
+    # Construct gRPC backend is reachable via host.docker.internal on Linux
+    # only when --add-host is set; expose for portability.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: >
+      construct-veil-relay
+      --listen 0.0.0.0:443
+      --cert /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
+      --key  /etc/letsencrypt/live/${DOMAIN}/privkey.pem
+      --site cover:8080
+      --backend ${BACKEND:-host.docker.internal:50051}
+      --tickets /etc/veil-front/tickets.json
+    # Healthcheck — quick TLS handshake check.
+    healthcheck:
+      test: ["CMD-SHELL", "echo | openssl s_client -connect 127.0.0.1:443 -servername $$(echo $${DOMAIN}) -brief 2>&1 | grep -q 'Verification: OK\\|verify error' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  letsencrypt:
+  certbot-www:

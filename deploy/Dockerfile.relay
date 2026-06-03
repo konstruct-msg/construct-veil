@@ -1,0 +1,50 @@
+# Multi-stage Rust build of construct-veil-relay + issue-ticket helper.
+# Build context: construct-veil workspace root (`..` from deploy/).
+
+FROM rust:1.85-bookworm AS build
+WORKDIR /src
+
+# Copy workspace manifests first for dep-cache layer hits.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/construct-veil-protocol/Cargo.toml crates/construct-veil-protocol/
+COPY crates/construct-veil-relay/Cargo.toml    crates/construct-veil-relay/
+
+# Stub-build to cache deps (Rust idiomatic trick — touch a dummy lib.rs in
+# each member crate, build everything, then overwrite with real source).
+RUN mkdir -p crates/construct-veil-protocol/src crates/construct-veil-relay/src/bin src \
+    && echo "fn main(){}" > src/lib.rs \
+    && echo "fn main(){}" > crates/construct-veil-protocol/src/lib.rs \
+    && echo "fn main(){}" > crates/construct-veil-relay/src/main.rs \
+    && echo "fn main(){}" > crates/construct-veil-relay/src/bin/issue_ticket.rs \
+    && cargo build --release -p construct-veil-relay --bins 2>/dev/null || true
+
+# Now copy the real source.
+COPY src ./src
+COPY crates ./crates
+
+# Real build.
+RUN cargo build --release -p construct-veil-relay --bins
+
+# ── Runtime ──────────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates openssl \
+ && rm -rf /var/lib/apt/lists/*
+
+# Non-root user. Cert / ticket volumes are read-only so 65532 can read them
+# if the bind-mount on the host is world-readable (which letsencrypt's are
+# not by default — see the deploy README).
+RUN useradd -r -u 65532 -s /sbin/nologin veil
+
+COPY --from=build /src/target/release/construct-veil-relay /usr/local/bin/
+COPY --from=build /src/target/release/issue-ticket          /usr/local/bin/
+
+# Allow the relay to bind :443 as non-root.
+RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/construct-veil-relay
+
+USER veil
+EXPOSE 443
+
+# Default entrypoint runs the relay; `docker compose run relay issue-ticket ...`
+# overrides this to invoke the helper instead.
+ENTRYPOINT ["/usr/local/bin/construct-veil-relay"]

@@ -1,0 +1,12 @@
+{
+  "name": "divany-kresla-site",
+  "version": "1.0.0",
+  "description": "Landing + live production tracker for the Диваны и Кресла custom-furniture workshop (UK).",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21"
+  }
+}
