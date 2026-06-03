@@ -395,6 +395,7 @@ impl PersistentScores {
                 0 => MethodId::Obfs4,
                 1 => MethodId::WebTunnel,
                 2 => MethodId::Masque,
+                3 => MethodId::VeilFront,
                 _ => continue,
             };
             let entry = ScoreEntry {

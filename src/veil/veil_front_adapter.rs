@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::veil::fsm::MethodId;
 use crate::veil::obfuscator::{Obfuscator, ObfuscatorError, ObfuscatorHandle, ProbeRequest};
+use crate::veil::veil_front::WriteStrategy;
 use construct_veil_protocol::ticket::{TICKET_WIRE_LEN, Ticket, ticket_from_bytes};
 use construct_veil_protocol::{
     AuthRecord, EXPORTER_LABEL, EXPORTER_LEN, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, Frame,
@@ -208,8 +209,125 @@ async fn probe_veil_front(req: &ProbeRequest) -> Result<(), ObfuscatorError> {
 /// Run the veil-front data ferry for one accepted local connection.
 ///
 /// Re-dials the relay, re-authenticates, then bridges the local h2c gRPC stream
-/// and the tunnel: local bytes → `DATA` frames → relay; relay `DATA` frames →
-/// local (payload only); relay `CHAFF` frames are dropped (sketch §7).
+/// and the tunnel:
+/// - **local → relay:** `WriteStrategy` — payload DATA frames with FRONT-style
+///   chaff injection (payload priority, no HOL blocking, length bucketing).
+/// - **relay → local:** de-frame DATA payloads, drop CHAFF.
+///
+/// The up-stream uses the `FrontChaffScheduler` from M6 (§8 of the plan):
+/// chaff is injected at connection start then tapers off; payload always wins.
+///
+/// Returns the `WriteStrategy` with final metrics (overhead ratio etc).
+pub async fn run_veil_front_ferry_with_metrics(
+    local: TcpStream,
+    relay_addr: &str,
+    tls_sni: &str,
+    spki_hex: &str,
+    ticket_b64: &str,
+) -> Result<WriteStrategy, ObfuscatorError> {
+    let tls_stream = dial_and_authenticate(relay_addr, tls_sni, spki_hex, ticket_b64).await?;
+
+    let (relay_rd, relay_wr) = tokio::io::split(tls_stream);
+    let (local_rd, local_wr) = tokio::io::split(local);
+
+    // Use a WriteStrategy for the up-stream: payload + chaff with priority.
+    let strategy = WriteStrategy::new();
+
+    // local h2c → payload queue + chaff scheduler → DATA/CHAFF frames → relay
+    let up = async move {
+        let mut strategy = strategy;
+        let mut local_rd = local_rd;
+        let mut relay_wr = relay_wr;
+        let mut rbuf = [0u8; 8192];
+
+        loop {
+            // 1. Check if there's a frame ready to send (payload or chaff).
+            if let Some(frame) = strategy.next_frame() {
+                let frame_type = frame.frame_type;
+                let encoded = frame.encode_to_bytes();
+                relay_wr
+                    .write_all(&encoded)
+                    .await
+                    .map_err(ObfuscatorError::Io)?;
+                relay_wr.flush().await.map_err(ObfuscatorError::Io)?;
+
+                // If we just sent chaff, continue the loop to check for more.
+                if frame_type == FRAME_TYPE_CHAFF {
+                    continue;
+                }
+                // If we sent payload, try to read more from local.
+            }
+
+            // 2. Read from local (non-blocking-ish: use a short timeout to allow
+            //    chaff injection when the local stream is idle).
+            let read_fut = local_rd.read(&mut rbuf);
+            let n = match tokio::time::timeout(Duration::from_millis(20), read_fut).await {
+                Ok(Ok(0)) => break, // EOF
+                Ok(Ok(n)) => n,     // n > 0 guaranteed by the arm above
+                Ok(Err(e)) => return Err(ObfuscatorError::Io(e)),
+                Err(_) => {
+                    // Timeout — local is idle, let chaff scheduler inject.
+                    continue;
+                }
+            };
+
+            // Push payload into the strategy's queue.
+            strategy
+                .payload_queue
+                .push(Frame::data(Bytes::copy_from_slice(&rbuf[..n])));
+        }
+
+        relay_wr.shutdown().await.map_err(ObfuscatorError::Io)?;
+        Ok(strategy)
+    };
+
+    // relay DATA frames → local; drop CHAFF
+    let down = async {
+        let mut relay_rd = relay_rd;
+        let mut local_wr = local_wr;
+        let mut codec = VeilFrontCodec::default();
+        let mut buf = BytesMut::with_capacity(4096);
+
+        loop {
+            // Drain any complete frames already in the buffer.
+            loop {
+                match codec.decode(&mut buf).map_err(ObfuscatorError::Io)? {
+                    Some(frame) => match frame.frame_type {
+                        FRAME_TYPE_DATA => {
+                            local_wr
+                                .write_all(&frame.payload)
+                                .await
+                                .map_err(ObfuscatorError::Io)?;
+                        }
+                        FRAME_TYPE_CHAFF => { /* cover traffic — discard */ }
+                        _ => { /* AUTH/unknown mid-stream — ignore */ }
+                    },
+                    None => break,
+                }
+            }
+
+            let n = relay_rd
+                .read_buf(&mut buf)
+                .await
+                .map_err(ObfuscatorError::Io)?;
+            if n == 0 {
+                break;
+            }
+        }
+        local_wr.shutdown().await.map_err(ObfuscatorError::Io)
+    };
+
+    let (r1, r2) = tokio::join!(up, down);
+    let strategy = r1?;
+    r2?;
+
+    Ok(strategy)
+}
+
+/// Run the veil-front data ferry for one accepted local connection.
+///
+/// Convenience wrapper around [`run_veil_front_ferry_with_metrics`] that discards
+/// the final metrics. Use the `_with_metrics` variant when you need overhead stats.
 pub async fn run_veil_front_ferry(
     local: TcpStream,
     relay_addr: &str,
@@ -217,54 +335,8 @@ pub async fn run_veil_front_ferry(
     spki_hex: &str,
     ticket_b64: &str,
 ) -> Result<(), ObfuscatorError> {
-    let tls_stream = dial_and_authenticate(relay_addr, tls_sni, spki_hex, ticket_b64).await?;
-
-    let (mut relay_rd, mut relay_wr) = tokio::io::split(tls_stream);
-    let (mut local_rd, mut local_wr) = local.into_split();
-
-    // local h2c → DATA frames → relay
-    let up = async {
-        let mut codec = VeilFrontCodec::default();
-        let mut rbuf = [0u8; 8192];
-        loop {
-            let n = local_rd.read(&mut rbuf).await?;
-            if n == 0 {
-                break;
-            }
-            let mut out = BytesMut::with_capacity(n + 4);
-            codec.encode(Frame::data(Bytes::copy_from_slice(&rbuf[..n])), &mut out)?;
-            relay_wr.write_all(&out).await?;
-            relay_wr.flush().await?;
-        }
-        relay_wr.shutdown().await
-    };
-
-    // relay DATA frames → local; drop CHAFF
-    let down = async {
-        let mut codec = VeilFrontCodec::default();
-        let mut buf = BytesMut::with_capacity(4096);
-        loop {
-            loop {
-                match codec.decode(&mut buf)? {
-                    Some(frame) => match frame.frame_type {
-                        FRAME_TYPE_DATA => local_wr.write_all(&frame.payload).await?,
-                        FRAME_TYPE_CHAFF => { /* cover traffic — discard */ }
-                        _ => { /* AUTH/unknown mid-stream — ignore */ }
-                    },
-                    None => break,
-                }
-            }
-            let n = relay_rd.read_buf(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-        }
-        local_wr.shutdown().await
-    };
-
-    let (r1, r2): (std::io::Result<()>, std::io::Result<()>) = tokio::join!(up, down);
-    r1.map_err(ObfuscatorError::Io)?;
-    r2.map_err(ObfuscatorError::Io)?;
+    let _ =
+        run_veil_front_ferry_with_metrics(local, relay_addr, tls_sni, spki_hex, ticket_b64).await?;
     Ok(())
 }
 

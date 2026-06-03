@@ -978,7 +978,7 @@ pub struct VeilStartRequest {
 pub struct VeilStartResult {
     /// Local TCP port the proxy is listening on.
     pub port: u16,
-    /// Which method won the probe race: 0=obfs4, 1=webtunnel, 2=masque.
+    /// Which method won the probe race: 0=obfs4, 1=webtunnel, 2=masque, 3=veil-front.
     pub method: u8,
     /// Wall-clock ms from start to first byte through the tunnel.
     pub latency_ms: u32,
@@ -1087,6 +1087,8 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
             let mut coordinator = VeilCoordinator::new(config, scores);
             coordinator.register(Box::new(Obfs4Obfuscator::new()));
             coordinator.register(Box::new(WebTunnelObfuscator::new()));
+            #[cfg(feature = "utls")]
+            coordinator.register(Box::new(crate::veil::VeilFrontObfuscator::new()));
 
             let arc = std::sync::Arc::new(coordinator);
             COORDINATOR

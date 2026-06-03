@@ -17,6 +17,8 @@
 //! let mut coordinator = VeilCoordinator::new(VeilConfig::default(), scores);
 //! coordinator.register(Box::new(Obfs4Obfuscator::new()));
 //! coordinator.register(Box::new(WebTunnelObfuscator::new()));
+//! #[cfg(feature = "utls")]
+//! coordinator.register(Box::new(VeilFrontObfuscator::new()));
 //!
 //! let result = coordinator.start_session(
 //!     relay, bundle, fingerprint, MethodSet::all(),

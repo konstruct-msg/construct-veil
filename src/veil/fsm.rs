@@ -1430,6 +1430,7 @@ mod tests {
         assert!(ms.contains(MethodId::Obfs4));
         assert!(ms.contains(MethodId::WebTunnel));
         assert!(ms.contains(MethodId::Masque));
+        assert!(ms.contains(MethodId::VeilFront));
     }
 
     #[test]
@@ -1437,5 +1438,60 @@ mod tests {
         let ms = MethodSet::from_bitmask(MethodId::WebTunnel.bit());
         assert!(ms.contains(MethodId::Obfs4));
         assert!(!ms.contains(MethodId::WebTunnel));
+    }
+
+    #[test]
+    fn veil_front_is_a_candidate() {
+        struct VeilFrontOnlyScores;
+        impl ScoreLookup for VeilFrontOnlyScores {
+            fn get(&self, _fp: &NetworkFingerprint, method: MethodId) -> Option<ScoreEntry> {
+                match method {
+                    MethodId::VeilFront => Some(ScoreEntry {
+                        successes: 5,
+                        failures: 0,
+                        last_success_at: Some(SystemTime::now() - Duration::from_secs(60)),
+                        last_failure_at: None,
+                        median_latency_ms: 300,
+                        blocked_at: None,
+                        consecutive_failures: 0,
+                    }),
+                    // All other methods are blocked.
+                    MethodId::Obfs4 | MethodId::WebTunnel | MethodId::Masque => Some(ScoreEntry {
+                        successes: 0,
+                        failures: 10,
+                        last_success_at: None,
+                        last_failure_at: Some(SystemTime::now()),
+                        median_latency_ms: 0,
+                        blocked_at: Some(SystemTime::now() - Duration::from_secs(3600)),
+                        consecutive_failures: 10,
+                    }),
+                }
+            }
+            fn is_permanently_blocked(
+                &self,
+                _fp: &NetworkFingerprint,
+                method: MethodId,
+                _ttl: Duration,
+                _now: SystemTime,
+            ) -> bool {
+                method != MethodId::VeilFront
+            }
+        }
+
+        let cfg = VeilConfig {
+            top_k_probes: 2,
+            ..VeilConfig::default()
+        };
+        let candidates = select_probe_candidates(
+            &NetworkFingerprint::default(),
+            MethodSet::all(),
+            &VeilFrontOnlyScores,
+            &cfg,
+            now_sys(),
+        );
+
+        // VeilFront should be the only candidate (others are blocked).
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0], MethodId::VeilFront);
     }
 }
