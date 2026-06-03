@@ -8,6 +8,10 @@ description = "Veil-front relay — honest-front HTTPS server with session-bound
 name = "construct-veil-relay"
 path = "src/main.rs"
 
+[[bin]]
+name = "issue-ticket"
+path = "src/bin/issue_ticket.rs"
+
 [dependencies]
 construct-veil-protocol = { path = "../construct-veil-protocol" }
 
