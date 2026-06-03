@@ -21,7 +21,9 @@
 use std::net::SocketAddr;
 
 use bytes::{Bytes, BytesMut};
-use construct_veil_protocol::{FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, Frame, VeilFrontCodec};
+use construct_veil_protocol::{
+    FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, Frame, LENGTH_BUCKETS, VeilFrontCodec,
+};
 use rand::Rng;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::codec::{Decoder, Encoder};
@@ -79,7 +81,7 @@ where
     // bytes share a length distribution with the site path's first response.
     let chaff_payload = initial_chaff(&mut rand::thread_rng());
     let mut init_frame = BytesMut::with_capacity(2 + 9 + chaff_payload.len());
-    let mut codec_init = VeilFrontCodec::default();
+    let mut codec_init = VeilFrontCodec::default().with_buckets(LENGTH_BUCKETS);
     codec_init.encode(Frame::chaff(chaff_payload), &mut init_frame)?;
     client_wr.write_all(&init_frame).await?;
     client_wr.flush().await?;
@@ -158,7 +160,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut codec = VeilFrontCodec::default();
+    let mut codec = VeilFrontCodec::default().with_buckets(LENGTH_BUCKETS);
     let mut rbuf = [0u8; COPY_BUF];
 
     loop {

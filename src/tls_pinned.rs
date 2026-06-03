@@ -59,6 +59,14 @@ pub fn build_connector(
         config.alpn_protocols = alpn;
     }
 
+    // Cap TLS plaintext record size at the top veil-front length bucket so
+    // coalescing of small frames into a giant record can't escape the bucket
+    // distribution the codec emits. rustls 0.23 has no public record padder;
+    // frame-level zero padding is in `construct_veil_protocol::VeilFrontCodec`.
+    config.max_fragment_size = Some(
+        construct_veil_protocol::LENGTH_BUCKETS[construct_veil_protocol::LENGTH_BUCKETS.len() - 1],
+    );
+
     let server_name = resolve_server_name(sni, relay_addr)?;
     Ok((TlsConnector::from(Arc::new(config)), server_name))
 }

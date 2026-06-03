@@ -100,6 +100,7 @@ impl VeilCoordinator {
     /// This is the main entry point for the coordinator.
     /// For Phase 1 (top_k_probes=1), probes are executed sequentially.
     /// Once a probe succeeds, the proxy loop is started and the port is returned.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_session_with_params(
         &self,
         relay: String,
@@ -110,6 +111,7 @@ impl VeilCoordinator {
         spki_hex: String,
         host_header: String,
         wt_base_path: String,
+        veil_front_ticket_b64: String,
     ) -> Result<CoordinatorStartResult, CoordinatorError> {
         let start_time = Instant::now();
         let mut state = VeilState::Idle;
@@ -175,6 +177,7 @@ impl VeilCoordinator {
                     &spki_hex,
                     &host_header,
                     &wt_base_path,
+                    &veil_front_ticket_b64,
                     start_time,
                 )
                 .await?;
@@ -213,7 +216,9 @@ impl VeilCoordinator {
 
     /// Start an VEIL session with default TLS/WebTunnel parameters.
     ///
-    /// Delegates to [`start_session_with_params`] with empty TLS/WebTunnel params.
+    /// Delegates to [`start_session_with_params`] with empty TLS/WebTunnel params
+    /// and no veil-front ticket (so veil-front is effectively excluded from the
+    /// race — its probe will fail ticket parsing).
     pub async fn start_session(
         &self,
         relay: String,
@@ -226,6 +231,7 @@ impl VeilCoordinator {
             bundle,
             fingerprint,
             allowed_methods,
+            String::new(),
             String::new(),
             String::new(),
             String::new(),
@@ -248,6 +254,7 @@ impl VeilCoordinator {
         spki_hex: &str,
         host_header: &str,
         wt_base_path: &str,
+        veil_front_ticket_b64: &str,
         _start_time: Instant,
     ) -> Result<(), CoordinatorError> {
         match effect {
@@ -272,6 +279,7 @@ impl VeilCoordinator {
                         spki_hex,
                         host_header,
                         wt_base_path,
+                        veil_front_ticket_b64,
                     )
                     .await?;
                 } else {
@@ -287,6 +295,7 @@ impl VeilCoordinator {
                         spki_hex,
                         host_header,
                         wt_base_path,
+                        veil_front_ticket_b64,
                     )
                     .await?;
                 }
@@ -337,6 +346,7 @@ impl VeilCoordinator {
     }
 
     /// Run probes sequentially (top_k_probes=1).
+    #[allow(clippy::too_many_arguments)]
     async fn run_sequential_probes(
         &self,
         methods: &[MethodId],
@@ -349,6 +359,7 @@ impl VeilCoordinator {
         spki_hex: &str,
         host_header: &str,
         wt_base_path: &str,
+        veil_front_ticket_b64: &str,
     ) -> Result<(), CoordinatorError> {
         for &method in methods {
             let probe_start = Instant::now();
@@ -362,6 +373,7 @@ impl VeilCoordinator {
                     spki_hex,
                     host_header,
                     wt_base_path,
+                    veil_front_ticket_b64,
                 )
                 .await;
 
@@ -376,6 +388,7 @@ impl VeilCoordinator {
                         bundle,
                         tls_sni,
                         spki_hex,
+                        veil_front_ticket_b64,
                         state,
                         scores_cache,
                     )
@@ -409,6 +422,7 @@ impl VeilCoordinator {
     ///
     /// Probes are started with `inter_probe_delay` between them.
     /// The first probe to succeed wins; all others are cancelled.
+    #[allow(clippy::too_many_arguments)]
     async fn run_parallel_probes(
         &self,
         methods: &[MethodId],
@@ -421,6 +435,7 @@ impl VeilCoordinator {
         spki_hex: &str,
         host_header: &str,
         wt_base_path: &str,
+        veil_front_ticket_b64: &str,
     ) -> Result<(), CoordinatorError> {
         let num_probes = methods.len();
         let (tx, mut rx) = mpsc::channel::<ProbeResult>(num_probes);
@@ -438,6 +453,7 @@ impl VeilCoordinator {
             let spki_hex_str = spki_hex.to_owned();
             let host_header_str = host_header.to_owned();
             let wt_base_path_str = wt_base_path.to_owned();
+            let veil_front_ticket_b64_str = veil_front_ticket_b64.to_owned();
             let probe_timeout = self.config.probe_timeout;
             let obfuscator = self.obfuscators.get(&method);
             let has_obfuscator = obfuscator.is_some();
@@ -477,12 +493,12 @@ impl VeilCoordinator {
                 let probe_start = Instant::now();
                 let req = ProbeRequest {
                     relay_addr: relay_str,
-                    bundle: bundle_str.clone(),
+                    bundle: bundle_str,
                     tls_sni: tls_sni_str,
                     spki_hex: spki_hex_str,
                     host_header: host_header_str,
                     wt_base_path: wt_base_path_str,
-                    veil_front_ticket_b64: bundle_str, // PoC: ticket embedded in bundle
+                    veil_front_ticket_b64: veil_front_ticket_b64_str,
                 };
 
                 let handle = match obf.start(&req, cancel.clone()).await {
@@ -629,6 +645,7 @@ impl VeilCoordinator {
                 bundle: bundle.to_owned(),
                 tls_sni: tls_sni.to_owned(),
                 spki_hex: spki_hex.to_owned(),
+                veil_front_ticket_b64: veil_front_ticket_b64.to_owned(),
             };
 
             {
@@ -683,6 +700,7 @@ impl VeilCoordinator {
 
     /// Handle a successful probe: transition FSM, record score, start proxy.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn handle_probe_success(
         &self,
         method: MethodId,
@@ -692,6 +710,7 @@ impl VeilCoordinator {
         bundle: &str,
         tls_sni: &str,
         spki_hex: &str,
+        veil_front_ticket_b64: &str,
         state: &mut VeilState,
         scores_cache: &CachedScoreLookup,
     ) -> Result<(), CoordinatorError> {
@@ -753,6 +772,7 @@ impl VeilCoordinator {
             bundle: bundle.to_owned(),
             tls_sni: tls_sni.to_owned(),
             spki_hex: spki_hex.to_owned(),
+            veil_front_ticket_b64: veil_front_ticket_b64.to_owned(),
         };
 
         {
@@ -844,6 +864,7 @@ impl VeilCoordinator {
     }
 
     /// Execute a single probe with full TLS/WebTunnel parameters.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_probe_with_params(
         &self,
         method: MethodId,
@@ -853,6 +874,7 @@ impl VeilCoordinator {
         spki_hex: &str,
         host_header: &str,
         wt_base_path: &str,
+        veil_front_ticket_b64: &str,
     ) -> Result<(), ProbeFailureReason> {
         let obfuscator = match self.obfuscators.get(&method) {
             Some(o) => o.clone(),
@@ -866,7 +888,7 @@ impl VeilCoordinator {
             spki_hex: spki_hex.to_owned(),
             host_header: host_header.to_owned(),
             wt_base_path: wt_base_path.to_owned(),
-            veil_front_ticket_b64: bundle.to_owned(), // PoC: ticket embedded in bundle
+            veil_front_ticket_b64: veil_front_ticket_b64.to_owned(),
         };
         let cancel = CancellationToken::new();
 
@@ -929,7 +951,7 @@ struct ProxyParams {
     method: MethodId,
     /// Relay address (`host:port`).
     relay_addr: String,
-    /// Bridge/cert bundle (obfs4) — also the veil-front ticket blob (PoC).
+    /// obfs4 bridge / cert bundle. Empty for non-obfs4 methods.
     bundle: String,
     /// TLS SNI (TLS-wrapped methods). Read only by the veil-front (utls) path.
     #[cfg_attr(not(feature = "utls"), allow(dead_code))]
@@ -937,6 +959,9 @@ struct ProxyParams {
     /// SPKI hex pin (TLS-wrapped methods). Read only by the veil-front (utls) path.
     #[cfg_attr(not(feature = "utls"), allow(dead_code))]
     spki_hex: String,
+    /// Base64-encoded veil-front ticket. Empty for non-veil-front methods.
+    #[cfg_attr(not(feature = "utls"), allow(dead_code))]
+    veil_front_ticket_b64: String,
 }
 
 /// Run the proxy loop: accept local connections and forward through the winning
@@ -969,13 +994,12 @@ async fn handle_proxy_connection(local: TcpStream, params: ProxyParams) {
         #[cfg(feature = "utls")]
         MethodId::VeilFront => {
             // veil-front: framed h2c ferry over the authenticated TLS tunnel.
-            // PoC: the ticket blob is carried in `bundle`.
             if let Err(e) = crate::veil::veil_front_adapter::run_veil_front_ferry(
                 local,
                 &params.relay_addr,
                 &params.tls_sni,
                 &params.spki_hex,
-                &params.bundle,
+                &params.veil_front_ticket_b64,
             )
             .await
             {

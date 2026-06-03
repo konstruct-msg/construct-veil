@@ -10,5 +10,6 @@ pub mod padding_mode0 {
     pub use super::padding::mode0_front::*;
 }
 
+pub use construct_veil_protocol::LENGTH_BUCKETS;
 pub use padding::mode0_front::{FrontChaffScheduler, PayloadQueue, WriteStrategy};
-pub use padding::{ChaffScheduler, LENGTH_BUCKETS, PaddingMode, bucket_data_frame, bucket_size};
+pub use padding::{ChaffScheduler, PaddingMode, bucket_size};

@@ -6,8 +6,9 @@
 //! # Wire format
 //!
 //! ```text
-//! Frame = [ver:u8=WIRE_VER][type:u8][len:varint][payload:len bytes]
-//!   ver:  0x02 = current wire format (WIRE_VER embedded)
+//! Frame = [ver:u8=WIRE_VER][type:u8][payload_len:varint][pad_len:varint]
+//!         [payload:payload_len bytes][pad:pad_len bytes of 0x00]
+//!   ver:  0x03 = current wire format
 //!   type: 0x00 = AUTH, 0x01 = DATA, 0x02 = CHAFF
 //! ```
 //!
@@ -40,7 +41,11 @@ pub use varint::*;
 ///
 /// v1: initial (no version byte)
 /// v2: WIRE_VER prefix added to every frame (enables version pinning).
-pub const WIRE_VER: u8 = 2;
+/// v3: trailing `pad_len:varint` field after `payload_len`; encoder pads
+///     payload up to the next length bucket with zero bytes; decoder reads
+///     both lengths and discards the trailing pad. See `LENGTH_BUCKETS` and
+///     `VeilFrontCodec::with_buckets`.
+pub const WIRE_VER: u8 = 3;
 
 /// TLS exporter label for session binding.
 pub const EXPORTER_LABEL: &str = "construct veil-front auth v1";

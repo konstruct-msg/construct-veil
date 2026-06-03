@@ -157,7 +157,7 @@ pub fn gather() -> String {
 ///
 /// This is intentionally dependency-free (no hyper, no axum) — it only
 /// handles the exact path Prometheus scrapes:
-/// ```
+/// ```text
 /// GET /metrics HTTP/1.1
 /// ```
 /// Any other request receives a `404 Not Found`.

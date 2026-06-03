@@ -22,11 +22,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::veil::fsm::MethodId;
 use crate::veil::obfuscator::{Obfuscator, ObfuscatorError, ObfuscatorHandle, ProbeRequest};
-use crate::veil::veil_front::{WriteStrategy, padding::tls_record_bucket};
+use crate::veil::veil_front::WriteStrategy;
 use construct_veil_protocol::ticket::{TICKET_WIRE_LEN, Ticket, ticket_from_bytes};
 use construct_veil_protocol::{
     AuthRecord, EXPORTER_LABEL, EXPORTER_LEN, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, Frame,
-    VeilFrontCodec,
+    LENGTH_BUCKETS, VeilFrontCodec,
 };
 
 /// HTTP/2 client connection preface (RFC 7540 §3.5) + an empty SETTINGS frame.
@@ -109,7 +109,7 @@ async fn dial_and_authenticate(
     // TLS handshake with SPKI pinning.
     let mut tls_stream = dial_utls_tcp(tcp, tls_sni, spki_hex, relay_addr).await?;
 
-    // Parse ticket (PoC: bundle is base64-encoded 65-byte ticket).
+    // Parse the base64-encoded 65-byte veil-front ticket blob.
     let ticket = parse_ticket(ticket_b64)?;
 
     // Derive TLS exporter keying material (32 bytes) and build the auth record:
@@ -147,7 +147,7 @@ async fn probe_veil_front(req: &ProbeRequest) -> Result<(), ObfuscatorError> {
     .await?;
 
     let (mut reader, mut writer) = tokio::io::split(tls_stream);
-    let mut codec = VeilFrontCodec::default();
+    let mut codec = VeilFrontCodec::default().with_buckets(LENGTH_BUCKETS);
 
     // Drive the h2c backend: send the preface inside a DATA frame.
     let mut tx_buf = BytesMut::new();
@@ -234,42 +234,29 @@ pub async fn run_veil_front_ferry_with_metrics(
     let strategy = WriteStrategy::new();
 
     // local h2c → payload queue + chaff scheduler → DATA/CHAFF frames → relay
+    //
+    // Length bucketing is handled by the codec (encoder pads payloads up to the
+    // next `LENGTH_BUCKETS` boundary with zero bytes; decoder on the relay side
+    // honours `pad_len` and discards them).
     let up = async move {
         let mut strategy = strategy;
         let mut local_rd = local_rd;
         let mut relay_wr = relay_wr;
+        let mut up_codec = VeilFrontCodec::default().with_buckets(LENGTH_BUCKETS);
         let mut rbuf = [0u8; 8192];
 
         loop {
             // 1. Check if there's a frame ready to send (payload or chaff).
             if let Some(frame) = strategy.next_frame() {
                 let frame_type = frame.frame_type;
-                let encoded = frame.encode_to_bytes();
-
-                // TLS-record length bucketing (RFC 8446 §5.4): pad the encoded
-                // frame so the resulting TLS record matches a length bucket.
-                let target = tls_record_bucket(encoded.len());
-                if target > encoded.len() {
-                    let pad_len = target - encoded.len();
-                    // Random padding — not zeros (zeros look suspicious to classifiers).
-                    use rand::{RngCore, SeedableRng};
-                    use rand_chacha::ChaCha8Rng;
-                    let mut rng = ChaCha8Rng::from_entropy();
-                    let mut out = BytesMut::with_capacity(target);
-                    out.extend_from_slice(&encoded);
-                    let mut pad = vec![0u8; pad_len];
-                    rng.fill_bytes(&mut pad);
-                    out.extend_from_slice(&pad);
-                    relay_wr
-                        .write_all(&out)
-                        .await
-                        .map_err(ObfuscatorError::Io)?;
-                } else {
-                    relay_wr
-                        .write_all(&encoded)
-                        .await
-                        .map_err(ObfuscatorError::Io)?;
-                }
+                let mut out = BytesMut::with_capacity(frame.payload.len() + 16);
+                up_codec
+                    .encode(frame, &mut out)
+                    .map_err(ObfuscatorError::Io)?;
+                relay_wr
+                    .write_all(&out)
+                    .await
+                    .map_err(ObfuscatorError::Io)?;
                 relay_wr.flush().await.map_err(ObfuscatorError::Io)?;
 
                 // If we just sent chaff, continue the loop to check for more.
@@ -409,18 +396,20 @@ fn derive_exporter(
     Ok(exporter)
 }
 
-/// Parse a veil-front ticket from the bundle string.
+/// Parse a base64-encoded veil-front ticket.
 ///
-/// PoC format: the bundle IS a base64-encoded 65-byte ticket blob.
-/// Production: the bundle will be a manifest descriptor containing the ticket.
-fn parse_ticket(bundle_b64: &str) -> Result<Ticket, ObfuscatorError> {
-    if bundle_b64.is_empty() {
+/// Wire format: 65 raw bytes (see `construct_veil_protocol::ticket`), base64-
+/// encoded for transport over string-typed channels (FFI, manifest).
+/// An empty input returns a handshake error, which the coordinator treats as
+/// "veil-front not configured" — the probe fails and the FSM moves on.
+fn parse_ticket(ticket_b64: &str) -> Result<Ticket, ObfuscatorError> {
+    if ticket_b64.is_empty() {
         return Err(ObfuscatorError::Handshake(
-            "no veil-front ticket in bundle".into(),
+            "veil-front ticket is empty (not configured)".into(),
         ));
     }
 
-    let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, bundle_b64)
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, ticket_b64)
         .map_err(|e| ObfuscatorError::Handshake(format!("ticket base64 decode: {e}")))?;
 
     ticket_from_bytes(&raw).ok_or_else(|| {
@@ -465,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_ticket_empty_bundle() {
+    fn parse_ticket_empty_input() {
         let err = parse_ticket("").unwrap_err();
         assert!(matches!(err, ObfuscatorError::Handshake(_)));
     }

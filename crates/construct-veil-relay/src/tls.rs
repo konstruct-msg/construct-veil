@@ -8,11 +8,24 @@
 
 use std::sync::Arc;
 
+use construct_veil_protocol::LENGTH_BUCKETS;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rustls::server::ServerConfig;
 use sha2::Digest;
 use tokio_rustls::TlsAcceptor;
 use tracing::info;
+
+/// Cap on the plaintext size of any TLS record this relay emits.
+///
+/// rustls 0.23 has no public `RecordPadder` callback, so length bucketing is
+/// done at the veil-front codec layer (zero-pad inside the frame). Setting
+/// `max_fragment_size` to the top bucket prevents rustls from coalescing
+/// multiple sub-bucket plaintext writes into a single oversized record that
+/// would fall outside the bucket distribution.
+const MAX_TLS_PLAINTEXT: usize = {
+    // const indexing of a slice is not stable; LENGTH_BUCKETS is sorted, top last.
+    LENGTH_BUCKETS[LENGTH_BUCKETS.len() - 1]
+};
 
 /// TLS configuration for the veil-front relay.
 pub struct RelayTls {
@@ -41,10 +54,14 @@ impl RelayTls {
         certs: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Self, std::io::Error> {
-        let config = ServerConfig::builder()
+        let mut config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs.clone(), key)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        // See MAX_TLS_PLAINTEXT comment — caps the record size so coalescing
+        // can't escape the bucket distribution emitted by the codec.
+        config.max_fragment_size = Some(MAX_TLS_PLAINTEXT);
 
         // Compute SPKI fingerprint from the first (leaf) cert.
         let spki_hex = compute_spki_hex(certs.first().ok_or_else(|| {
@@ -73,10 +90,11 @@ impl RelayTls {
 
         let spki_hex = compute_spki_hex(&cert_der);
 
-        let config = ServerConfig::builder()
+        let mut config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key_der)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        config.max_fragment_size = Some(MAX_TLS_PLAINTEXT);
 
         let acceptor = TlsAcceptor::from(Arc::new(config));
 

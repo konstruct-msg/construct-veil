@@ -970,6 +970,12 @@ pub struct VeilStartRequest {
     pub allowed_methods: u32,
     /// Path to the SQLite scores database. NULL = in-memory (no persistence).
     pub scores_path: *const c_char,
+    /// Base64-encoded veil-front ticket (65 bytes binary). Empty / NULL means
+    /// veil-front is excluded from the race — its probe will fail at ticket
+    /// parsing and the FSM moves on to the other methods. Must be set by
+    /// clients that ship veil-front; obfs4 / WebTunnel callers can leave it
+    /// NULL. Added in WIRE_VER 3 of the FFI — rebuild Swift/Kotlin bindings.
+    pub veil_front_ticket_b64: *const c_char,
 }
 
 /// Result struct returned by `veil_start`.
@@ -1037,6 +1043,13 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
     };
     let wt_base_path = unsafe {
         req.wt_base_path
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let veil_front_ticket_b64 = unsafe {
+        req.veil_front_ticket_b64
             .as_ref()
             .and_then(|p| CStr::from_ptr(p).to_str().ok())
             .unwrap_or("")
@@ -1118,6 +1131,7 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
                 spki_hex,
                 host_header,
                 wt_base_path,
+                veil_front_ticket_b64,
             )
             .await;
 
