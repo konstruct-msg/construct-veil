@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::veil::fsm::MethodId;
 use crate::veil::obfuscator::{Obfuscator, ObfuscatorError, ObfuscatorHandle, ProbeRequest};
-use crate::veil::veil_front::WriteStrategy;
+use crate::veil::veil_front::{WriteStrategy, padding::tls_record_bucket};
 use construct_veil_protocol::ticket::{TICKET_WIRE_LEN, Ticket, ticket_from_bytes};
 use construct_veil_protocol::{
     AuthRecord, EXPORTER_LABEL, EXPORTER_LEN, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, Frame,
@@ -245,10 +245,31 @@ pub async fn run_veil_front_ferry_with_metrics(
             if let Some(frame) = strategy.next_frame() {
                 let frame_type = frame.frame_type;
                 let encoded = frame.encode_to_bytes();
-                relay_wr
-                    .write_all(&encoded)
-                    .await
-                    .map_err(ObfuscatorError::Io)?;
+
+                // TLS-record length bucketing (RFC 8446 §5.4): pad the encoded
+                // frame so the resulting TLS record matches a length bucket.
+                let target = tls_record_bucket(encoded.len());
+                if target > encoded.len() {
+                    let pad_len = target - encoded.len();
+                    // Random padding — not zeros (zeros look suspicious to classifiers).
+                    use rand::{RngCore, SeedableRng};
+                    use rand_chacha::ChaCha8Rng;
+                    let mut rng = ChaCha8Rng::from_entropy();
+                    let mut out = BytesMut::with_capacity(target);
+                    out.extend_from_slice(&encoded);
+                    let mut pad = vec![0u8; pad_len];
+                    rng.fill_bytes(&mut pad);
+                    out.extend_from_slice(&pad);
+                    relay_wr
+                        .write_all(&out)
+                        .await
+                        .map_err(ObfuscatorError::Io)?;
+                } else {
+                    relay_wr
+                        .write_all(&encoded)
+                        .await
+                        .map_err(ObfuscatorError::Io)?;
+                }
                 relay_wr.flush().await.map_err(ObfuscatorError::Io)?;
 
                 // If we just sent chaff, continue the loop to check for more.

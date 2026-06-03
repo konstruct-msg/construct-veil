@@ -6,7 +6,8 @@
 //! # Wire format
 //!
 //! ```text
-//! Frame = [type:u8][len:varint][payload:len bytes]
+//! Frame = [ver:u8=WIRE_VER][type:u8][len:varint][payload:len bytes]
+//!   ver:  0x02 = current wire format (WIRE_VER embedded)
 //!   type: 0x00 = AUTH, 0x01 = DATA, 0x02 = CHAFF
 //! ```
 //!
@@ -36,7 +37,10 @@ pub use varint::*;
 // ── Wire protocol constants ────────────────────────────────────────────────
 
 /// Current wire format version. Bump on any framing change.
-pub const WIRE_VER: u8 = 1;
+///
+/// v1: initial (no version byte)
+/// v2: WIRE_VER prefix added to every frame (enables version pinning).
+pub const WIRE_VER: u8 = 2;
 
 /// TLS exporter label for session binding.
 pub const EXPORTER_LABEL: &str = "construct veil-front auth v1";

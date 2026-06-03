@@ -5,8 +5,11 @@
 //!
 //! # Frame format
 //! ```text
-//! [type:u8][len:varint][payload:len bytes]
+//! [ver:u8=WIRE_VER][type:u8][len:varint][payload:len bytes]
 //! ```
+//!
+//! The version byte is checked on decode — mismatched versions produce an error,
+//! enabling detection of silent format drift and per-version golden-vector pinning.
 //!
 //! # Usage
 //! ```ignore
@@ -22,7 +25,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::varint::{decode_varint, encode_varint};
-use crate::{FRAME_TYPE_AUTH, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA};
+use crate::{FRAME_TYPE_AUTH, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, WIRE_VER};
 
 /// Default maximum frame payload size (1 MiB).
 const DEFAULT_MAX_PAYLOAD: usize = 1024 * 1024;
@@ -114,8 +117,11 @@ impl Frame {
     }
 
     /// Encode the frame to wire format bytes.
+    ///
+    /// Wire format: `[ver:u8][type:u8][len:varint][payload]`
     pub fn encode_to_bytes(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(1 + 9 + self.payload.len());
+        let mut buf = BytesMut::with_capacity(2 + 9 + self.payload.len());
+        buf.put_u8(WIRE_VER);
         buf.put_u8(self.frame_type);
         encode_varint(self.payload.len() as u64, &mut buf);
         buf.put_slice(&self.payload);
@@ -129,6 +135,7 @@ impl Encoder<Frame> for VeilFrontCodec {
     type Error = std::io::Error;
 
     fn encode(&mut self, item: Frame, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        dst.put_u8(WIRE_VER);
         dst.put_u8(item.frame_type);
         encode_varint(item.payload.len() as u64, dst);
         dst.put_slice(&item.payload);
@@ -147,14 +154,25 @@ impl Decoder for VeilFrontCodec {
             return Ok(None);
         }
 
-        // Save position in case we need to backtrack (incomplete frame).
-        let _saved_len = src.len();
+        // Check wire version byte.
+        let ver = src[0];
+        if ver != WIRE_VER {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown wire version: got 0x{ver:02x}, expected 0x{WIRE_VER:02x}"),
+            ));
+        }
+
+        if src.len() < 2 {
+            // Have version byte but not enough for frame type — need more data.
+            return Ok(None);
+        }
 
         // Peek at frame type.
-        let frame_type = src[0];
+        let frame_type = src[1];
 
         // Try to decode the varint length.
-        let mut len_buf = &src[1..];
+        let mut len_buf = &src[2..];
         let (payload_len, varint_bytes) = match decode_varint(&mut len_buf) {
             Some(v) => v,
             None => {
@@ -173,7 +191,7 @@ impl Decoder for VeilFrontCodec {
             ));
         }
 
-        let header_len = 1 + varint_bytes; // frame_type byte + varint bytes
+        let header_len = 2 + varint_bytes; // ver + frame_type byte + varint bytes
         let total_len = header_len + payload_len as usize;
 
         if src.len() < total_len {
@@ -181,7 +199,7 @@ impl Decoder for VeilFrontCodec {
             return Ok(None);
         }
 
-        // Advance past header.
+        // Advance past header (version + type + varint).
         src.advance(header_len);
 
         // Extract payload.
@@ -294,8 +312,8 @@ mod tests {
         let mut buf = BytesMut::new();
         codec.encode(frame, &mut buf).unwrap();
 
-        // Give it only the first 2 bytes (type + partial varint).
-        let mut partial = buf.split_to(2);
+        // Give it only the first 3 bytes (ver + type + partial varint).
+        let mut partial = buf.split_to(3);
         assert!(codec.decode(&mut partial).unwrap().is_none());
 
         // Put the remaining bytes back.
@@ -356,11 +374,41 @@ mod tests {
         let mut buf = BytesMut::new();
         codec.encode(frame, &mut buf).unwrap();
 
-        // Take only the type byte.
+        // Take only the version byte — can't decode anything.
         buf.truncate(1);
 
         let result = codec.decode_eof(&mut buf);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_wrong_version() {
+        let mut codec = VeilFrontCodec::default();
+        let mut buf = BytesMut::new();
+
+        // Manually write a frame with wrong version.
+        buf.put_u8(0xFF); // wrong version
+        buf.put_u8(FRAME_TYPE_DATA);
+        encode_varint(5, &mut buf);
+        buf.put_slice(b"hello");
+
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("wire version"));
+    }
+
+    #[test]
+    fn version_byte_in_encoded() {
+        let mut codec = VeilFrontCodec::default();
+        let payload = Bytes::from(&b"test"[..]);
+        let frame = Frame::data(payload);
+        let mut buf = BytesMut::new();
+        codec.encode(frame, &mut buf).unwrap();
+
+        // First byte must be WIRE_VER.
+        assert_eq!(buf[0], WIRE_VER);
     }
 
     #[test]
