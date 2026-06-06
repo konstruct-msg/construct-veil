@@ -1,7 +1,7 @@
 # Multi-stage Rust build of construct-veil-relay + issue-ticket helper.
 # Build context: construct-veil workspace root (`..` from deploy/).
 
-FROM rust:1.85-bookworm AS build
+FROM rust:1.96-slim-bookworm AS build
 WORKDIR /src
 
 # Copy workspace manifests first for dep-cache layer hits.
