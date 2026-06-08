@@ -78,10 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let json = serde_json::to_string_pretty(&vec![&b64])?;
         fs::write(&path, json)?;
         eprintln!("Wrote 1 ticket to {path}");
-        eprintln!(
-            "  ticket_id = {}",
-            hex_encode(&ticket.ticket_id)
-        );
+        eprintln!("  ticket_id = {}", hex_encode(&ticket.ticket_id));
         eprintln!("  not_after = {not_after} ({} days from now)", args.days);
     } else if let Some(path) = args.append {
         let mut existing: Vec<String> = match fs::read_to_string(&path) {
@@ -92,10 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let json = serde_json::to_string_pretty(&existing)?;
         fs::write(&path, json)?;
         eprintln!("Appended ticket to {path} (total = {})", existing.len());
-        eprintln!(
-            "  ticket_id = {}",
-            hex_encode(&ticket.ticket_id)
-        );
+        eprintln!("  ticket_id = {}", hex_encode(&ticket.ticket_id));
         eprintln!("  not_after = {not_after} ({} days from now)", args.days);
     } else {
         // stdout — print just the base64 so it can be piped / captured.
@@ -116,4 +110,3 @@ fn hex_encode(b: &[u8]) -> String {
     }
     s
 }
-
