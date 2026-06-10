@@ -18,8 +18,9 @@ RUN mkdir -p crates/construct-veil-protocol/src crates/construct-veil-relay/src/
 COPY src ./src
 COPY crates ./crates
 
-# Собираем реальный бинарник
-RUN cargo build --release -p construct-veil-relay --bins
+# Удаляем артефакты заглушек и собираем реальный бинарник
+RUN rm -rf target/release/construct-veil-relay target/release/issue-ticket \
+    && cargo build --release -p construct-veil-relay --bins
 
 # Runtime - всё остальное без изменений
 FROM debian:bookworm-slim AS runtime
