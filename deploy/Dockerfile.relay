@@ -7,20 +7,21 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/construct-veil-protocol/Cargo.toml crates/construct-veil-protocol/
 COPY crates/construct-veil-relay/Cargo.toml    crates/construct-veil-relay/
 
-# Создаем временные файлы для кэширования зависимостей
+# Этап 1: предварительная компиляция зависимостей на заглушках (только для кэша).
+# Используем отдельный --target-dir чтобы артефакты заглушек не попали в финальный образ.
 RUN mkdir -p crates/construct-veil-protocol/src crates/construct-veil-relay/src/bin \
     && echo "pub fn dummy() {}" > crates/construct-veil-protocol/src/lib.rs \
-    && echo "fn main() { println!(\"caching deps\"); }" > crates/construct-veil-relay/src/main.rs \
-    && echo "fn main() { println!(\"caching deps\"); }" > crates/construct-veil-relay/src/bin/issue_ticket.rs \
-    && cargo build --release -p construct-veil-relay --bins 2>/dev/null || true
+    && echo "fn main() {}" > crates/construct-veil-relay/src/main.rs \
+    && echo "fn main() {}" > crates/construct-veil-relay/src/bin/issue_ticket.rs \
+    && cargo build --release -p construct-veil-relay --bins --target-dir /tmp/deps 2>/dev/null || true \
+    && rm -rf /tmp/deps
 
 # Копируем реальный исходный код (перезаписывая заглушки)
 COPY src ./src
 COPY crates ./crates
 
-# Удаляем артефакты заглушек и собираем реальный бинарник
-RUN rm -rf target/release/construct-veil-relay target/release/issue-ticket \
-    && cargo build --release -p construct-veil-relay --bins
+# Финальная сборка — target/ чист, никаких следов заглушек
+RUN cargo build --release -p construct-veil-relay --bins
 
 # Runtime - всё остальное без изменений
 FROM debian:bookworm-slim AS runtime
