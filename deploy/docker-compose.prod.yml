@@ -41,6 +41,11 @@ services:
       - ./data/tickets:/etc/veil-front:ro
     environment:
       RUST_LOG: "${RUST_LOG:-info}"
+      # Passed through so the healthcheck's `openssl s_client -servername ${DOMAIN}`
+      # expands to a real hostname inside the container. Without it the SNI is empty,
+      # openssl shifts and uses `-brief` as the servername, and the relay rejects the
+      # handshake (ServerNameMustContainOneHostName) → container marked unhealthy.
+      DOMAIN: "${DOMAIN}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     # Remote front topology: this relay (e.g. in RU, reachable by IP) terminates

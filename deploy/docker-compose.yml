@@ -46,6 +46,10 @@ services:
       - ./data/tickets:/etc/veil-front:ro
     environment:
       RUST_LOG: "${RUST_LOG:-info}"
+      # Passed through so the healthcheck's `openssl s_client -servername ${DOMAIN}`
+      # expands to a real hostname inside the container (else SNI is empty and the
+      # relay rejects the handshake → container marked unhealthy).
+      DOMAIN: "${DOMAIN}"
     # Construct gRPC backend is reachable via host.docker.internal on Linux
     # only when --add-host is set; expose for portability.
     extra_hosts:
