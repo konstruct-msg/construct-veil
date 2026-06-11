@@ -44,7 +44,6 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     command: >
-      construct-veil-relay
       --listen 0.0.0.0:443
       --cert /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
       --key  /etc/letsencrypt/live/${DOMAIN}/privkey.pem
