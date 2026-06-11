@@ -22,7 +22,18 @@ docker compose run --rm certbot renew --webroot -w /var/www/certbot --quiet
 POST_MTIME=$(stat -c '%Y' "$CERT_PATH" 2>/dev/null || echo 0)
 
 if [ "$POST_MTIME" -gt "$PRE_MTIME" ]; then
-  echo "✓ cert renewed (mtime: $PRE_MTIME → $POST_MTIME), restarting relay"
+  echo "✓ cert renewed (mtime: $PRE_MTIME → $POST_MTIME)"
+
+  # certbot resets perms on the freshly-issued privkey (0600 root:root) — re-open
+  # them so the non-root relay (uid 65532) can read the new key after restart.
+  echo "  fixing cert permissions for the non-root relay…"
+  docker compose run --rm --no-TTY --entrypoint sh certbot -c '
+    chmod 0755 /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
+    chmod 0755 /etc/letsencrypt/live/* /etc/letsencrypt/archive/* 2>/dev/null || true
+    chmod 0644 /etc/letsencrypt/archive/*/privkey*.pem 2>/dev/null || true
+  '
+
+  echo "  restarting relay"
   docker compose restart relay
 
   # Republish SPKI — fish it from the new banner.

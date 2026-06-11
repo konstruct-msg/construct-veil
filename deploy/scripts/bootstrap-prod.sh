@@ -58,6 +58,17 @@ $COMPOSE run --rm certbot certonly \
   --email "$EMAIL" \
   --agree-tos --no-eff-email --expand -n
 
+# ── Make certs readable by the non-root relay (uid 65532) ───────────────────
+# certbot writes privkey.pem 0600 root:root and live/archive dirs 0700, so the
+# relay container (USER veil, uid 65532) gets EACCES on the key. Re-applied on
+# every renewal (renew-cert.sh) since certbot resets perms on each new key.
+echo "▸ Fixing cert permissions for the non-root relay…"
+$COMPOSE run --rm --no-TTY --entrypoint sh certbot -c '
+  chmod 0755 /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
+  chmod 0755 /etc/letsencrypt/live/* /etc/letsencrypt/archive/* 2>/dev/null || true
+  chmod 0644 /etc/letsencrypt/archive/*/privkey*.pem 2>/dev/null || true
+'
+
 # ── Issue ticket ─────────────────────────────────────────────────────────
 echo "▸ Issuing initial veil-front ticket ($TICKET_DAYS days)…"
 mkdir -p data/tickets

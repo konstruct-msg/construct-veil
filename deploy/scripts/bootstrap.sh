@@ -88,6 +88,19 @@ docker compose run --rm certbot certonly \
   --email "$EMAIL" \
   --agree-tos --no-eff-email --expand -n
 
+# ── Make certs readable by the non-root relay (uid 65532) ───────────────────
+# certbot writes privkey.pem as 0600 root:root and the live/archive dirs as
+# 0700, so the relay container (USER veil, uid 65532) gets EACCES on the key and
+# crashes with InvalidData(PermissionDenied). Open traversal on live/archive and
+# read on the privkeys. Must be re-applied after every renewal — see
+# renew-cert.sh — because certbot resets perms on each freshly-issued key.
+echo "▸ Fixing cert permissions for the non-root relay…"
+docker compose run --rm --no-TTY --entrypoint sh certbot -c '
+  chmod 0755 /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
+  chmod 0755 /etc/letsencrypt/live/* /etc/letsencrypt/archive/* 2>/dev/null || true
+  chmod 0644 /etc/letsencrypt/archive/*/privkey*.pem 2>/dev/null || true
+'
+
 # ── Issue initial ticket ───────────────────────────────────────────────────
 echo "▸ Issuing initial veil-front ticket ($TICKET_DAYS days)…"
 mkdir -p data/tickets
