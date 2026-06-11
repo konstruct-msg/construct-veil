@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use gate::{GateResult, gate_with_exporter};
-use tokio::net::{TcpListener, lookup_host};
+use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use crate::tickets::TicketStore;
@@ -202,9 +202,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Accept loop ────────────────────────────────────────────────────────
 
     let acceptor = relay_tls.acceptor;
-    let backend_addr = resolve(&args.backend).await?;
-    let site_addr = resolve(&args.site).await?;
-    info!("Resolved backend => {backend_addr}, site => {site_addr}");
+    // host:port strings, resolved per connection (not once at startup) so a
+    // recreated backend / cover container with a new Docker IP is picked up
+    // automatically — a startup-only resolve strands the relay on the old IP.
+    let backend: Arc<str> = Arc::from(args.backend.as_str());
+    let site: Arc<str> = Arc::from(args.site.as_str());
 
     loop {
         let (tcp, peer) = match listener.accept().await {
@@ -220,25 +222,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let acceptor = acceptor.clone();
         let store = Arc::clone(&ticket_store);
         let dialer = backend_dialer.clone();
+        let backend = Arc::clone(&backend);
+        let site = Arc::clone(&site);
 
         tokio::spawn(async move {
             if let Err(e) =
-                handle_connection(tcp, peer, acceptor, store, backend_addr, dialer, site_addr).await
+                handle_connection(tcp, peer, acceptor, store, &backend, dialer, &site).await
             {
                 warn!(peer = %peer, error = %e, "connection handler error");
             }
         });
     }
-}
-
-/// Resolve a host:port string to a SocketAddr.
-async fn resolve(addr: &str) -> Result<SocketAddr, Box<dyn std::error::Error>> {
-    let resolved = lookup_host(addr)
-        .await
-        .map_err(|e| format!("Failed to resolve '{addr}': {e}"))?
-        .next()
-        .ok_or_else(|| format!("No addresses found for '{addr}'"))?;
-    Ok(resolved)
 }
 
 /// Handle a single incoming connection.
@@ -247,9 +241,9 @@ async fn handle_connection(
     peer: SocketAddr,
     acceptor: tokio_rustls::TlsAcceptor,
     store: Arc<TicketStore>,
-    backend_addr: SocketAddr,
+    backend: &str,
     backend_dialer: BackendDialer,
-    site_addr: SocketAddr,
+    site: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // TLS handshake.
     let tls_stream = acceptor.accept(tcp).await?;
@@ -259,7 +253,8 @@ async fn handle_connection(
     match gate_with_exporter(tls_stream, &store).await {
         Ok(GateResult::Tunnel { stream, leftover }) => {
             // Valid auth — connect to the backend (plain h2c or TLS+ALPN-h2) and tunnel.
-            let backend = tokio::net::TcpStream::connect(backend_addr).await?;
+            // `backend` is a host:port string, resolved here (per connection).
+            let backend = tokio::net::TcpStream::connect(backend).await?;
             backend.set_nodelay(true)?;
             match &backend_dialer {
                 BackendDialer::Plain => {
@@ -286,7 +281,7 @@ async fn handle_connection(
             // Forward raw bytes to the cover site backend.
             // The constant-shape requirement: we do NOT close/silence/delay differently.
             // The cover app's own error timing is the only timing on this branch.
-            match site::forward_to_site(stream, first_bytes, site_addr).await {
+            match site::forward_to_site(stream, first_bytes, site).await {
                 Ok(()) => {}
                 Err(e) => {
                     tracing::debug!(peer = %peer, error = %e, "site forwarding ended");

@@ -8,8 +8,6 @@
 //! The cover site MUST serve long-lived H2 traffic (SSE, WebSocket, etc.) so
 //! the baseline traffic shape matches a tunnelled messenger.
 
-use std::net::SocketAddr;
-
 use bytes::BytesMut;
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
@@ -25,12 +23,14 @@ use tracing::{debug, warn};
 pub async fn forward_to_site<S>(
     client_stream: S,
     first_bytes: BytesMut,
-    site_addr: SocketAddr,
+    site_addr: &str,
 ) -> Result<(), std::io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    // Connect to the cover site backend.
+    // Connect to the cover site backend. `site_addr` is a `host:port` string,
+    // resolved per connection so a recreated cover container (new Docker IP) is
+    // picked up without restarting the relay.
     let mut site_conn = tokio::net::TcpStream::connect(site_addr).await?;
     site_conn.set_nodelay(true)?;
 
