@@ -18,8 +18,6 @@
 //! forwards frame headers to the backend, and the chaff channel is real on the
 //! wire (CHAFF is silently discarded here, injected by the client's padding layer).
 
-use std::net::SocketAddr;
-
 use bytes::{Bytes, BytesMut};
 use construct_veil_protocol::{
     FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, Frame, LENGTH_BUCKETS, VeilFrontCodec,
@@ -59,22 +57,25 @@ fn initial_chaff(rng: &mut impl Rng) -> Bytes {
 
 /// Forward tunnel traffic between an authenticated client and the backend.
 ///
+/// `backend` is an already-connected byte stream — either a plain `TcpStream`
+/// (co-located h2c backend) or a TLS stream (remote backend reached over its
+/// public TLS endpoint, ALPN h2). The relay is transport-agnostic here: DATA
+/// payloads are the client's raw H2/gRPC bytes, written to the backend verbatim.
+///
 /// `leftover` contains any buffered bytes that arrived in the same read as the
 /// AUTH frame (after it was consumed) — these are the start of the framed DATA
 /// stream and are fed into the decoder before reading more from the socket.
-pub async fn forward_tunnel<S>(
+pub async fn forward_tunnel<S, B>(
     client_stream: S,
     leftover: BytesMut,
-    backend_addr: SocketAddr,
+    backend: B,
 ) -> Result<(), std::io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
+    B: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let backend = tokio::net::TcpStream::connect(backend_addr).await?;
-    backend.set_nodelay(true)?;
-
     let (client_rd, mut client_wr) = io::split(client_stream);
-    let (backend_rd, backend_wr) = backend.into_split();
+    let (backend_rd, backend_wr) = io::split(backend);
 
     // ── First-response alignment (§6.6): emit an initial CHAFF frame
     // before any backend data. This ensures the tunnel path's first emitted
@@ -219,8 +220,10 @@ mod tests {
 
         // Client stream is one end of an in-memory duplex.
         let (client_inner, client_test) = tokio::io::duplex(8192);
+        let backend_conn = tokio::net::TcpStream::connect(backend_addr).await.unwrap();
+        backend_conn.set_nodelay(true).unwrap();
         let tunnel = tokio::spawn(async move {
-            forward_tunnel(client_inner, BytesMut::new(), backend_addr).await
+            forward_tunnel(client_inner, BytesMut::new(), backend_conn).await
         });
 
         let (mut test_rd, mut test_wr) = tokio::io::split(client_test);

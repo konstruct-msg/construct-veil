@@ -399,7 +399,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "construct-veil"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "construct-veil-protocol"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "bytes",
  "hex",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "construct-veil-relay"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "base64",
  "bytes",
@@ -484,6 +484,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots 0.26.11",
  "x509-cert",
 ]
 
@@ -3065,6 +3066,24 @@ checksum = "854ba17bb104abfb26ba36da9729addc7ce7f06f5c0f90f3c391f8461cca21f9"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.7",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

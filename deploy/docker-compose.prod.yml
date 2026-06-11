@@ -43,12 +43,19 @@ services:
       RUST_LOG: "${RUST_LOG:-info}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Remote front topology: this relay (e.g. in RU, reachable by IP) terminates
+    # the veil-TLS and re-wraps the gRPC stream in a fresh TLS connection to the
+    # Construct backend's public endpoint (Traefik :443 → h2c → envoy:8080).
+    # --backend-sni keeps the cert hostname correct even when BACKEND is set to a
+    # raw IP (e.g. when the backend domain is DNS-blocked on the relay's network).
     command: >
       --listen 0.0.0.0:443
       --cert /etc/letsencrypt/live/${DOMAIN}/fullchain.pem
       --key  /etc/letsencrypt/live/${DOMAIN}/privkey.pem
       --site cover:8080
-      --backend ${BACKEND:-host.docker.internal:50051}
+      --backend ${BACKEND:-ams.konstruct.cc:443}
+      --backend-tls
+      --backend-sni ${BACKEND_SNI:-ams.konstruct.cc}
       --tickets /etc/veil-front/tickets.json
     healthcheck:
       test: ["CMD-SHELL", "echo | openssl s_client -connect 127.0.0.1:443 -servername $$(echo $${DOMAIN}) -brief 2>&1 | grep -q 'Verification: OK\\|verify error' || exit 1"]

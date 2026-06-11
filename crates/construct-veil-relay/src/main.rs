@@ -60,13 +60,38 @@ struct Args {
     #[arg(long)]
     tickets: Option<String>,
 
-    /// Backend address (Construct gRPC, h2c). Accepts host:port or IP:port.
+    /// Backend address (Construct gRPC). Accepts host:port or IP:port. Plaintext
+    /// h2c by default; with --backend-tls the relay connects over TLS (ALPN h2).
     #[arg(long, default_value = "127.0.0.1:50051")]
     backend: String,
+
+    /// Connect to the backend over TLS (ALPN h2) instead of plaintext h2c. Use
+    /// this when the relay is remote and reaches the Construct backend via its
+    /// public TLS endpoint (e.g. ams.konstruct.cc:443 → Traefik → envoy:8080).
+    #[arg(long, default_value_t = false)]
+    backend_tls: bool,
+
+    /// SNI / certificate hostname for the TLS backend. Defaults to the host part
+    /// of --backend. Only used with --backend-tls.
+    #[arg(long)]
+    backend_sni: Option<String>,
 
     /// Cover site address (local HTTP server with long-lived H2). Accepts host:port or IP:port.
     #[arg(long, default_value = "127.0.0.1:8080")]
     site: String,
+}
+
+/// How the relay connects to the backend after authenticating a tunnel.
+#[derive(Clone)]
+enum BackendDialer {
+    /// Plaintext h2c — a co-located backend (e.g. local envoy on the same host).
+    Plain,
+    /// TLS with ALPN h2 — a remote backend reached via its public TLS endpoint
+    /// (e.g. ams.konstruct.cc:443, terminated by Traefik and routed to envoy).
+    Tls {
+        connector: tokio_rustls::TlsConnector,
+        server_name: rustls::pki_types::ServerName<'static>,
+    },
 }
 
 #[tokio::main]
@@ -116,13 +141,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ticket_store = Arc::new(ticket_store);
 
+    // ── Backend dialer ─────────────────────────────────────────────────────
+    // h2c by default (co-located backend); TLS+ALPN-h2 for a remote backend
+    // reached over its public TLS endpoint (the front-relay-in-RU topology).
+    let backend_dialer = if args.backend_tls {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let mut client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"h2".to_vec()];
+        let sni = args.backend_sni.clone().unwrap_or_else(|| {
+            args.backend
+                .rsplit_once(':')
+                .map(|(h, _)| h.to_string())
+                .unwrap_or_else(|| args.backend.clone())
+        });
+        let server_name = rustls::pki_types::ServerName::try_from(sni.clone())
+            .map_err(|e| format!("invalid backend SNI '{sni}': {e}"))?;
+        info!("Backend TLS enabled — SNI={sni}, ALPN=h2");
+        BackendDialer::Tls {
+            connector: tokio_rustls::TlsConnector::from(Arc::new(client_config)),
+            server_name,
+        }
+    } else {
+        BackendDialer::Plain
+    };
+
     // ── Banner ─────────────────────────────────────────────────────────────
 
     info!("╔══════════════════════════════════════════════════════════");
     info!("║  construct-veil-relay  v{}", env!("CARGO_PKG_VERSION"));
     info!("╠══════════════════════════════════════════════════════════");
     info!("║  listen     {}", args.listen);
-    info!("║  backend    {} (h2c)", args.backend);
+    info!(
+        "║  backend    {} ({})",
+        args.backend,
+        if args.backend_tls { "TLS h2" } else { "h2c" }
+    );
     info!("║  site       {} (cover app)", args.site);
     info!(
         "║  tls        {}",
@@ -163,10 +219,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let acceptor = acceptor.clone();
         let store = Arc::clone(&ticket_store);
+        let dialer = backend_dialer.clone();
 
         tokio::spawn(async move {
             if let Err(e) =
-                handle_connection(tcp, peer, acceptor, store, backend_addr, site_addr).await
+                handle_connection(tcp, peer, acceptor, store, backend_addr, dialer, site_addr).await
             {
                 warn!(peer = %peer, error = %e, "connection handler error");
             }
@@ -191,6 +248,7 @@ async fn handle_connection(
     acceptor: tokio_rustls::TlsAcceptor,
     store: Arc<TicketStore>,
     backend_addr: SocketAddr,
+    backend_dialer: BackendDialer,
     site_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // TLS handshake.
@@ -200,8 +258,21 @@ async fn handle_connection(
     // Run the constant-shape gate.
     match gate_with_exporter(tls_stream, &store).await {
         Ok(GateResult::Tunnel { stream, leftover }) => {
-            // Valid auth — tunnel to backend.
-            tunnel::forward_tunnel(stream, leftover, backend_addr).await?;
+            // Valid auth — connect to the backend (plain h2c or TLS+ALPN-h2) and tunnel.
+            let backend = tokio::net::TcpStream::connect(backend_addr).await?;
+            backend.set_nodelay(true)?;
+            match &backend_dialer {
+                BackendDialer::Plain => {
+                    tunnel::forward_tunnel(stream, leftover, backend).await?;
+                }
+                BackendDialer::Tls {
+                    connector,
+                    server_name,
+                } => {
+                    let tls_backend = connector.connect(server_name.clone(), backend).await?;
+                    tunnel::forward_tunnel(stream, leftover, tls_backend).await?;
+                }
+            }
         }
         Ok(GateResult::Site {
             stream,
