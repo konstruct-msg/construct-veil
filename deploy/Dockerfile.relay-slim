@@ -1,0 +1,18 @@
+# Slim runtime — assumes pre-built x86_64 binary at target/x86_64-unknown-linux-gnu/release/
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libcap2-bin ca-certificates openssl \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -r -u 65532 -s /sbin/nologin veil
+
+COPY target/x86_64-unknown-linux-gnu/release/construct-veil-relay /usr/local/bin/
+COPY target/x86_64-unknown-linux-gnu/release/issue-ticket          /usr/local/bin/
+
+RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/construct-veil-relay
+
+USER veil
+EXPOSE 443
+
+ENTRYPOINT ["/usr/local/bin/construct-veil-relay"]
