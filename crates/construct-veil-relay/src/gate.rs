@@ -115,7 +115,7 @@ pub async fn gate_with_exporter(
 
     // Try to decode immediately — no fixed threshold.
     if let Some(result) = try_decode_auth(&buf, &exporter, store).await {
-        return Ok(result.consume(reader));
+        return Ok(result.consume(reader, buf));
     }
 
     // Incomplete or invalid — one more read with timeout to handle TCP
@@ -130,7 +130,7 @@ pub async fn gate_with_exporter(
         Ok(Ok(_n2)) => {
             // Got more data, try decode again.
             if let Some(result) = try_decode_auth(&buf, &exporter, store).await {
-                return Ok(result.consume(reader));
+                return Ok(result.consume(reader, buf));
             }
             // Still incomplete/invalid → Site.
             debug!("second read still incomplete, routing to site");
@@ -224,12 +224,18 @@ enum GateDecision {
 
 impl GateDecision {
     /// Consume the read side of the stream and produce a `GateResult`.
-    fn consume<S>(self, stream: S) -> GateResult<S> {
+    ///
+    /// `buf` is everything read during the gate. For the Site branch it MUST be
+    /// carried through as `first_bytes` — those are the client's request bytes
+    /// (e.g. `GET / HTTP/1.1`) that the cover site needs to see. Returning an empty
+    /// buffer here made `handle_connection` close the connection without forwarding
+    /// (empty reply), so the cover site never responded to any non-auth request.
+    fn consume<S>(self, stream: S, buf: BytesMut) -> GateResult<S> {
         match self {
             GateDecision::Tunnel { leftover } => GateResult::Tunnel { stream, leftover },
             GateDecision::Site => GateResult::Site {
                 stream,
-                first_bytes: BytesMut::new(),
+                first_bytes: buf,
             },
         }
     }
