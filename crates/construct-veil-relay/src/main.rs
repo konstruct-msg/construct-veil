@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use gate::{GateResult, gate_with_exporter};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, lookup_host};
 use tracing::{info, warn};
 
 use crate::tickets::TicketStore;
@@ -60,13 +60,13 @@ struct Args {
     #[arg(long)]
     tickets: Option<String>,
 
-    /// Backend address (Construct gRPC, h2c).
+    /// Backend address (Construct gRPC, h2c). Accepts host:port or IP:port.
     #[arg(long, default_value = "127.0.0.1:50051")]
-    backend: SocketAddr,
+    backend: String,
 
-    /// Cover site address (local HTTP server with long-lived H2).
+    /// Cover site address (local HTTP server with long-lived H2). Accepts host:port or IP:port.
     #[arg(long, default_value = "127.0.0.1:8080")]
-    site: SocketAddr,
+    site: String,
 }
 
 #[tokio::main]
@@ -146,8 +146,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Accept loop ────────────────────────────────────────────────────────
 
     let acceptor = relay_tls.acceptor;
-    let backend_addr = args.backend;
-    let site_addr = args.site;
+    let backend_addr = resolve(&args.backend).await?;
+    let site_addr = resolve(&args.site).await?;
+    info!("Resolved backend => {backend_addr}, site => {site_addr}");
 
     loop {
         let (tcp, peer) = match listener.accept().await {
@@ -171,6 +172,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+}
+
+/// Resolve a host:port string to a SocketAddr.
+async fn resolve(addr: &str) -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let resolved = lookup_host(addr)
+        .await
+        .map_err(|e| format!("Failed to resolve '{addr}': {e}"))?
+        .next()
+        .ok_or_else(|| format!("No addresses found for '{addr}'"))?;
+    Ok(resolved)
 }
 
 /// Handle a single incoming connection.
