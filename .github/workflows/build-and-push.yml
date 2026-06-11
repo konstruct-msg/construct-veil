@@ -36,7 +36,7 @@ jobs:
           context: deploy/cover-site
           file: deploy/Dockerfile.cover
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/cover:latest
+          tags: ${{ env.REGISTRY }}/konstruct-msg/construct-veil/cover:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -47,6 +47,6 @@ jobs:
           context: .
           file: deploy/Dockerfile.relay
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/relay:latest
+          tags: ${{ env.REGISTRY }}/konstruct-msg/construct-veil/relay:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max

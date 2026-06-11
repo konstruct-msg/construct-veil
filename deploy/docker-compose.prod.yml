@@ -8,7 +8,7 @@
 
 services:
   cover:
-    image: ghcr.io/construct-msg/construct-veil/cover:latest
+    image: ghcr.io/konstruct-msg/construct-veil/cover:latest
     container_name: veil-front-cover
     restart: unless-stopped
     ports:
@@ -28,7 +28,7 @@ services:
     restart: "no"
 
   relay:
-    image: ghcr.io/construct-msg/construct-veil/relay:latest
+    image: ghcr.io/konstruct-msg/construct-veil/relay:latest
     container_name: veil-front-relay
     restart: unless-stopped
     depends_on:
