@@ -116,6 +116,22 @@ impl VeilCoordinator {
         let start_time = Instant::now();
         let mut state = VeilState::Idle;
 
+        // Restrict the allowed set to methods we actually have an obfuscator for.
+        // The host passes "all methods" (bitmask 0), but a build may register only
+        // a subset (e.g. veil-front-only on `utls`). Without this, the scorer can
+        // pick an unregistered method into the top-K — it "immediately fails", the
+        // registered method gets starved, no real probe runs, and the FSM dead-ends
+        // in cooldown→Idle (surfaced as the misleading "session was stopped").
+        let allowed_methods = {
+            let mut bits = allowed_methods.0;
+            for m in MethodId::all() {
+                if !self.obfuscators.contains_key(m) {
+                    bits |= m.bit();
+                }
+            }
+            MethodSet::from_bitmask(bits)
+        };
+
         info!(
             target: "ice::coordinator",
             "session started  fingerprint={} methods={:?}",
@@ -460,6 +476,10 @@ impl VeilCoordinator {
 
             if !has_obfuscator {
                 // No obfuscator registered for this method — immediately fail.
+                crate::veil::diag::record(format!(
+                    "{}: no obfuscator registered in this build",
+                    method.name()
+                ));
                 tokio::spawn(async move {
                     let _ = tx_clone
                         .send(ProbeResult {
