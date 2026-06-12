@@ -1,111 +1,134 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="ru">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Диваны и Кресла — мебель на заказ в UK</title>
-  <meta name="description" content="Мастерская в Великобритании: диваны и кресла на заказ по индивидуальным проектам. Изготовление, доставка по всей UK.">
-  <link rel="stylesheet" href="/styles.css">
-  <link rel="icon" href="/favicon.ico">
-</head>
-<body>
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Диваны и Кресла — мебель на заказ в UK</title>
+        <meta
+            name="description"
+            content="Мастерская в Великобритании: диваны и кресла на заказ по индивидуальным проектам. Изготовление, доставка по всей UK."
+        />
+        <link rel="stylesheet" href="/styles.css" />
+        <link rel="icon" href="/favicon.ico" />
+    </head>
+    <body>
+        <header class="hero">
+            <div class="hero-inner">
+                <div class="brand">Диваны и Кресла</div>
+                <h1>Мебель на заказ.<br />По индивидуальным проектам.</h1>
+                <p class="lede">
+                    Маленькая мастерская в Великобритании. Делаем диваны,
+                    кресла, банкетки и пуфы по эскизам клиента — каркас из
+                    массива бука и берёзы, наполнение из пенополиуретана высокой
+                    плотности, обивка из ткани или кожи на ваш выбор. Доставка
+                    по всей UK.
+                </p>
+                <a href="#contact" class="cta">Обсудить проект</a>
+            </div>
+        </header>
 
-<header class="hero">
-  <div class="hero-inner">
-    <div class="brand">Диваны и Кресла</div>
-    <h1>Мебель на заказ.<br>По индивидуальным проектам.</h1>
-    <p class="lede">
-      Маленькая мастерская в Великобритании. Делаем диваны, кресла, банкетки
-      и пуфы по эскизам клиента — каркас из массива бука и берёзы, наполнение
-      из пенополиуретана высокой плотности, обивка из ткани или кожи на ваш
-      выбор. Доставка по всей UK.
-    </p>
-    <a href="#contact" class="cta">Обсудить проект</a>
-  </div>
-</header>
+        <main>
+            <section class="section">
+                <h2>Что мы делаем</h2>
+                <ul class="features">
+                    <li>
+                        <strong>Диваны и кресла</strong>
+                        от классики до современных форм. Любые размеры и
+                        конфигурации.
+                    </li>
+                    <li>
+                        <strong>Каркас из массива</strong>
+                        бук, берёза, дуб. Шипованные соединения, без саморезов в
+                        нагруженных узлах.
+                    </li>
+                    <li>
+                        <strong>Обивка по выбору</strong>
+                        работаем с тканями шенилл, велюр, рогожка и натуральной
+                        кожей. Образцы привозим на дом перед стартом проекта.
+                    </li>
+                    <li>
+                        <strong>Доставка и подъём</strong>
+                        собственная служба доставки по UK, сборка на месте.
+                    </li>
+                </ul>
+            </section>
 
-<main>
+            <section class="section workshop">
+                <h2>Мастерская сейчас</h2>
+                <p class="muted small">
+                    Live-лента: над чем идёт работа в эту минуту. Обновляется
+                    автоматически.
+                </p>
+                <div id="status-bar">
+                    <span id="connection-status">соединение…</span>
+                    <span id="active-count">— заказов в работе</span>
+                </div>
+                <div id="feed"></div>
+            </section>
 
-  <section class="section">
-    <h2>Что мы делаем</h2>
-    <ul class="features">
-      <li>
-        <strong>Диваны и кресла</strong>
-        от классики до современных форм. Любые размеры и конфигурации.
-      </li>
-      <li>
-        <strong>Каркас из массива</strong>
-        бук, берёза, дуб. Шипованные соединения, без саморезов в нагруженных
-        узлах.
-      </li>
-      <li>
-        <strong>Обивка по выбору</strong>
-        работаем с тканями шенилл, велюр, рогожка и натуральной кожей.
-        Образцы привозим на дом перед стартом проекта.
-      </li>
-      <li>
-        <strong>Доставка и подъём</strong>
-        собственная служба доставки по UK, сборка на месте.
-      </li>
-    </ul>
-  </section>
+            <section class="section" id="contact">
+                <h2>Связаться с мастерской</h2>
+                <p>
+                    Оставьте телефон — перезвоним в течение дня, обсудим эскиз,
+                    размеры и бюджет. Или напишите подробнее, если уже есть
+                    готовый проект.
+                </p>
 
-  <section class="section workshop">
-    <h2>Мастерская сейчас</h2>
-    <p class="muted small">
-      Live-лента: над чем идёт работа в эту минуту. Обновляется автоматически.
-    </p>
-    <div id="status-bar">
-      <span id="connection-status">соединение…</span>
-      <span id="active-count">— заказов в работе</span>
-    </div>
-    <div id="feed"></div>
-  </section>
+                <form id="contact-form" class="contact-form">
+                    <label>
+                        <span>Как к вам обращаться</span>
+                        <input
+                            type="text"
+                            name="name"
+                            required
+                            autocomplete="name"
+                            maxlength="80"
+                        />
+                    </label>
+                    <label>
+                        <span>Телефон или WhatsApp</span>
+                        <input
+                            type="tel"
+                            name="phone"
+                            required
+                            autocomplete="tel"
+                            maxlength="40"
+                        />
+                    </label>
+                    <label>
+                        <span>Что хотите заказать (необязательно)</span>
+                        <textarea
+                            name="message"
+                            rows="4"
+                            maxlength="500"
+                        ></textarea>
+                    </label>
+                    <button type="submit">Отправить заявку</button>
+                    <p
+                        id="form-status"
+                        class="form-status"
+                        aria-live="polite"
+                    ></p>
+                </form>
+            </section>
+        </main>
 
-  <section class="section" id="contact">
-    <h2>Связаться с мастерской</h2>
-    <p>
-      Оставьте телефон — перезвоним в течение дня, обсудим эскиз, размеры и
-      бюджет. Или напишите подробнее, если уже есть готовый проект.
-    </p>
+        <footer>
+            <div class="footer-inner">
+                <div>
+                    <div class="brand small">Диваны и Кресла</div>
+                    <p class="muted small">
+                        Мастерская в UK. Изготовление мягкой мебели на заказ для
+                        русскоязычных клиентов в Великобритании.
+                    </p>
+                </div>
+                <nav>
+                    <a href="/about">О мастерской</a>
+                    <a href="#contact">Связаться</a>
+                </nav>
+            </div>
+        </footer>
 
-    <form id="contact-form" class="contact-form">
-      <label>
-        <span>Как к вам обращаться</span>
-        <input type="text" name="name" required autocomplete="name" maxlength="80">
-      </label>
-      <label>
-        <span>Телефон или WhatsApp</span>
-        <input type="tel" name="phone" required autocomplete="tel" maxlength="40">
-      </label>
-      <label>
-        <span>Что хотите заказать (необязательно)</span>
-        <textarea name="message" rows="4" maxlength="500"></textarea>
-      </label>
-      <button type="submit">Отправить заявку</button>
-      <p id="form-status" class="form-status" aria-live="polite"></p>
-    </form>
-  </section>
-
-</main>
-
-<footer>
-  <div class="footer-inner">
-    <div>
-      <div class="brand small">Диваны и Кресла</div>
-      <p class="muted small">
-        Мастерская в UK. Изготовление мягкой мебели на заказ для русскоязычных
-        клиентов в Великобритании.
-      </p>
-    </div>
-    <nav>
-      <a href="/about">О мастерской</a>
-      <a href="#contact">Связаться</a>
-      <a href="/.well-known/security.txt">Security</a>
-    </nav>
-  </div>
-</footer>
-
-<script src="/app.js"></script>
-</body>
+        <script src="/app.js"></script>
+    </body>
 </html>
