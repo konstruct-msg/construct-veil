@@ -999,8 +999,7 @@ pub struct VeilStartResult {
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -> i32 {
     use crate::veil::{
-        MethodSet, NetworkFingerprint, Obfs4Obfuscator, VeilConfig, VeilCoordinator,
-        WebTunnelObfuscator, scoring::PersistentScores,
+        MethodSet, NetworkFingerprint, VeilConfig, VeilCoordinator, scoring::PersistentScores,
     };
 
     let relay_addr = unsafe {
@@ -1098,10 +1097,20 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
             };
 
             let mut coordinator = VeilCoordinator::new(config, scores);
-            coordinator.register(Box::new(Obfs4Obfuscator::new()));
-            coordinator.register(Box::new(WebTunnelObfuscator::new()));
+            // veil-front-only (2026-06-12): obfs4 and WebTunnel are fundamentally
+            // DPI-cut in the RU target network and are superseded by veil-front
+            // (honest-front HTTPS). On `utls` builds (iOS/mac/android) we probe
+            // veil-front exclusively — probing the dead methods only wasted a
+            // per-start timeout. Non-`utls` builds keep the legacy transports so
+            // no other consumer breaks. See decision: veil-front-only-retire-obfs4.
             #[cfg(feature = "utls")]
             coordinator.register(Box::new(crate::veil::VeilFrontObfuscator::new()));
+            #[cfg(not(feature = "utls"))]
+            {
+                use crate::veil::{Obfs4Obfuscator, WebTunnelObfuscator};
+                coordinator.register(Box::new(Obfs4Obfuscator::new()));
+                coordinator.register(Box::new(WebTunnelObfuscator::new()));
+            }
 
             let arc = std::sync::Arc::new(coordinator);
             COORDINATOR

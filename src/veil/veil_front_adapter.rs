@@ -177,7 +177,10 @@ async fn probe_veil_front(req: &ProbeRequest) -> Result<(), ObfuscatorError> {
     let mut rx_buf = BytesMut::with_capacity(4096);
     let mut total_read = 0;
     loop {
-        let n = tokio::time::timeout(Duration::from_secs(3), reader.read_buf(&mut rx_buf))
+        // 7s: the relay opens a fresh TLS-upstream to the backend on the first
+        // tunnel frame; a cold relay→backend handshake can exceed a tight 3s window
+        // and spuriously fail the probe (veil-front is the only method now).
+        let n = tokio::time::timeout(Duration::from_secs(7), reader.read_buf(&mut rx_buf))
             .await
             .map_err(|_| ObfuscatorError::Timeout)?
             .map_err(ObfuscatorError::Io)?;
