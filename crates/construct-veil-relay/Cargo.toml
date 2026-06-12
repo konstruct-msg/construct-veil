@@ -30,8 +30,9 @@ x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 rcgen = "0.13"
 # Ed25519 signing (make-config-link) — ring is already in the tree via rustls.
 ring = "0.17"
-# Terminal QR for make-config-link.
-qrcode = { version = "0.14", default-features = false }
+# QR for make-config-link: terminal (unicode) + optional SVG file (svg feature is
+# pure string formatting — no heavy image deps).
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 # Async I/O
 tokio = { version = "1", features = ["full"] }

@@ -60,6 +60,10 @@ struct Args {
     /// Append the issued ticket to this tickets.json (JSON array of base64 strings).
     #[arg(long, value_name = "PATH")]
     append: Option<String>,
+
+    /// Also write the QR to an SVG file (open in a browser, scan, or send to a tester).
+    #[arg(long, value_name = "PATH")]
+    qr_svg: Option<String>,
 }
 
 const B64URL: base64::engine::general_purpose::GeneralPurpose =
@@ -156,6 +160,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .quiet_zone(true)
                 .build();
             eprintln!("{qr}");
+            if let Some(path) = &args.qr_svg {
+                let svg = code
+                    .render::<qrcode::render::svg::Color>()
+                    .min_dimensions(256, 256)
+                    .quiet_zone(true)
+                    .build();
+                fs::write(path, svg)?;
+                eprintln!("✓ QR written to {path}");
+            }
         }
         Err(e) => eprintln!("(QR render failed: {e})"),
     }
