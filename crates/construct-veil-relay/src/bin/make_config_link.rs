@@ -31,7 +31,10 @@ use rand::RngCore;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
 #[derive(Parser, Debug)]
-#[command(name = "make-config-link", about = "Issue a ticket + emit a signed veil-front config link + QR")]
+#[command(
+    name = "make-config-link",
+    about = "Issue a ticket + emit a signed veil-front config link + QR"
+)]
 struct Args {
     /// Ed25519 private seed (32-byte hex) for relayConfigSigningKey.
     #[arg(long)]
@@ -75,10 +78,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Signing key ─────────────────────────────────────────────────────────
     let seed = hex_decode(&args.signing_key).ok_or("--signing-key must be hex")?;
     if seed.len() != 32 {
-        return Err(format!("--signing-key must be 32 bytes (64 hex chars), got {}", seed.len()).into());
+        return Err(format!(
+            "--signing-key must be 32 bytes (64 hex chars), got {}",
+            seed.len()
+        )
+        .into());
     }
-    let key_pair =
-        Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|e| format!("invalid Ed25519 seed: {e}"))?;
+    let key_pair = Ed25519KeyPair::from_seed_unchecked(&seed)
+        .map_err(|e| format!("invalid Ed25519 seed: {e}"))?;
     let pub_hex = hex_encode(key_pair.public_key().as_ref());
 
     // ── Issue a fresh ticket (same as issue-ticket) ─────────────────────────
@@ -139,7 +146,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("✓ appended ticket to {path} (total {})", existing.len());
         eprintln!("  ⚠ restart the relay so it reloads tickets.json");
     } else {
-        eprintln!("⚠ ticket NOT added to any relay. Add this to the relay's tickets.json + restart:");
+        eprintln!(
+            "⚠ ticket NOT added to any relay. Add this to the relay's tickets.json + restart:"
+        );
         eprintln!("    {ticket_b64}");
     }
 
