@@ -82,11 +82,19 @@ done
 echo "▸ Requesting Let's Encrypt cert for: ${CERTBOT_DOMAINS[*]}"
 # --expand handles the case where a cert already exists for $DOMAIN and we're
 # adding SAN names this run. No-op if cert doesn't exist or names unchanged.
+#
+# --reuse-key: keep the SAME TLS keypair across every future `certbot renew`.
+# The client pins SHA-256(SubjectPublicKeyInfo); if certbot minted a fresh key
+# each renewal the pin (and every issued config link) would silently die ~every
+# 60 days. Reusing the key freezes the SPKI, so config links stay valid until we
+# deliberately rotate. This flag is persisted into the renewal config, so the
+# renew cron inherits it. Rotate intentionally with `certbot certonly --force-renewal`
+# (sans --reuse-key once) + re-issue links via provision-link.sh.
 docker compose run --rm certbot certonly \
   --webroot -w /var/www/certbot \
   "${CERTBOT_DOMAINS[@]}" \
   --email "$EMAIL" \
-  --agree-tos --no-eff-email --expand -n
+  --agree-tos --no-eff-email --reuse-key --expand -n
 
 # ── Make certs readable by the non-root relay (uid 65532) ───────────────────
 # certbot writes privkey.pem as 0600 root:root and the live/archive dirs as

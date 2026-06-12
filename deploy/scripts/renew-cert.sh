@@ -15,9 +15,20 @@ set -a; source .env; set +a
 CERT_PATH="/var/lib/docker/volumes/$(basename "$PWD" | tr '[:upper:]' '[:lower:]')_letsencrypt/_data/live/${DOMAIN}/cert.pem"
 PRE_MTIME=$(stat -c '%Y' "$CERT_PATH" 2>/dev/null || echo 0)
 
-echo "$(date -Iseconds) ▸ renew attempt for $DOMAIN"
+# SPKI pin BEFORE renewal (from the live wire cert) — used to assert the pin did
+# not move. With --reuse-key it must stay constant; a change means the key was
+# rotated and every issued config link just died.
+PRE_SPKI=$(echo | openssl s_client -connect "${DOMAIN}:443" -servername "$DOMAIN" 2>/dev/null \
+           | openssl x509 -pubkey -noout 2>/dev/null \
+           | openssl pkey -pubin -outform DER 2>/dev/null \
+           | openssl dgst -sha256 -r 2>/dev/null | awk '{print $1}')
 
-docker compose run --rm certbot renew --webroot -w /var/www/certbot --quiet
+echo "$(date -Iseconds) ▸ renew attempt for $DOMAIN (spki=$PRE_SPKI)"
+
+# --reuse-key freezes the TLS keypair so the SPKI pin (and every issued config
+# link) survives renewal. bootstrap.sh persists this into the renewal config;
+# passing it here guarantees it even on certs issued before the flag existed.
+docker compose run --rm certbot renew --webroot -w /var/www/certbot --reuse-key --quiet
 
 POST_MTIME=$(stat -c '%Y' "$CERT_PATH" 2>/dev/null || echo 0)
 
@@ -36,13 +47,18 @@ if [ "$POST_MTIME" -gt "$PRE_MTIME" ]; then
   echo "  restarting relay"
   docker compose restart relay
 
-  # Republish SPKI — fish it from the new banner.
+  # Assert the pin did NOT move. With --reuse-key the SPKI is identical to
+  # PRE_SPKI; if it changed, the key rotated and all issued config links are now
+  # dead — re-issue them with provision-link.sh and re-provision testers.
   sleep 3
-  SPKI=$(docker compose logs --no-color --tail 30 relay 2>&1 \
+  POST_SPKI=$(docker compose logs --no-color --tail 30 relay 2>&1 \
          | grep -oE 'spki *[a-f0-9]{64}' | tail -1 | awk '{print $2}')
-  if [ -n "$SPKI" ]; then
-    echo "  new SPKI = $SPKI"
-    echo "  ⚠ update the client manifest entry for $DOMAIN with this SPKI"
+  echo "  SPKI: $PRE_SPKI → $POST_SPKI"
+  if [ -n "$POST_SPKI" ] && [ "$POST_SPKI" != "$PRE_SPKI" ]; then
+    echo "  ⚠⚠ SPKI CHANGED despite --reuse-key — all config links are now INVALID."
+    echo "     Re-issue with: ./scripts/provision-link.sh <tester-name>"
+  else
+    echo "  ✓ SPKI stable — existing config links remain valid"
   fi
 else
   echo "  cert not yet due for renewal"
