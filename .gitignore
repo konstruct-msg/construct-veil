@@ -2,5 +2,6 @@ target/
 fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
+deploy/data/
 .env
 .DS_Store
