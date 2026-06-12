@@ -25,8 +25,8 @@ use crate::veil::obfuscator::{Obfuscator, ObfuscatorError, ObfuscatorHandle, Pro
 use crate::veil::veil_front::WriteStrategy;
 use construct_veil_protocol::ticket::{TICKET_WIRE_LEN, Ticket, ticket_from_bytes};
 use construct_veil_protocol::{
-    AuthRecord, EXPORTER_LABEL, EXPORTER_LEN, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, Frame,
-    LENGTH_BUCKETS, VeilFrontCodec,
+    AUTH_PAYLOAD_LEN, AuthRecord, EXPORTER_LABEL, EXPORTER_LEN, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA,
+    Frame, LENGTH_BUCKETS, VeilFrontCodec,
 };
 
 /// HTTP/2 client connection preface (RFC 7540 §3.5) + an empty SETTINGS frame.
@@ -117,9 +117,19 @@ async fn dial_and_authenticate(
     let exporter = derive_exporter(&tls_stream)?;
     let auth = AuthRecord::from_ticket(&ticket, &exporter);
 
-    // Send AUTH frame as the first application record.
-    // `AuthRecord::encode` yields the complete framed record (type+varint+payload).
-    let auth_frame = auth.encode();
+    // Send the AUTH frame as the first application record, encoded with the SAME
+    // wire codec the relay's gate decodes with: `WIRE_VER || type || payload_len
+    // || pad_len || payload`. Do NOT use `AuthRecord::encode()` — it emits a
+    // legacy, codec-incompatible framing (no version byte, no pad_len), which the
+    // relay rejects → routes the connection to the cover site.
+    let mut auth_payload = BytesMut::with_capacity(AUTH_PAYLOAD_LEN);
+    auth_payload.extend_from_slice(&auth.ticket_id);
+    auth_payload.extend_from_slice(&auth.authcode);
+    let mut auth_frame = BytesMut::new();
+    VeilFrontCodec::default()
+        .with_buckets(LENGTH_BUCKETS)
+        .encode(Frame::auth(auth_payload.freeze()), &mut auth_frame)
+        .map_err(ObfuscatorError::Io)?;
     tls_stream
         .write_all(&auth_frame)
         .await
