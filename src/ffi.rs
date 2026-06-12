@@ -1002,6 +1002,10 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
         MethodSet, NetworkFingerprint, VeilConfig, VeilCoordinator, scoring::PersistentScores,
     };
 
+    // Fresh attempt: clear the diagnostic sink so the host reads this call's
+    // failure (not a stale one) via `veil_last_error`.
+    crate::veil::diag::clear();
+
     let relay_addr = unsafe {
         req.relay_addr
             .as_ref()
@@ -1162,12 +1166,40 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
             0
         }
         Err(reason) => {
+            // Prefer the specific per-probe detail recorded during probing; only
+            // fall back to the generic coordinator error if nothing more specific
+            // was captured (e.g. a failure before any probe ran).
+            if crate::veil::diag::last().is_empty() {
+                crate::veil::diag::record(format!("veil_start: {reason}"));
+            }
             tracing::error!(target: "veil::ffi", "veil_start failed: {}", reason);
             // Also emit to stderr so iOS unified-log captures it even without tracing-subscriber.
             eprintln!("[veil_start] FAILED: {}", reason);
             -1
         }
     }
+}
+
+/// Copy the most recent `veil_start` failure reason into `buf` (NUL-terminated,
+/// truncated to `cap`). Returns the full byte length of the reason excluding the
+/// NUL (so a return >= `cap` means it was truncated). Call right after
+/// `veil_start` returns -1. The string names the failing method + stage, e.g.
+/// `"veil-front: timeout after 7003ms (no first byte)"`.
+#[cfg(feature = "coordinator")]
+#[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn veil_last_error(buf: *mut c_char, cap: usize) -> usize {
+    let s = crate::veil::diag::last();
+    let bytes = s.as_bytes();
+    if buf.is_null() || cap == 0 {
+        return bytes.len();
+    }
+    let n = bytes.len().min(cap - 1);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+        *buf.add(n) = 0;
+    }
+    bytes.len()
 }
 
 /// Stop the active VEIL session. Returns 0 if stopped, -1 if nothing was running.

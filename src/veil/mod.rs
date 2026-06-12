@@ -31,6 +31,7 @@
 #![allow(clippy::single_match)]
 
 pub mod coordinator;
+pub mod diag;
 pub mod fsm;
 pub mod obfuscator;
 pub mod scoring;

@@ -505,6 +505,10 @@ impl VeilCoordinator {
                     Ok(h) => h,
                     Err(e) => {
                         let latency_ms = probe_start.elapsed().as_millis() as u32;
+                        crate::veil::diag::record(format!(
+                            "{}: start error: {e:?} ({latency_ms}ms)",
+                            method.name()
+                        ));
                         let _ = tx_clone
                             .send(ProbeResult {
                                 method,
@@ -527,12 +531,22 @@ impl VeilCoordinator {
                         port: 0,
                         latency_ms,
                     },
-                    Ok(Err(e)) => ProbeOutcome::Failure {
-                        reason: classify_obfuscator_error(&e),
-                        latency_ms,
-                    },
+                    Ok(Err(e)) => {
+                        crate::veil::diag::record(format!(
+                            "{}: probe error: {e:?} ({latency_ms}ms)",
+                            method.name()
+                        ));
+                        ProbeOutcome::Failure {
+                            reason: classify_obfuscator_error(&e),
+                            latency_ms,
+                        }
+                    }
                     Err(_) => {
                         cancel.cancel();
+                        crate::veil::diag::record(format!(
+                            "{}: timeout after {latency_ms}ms (no first byte)",
+                            method.name()
+                        ));
                         ProbeOutcome::Failure {
                             reason: ProbeFailureReason::Timeout,
                             latency_ms,
