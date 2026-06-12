@@ -935,6 +935,43 @@ mod tests {
     }
 
     #[test]
+    fn method_bits_are_distinct_single_flags() {
+        // `MethodSet` ANDs these (`self.0 & method.bit()`), so each must be a
+        // distinct single bit. A bare discriminant (Obfs4=0, VeilFront=3=0b11)
+        // collides and corrupts any non-zero allowed-set bitmask.
+        let bits: Vec<u32> = MethodId::all().iter().map(|m| m.bit()).collect();
+        for (m, b) in MethodId::all().iter().zip(&bits) {
+            assert_eq!(b.count_ones(), 1, "{m:?}.bit()={b:#b} is not a single flag");
+        }
+        let combined = bits.iter().fold(0u32, |a, b| a | b);
+        assert_eq!(
+            combined.count_ones() as usize,
+            bits.len(),
+            "method bits collide: {bits:?}"
+        );
+    }
+
+    #[test]
+    fn disabling_all_but_veil_front_leaves_only_veil_front() {
+        // Mirrors the coordinator's "restrict allowed to registered" logic for a
+        // veil-front-only build: disable every method except VeilFront.
+        let mut bits = 0u32;
+        for m in MethodId::all() {
+            if *m != MethodId::VeilFront {
+                bits |= m.bit();
+            }
+        }
+        let ms = MethodSet::from_bitmask(bits);
+        assert!(ms.contains(MethodId::VeilFront));
+        assert!(!ms.contains(MethodId::Obfs4));
+        assert!(!ms.contains(MethodId::WebTunnel));
+        assert_eq!(
+            ms.iter_allowed().collect::<Vec<_>>(),
+            vec![MethodId::VeilFront]
+        );
+    }
+
+    #[test]
     fn veil_front_is_a_candidate() {
         struct VeilFrontOnlyScores;
         impl ScoreLookup for VeilFrontOnlyScores {

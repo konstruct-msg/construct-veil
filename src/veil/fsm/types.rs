@@ -31,7 +31,11 @@ impl MethodId {
 
     /// Convert to the bitmask bit position.
     pub fn bit(&self) -> u32 {
-        *self as u32
+        // Distinct bit flag per method. NOTE: must be `1 << discriminant`, not the
+        // bare discriminant — `MethodSet` ANDs these (`self.0 & method.bit()`), so a
+        // bare discriminant (Obfs4=0, VeilFront=3=0b11) collides and corrupts any
+        // non-zero allowed-set bitmask.
+        1u32 << (*self as u32)
     }
 
     /// Human-readable name.
