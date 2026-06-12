@@ -12,6 +12,12 @@ path = "src/main.rs"
 name = "issue-ticket"
 path = "src/bin/issue_ticket.rs"
 
+# Tester-provisioning tool: issue a ticket + emit a signed konstruct://veil-config
+# link and a terminal QR. Run locally/manually; not shipped in the relay image.
+[[bin]]
+name = "make-config-link"
+path = "src/bin/make_config_link.rs"
+
 [dependencies]
 construct-veil-protocol = { path = "../construct-veil-protocol" }
 
@@ -22,6 +28,10 @@ rustls-pki-types = "1"
 webpki-roots = "0.26"
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
 rcgen = "0.13"
+# Ed25519 signing (make-config-link) — ring is already in the tree via rustls.
+ring = "0.17"
+# Terminal QR for make-config-link.
+qrcode = { version = "0.14", default-features = false }
 
 # Async I/O
 tokio = { version = "1", features = ["full"] }
