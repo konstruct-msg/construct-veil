@@ -193,3 +193,45 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
         .collect()
 }
+
+#[cfg(test)]
+mod live_probe {
+    use super::*;
+    use crate::tls_fingerprint::TlsProfile;
+    use tokio::net::TcpStream;
+
+    /// Live veil-TLS handshake against the production relay. Ignored by default
+    /// (requires network); run with:
+    ///   cargo test -p construct-veil --lib tls_pinned::live_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dial_live_relay() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let relay = "api.divany-kresla.uk:443";
+            let sni = "api.divany-kresla.uk";
+            let spki = "b2361c0448a33a10e6521300aa4de8d8fe402791dd4fd5b0fe10fbb09457570c";
+
+            let (connector, server_name) =
+                build_connector(sni, spki, relay, TlsProfile::Chrome131, Some(vec![b"h2".to_vec()]))
+                    .expect("build_connector");
+            let tcp = TcpStream::connect(relay).await.expect("tcp connect");
+            tcp.set_nodelay(true).unwrap();
+            match connector.connect(server_name, tcp).await {
+                Ok(s) => {
+                    let (_, conn) = s.get_ref();
+                    eprintln!(
+                        "HANDSHAKE OK — proto={:?} alpn={:?}",
+                        conn.protocol_version(),
+                        conn.alpn_protocol().map(|a| String::from_utf8_lossy(a).to_string())
+                    );
+                }
+                Err(e) => panic!("HANDSHAKE ERR: {e}  (kind={:?})", e.kind()),
+            }
+        });
+    }
+}
