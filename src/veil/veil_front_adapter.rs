@@ -438,6 +438,63 @@ mod tests {
     use super::*;
     use construct_veil_protocol::ticket::{AUTH_KEY_LEN, AuthKey, TICKET_ID_LEN, ticket_to_bytes};
 
+    /// Live latency breakdown against the production relay. Requires the matching
+    /// debug ticket in the relay's tickets.json. Ignored by default; run with:
+    ///   cargo test -p construct-veil --features utls,coordinator --lib \
+    ///     veil::veil_front_adapter::tests::live_latency -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_latency() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let req = ProbeRequest {
+                relay_addr: "api.divany-kresla.uk:443".into(),
+                bundle: String::new(),
+                tls_sni: "api.divany-kresla.uk".into(),
+                spki_hex: "b2361c0448a33a10e6521300aa4de8d8fe402791dd4fd5b0fe10fbb09457570c".into(),
+                host_header: "api.divany-kresla.uk".into(),
+                wt_base_path: "/api/stream".into(),
+                veil_front_ticket_b64:
+                    "o4ojhrsE7oT3b9jVZT7nk8Dp2IWTmPSWBY8D/1V1k1Uoqjm+x7NEcrlu0Lzwnc92PTQtagAAAAA9wVRqAAAAAAE=".into(),
+            };
+
+            for i in 1..=3 {
+                let t0 = std::time::Instant::now();
+                let tls = dial_and_authenticate(
+                    &req.relay_addr, &req.tls_sni, &req.spki_hex, &req.veil_front_ticket_b64,
+                ).await.expect("dial+auth");
+                let t_auth = t0.elapsed();
+
+                let (mut reader, mut writer) = tokio::io::split(tls);
+                let mut codec = VeilFrontCodec::default().with_buckets(LENGTH_BUCKETS);
+                let mut tx = BytesMut::new();
+                codec.encode(Frame::data(Bytes::from_static(H2_PREFACE_AND_SETTINGS)), &mut tx).unwrap();
+                let t1 = std::time::Instant::now();
+                writer.write_all(&tx).await.unwrap();
+                writer.flush().await.unwrap();
+
+                let mut rx = BytesMut::with_capacity(4096);
+                let mut first_data = None;
+                loop {
+                    let n = tokio::time::timeout(Duration::from_secs(10), reader.read_buf(&mut rx))
+                        .await.expect("rtt timeout").expect("read");
+                    if n == 0 { break; }
+                    match codec.decode(&mut rx) {
+                        Ok(Some(f)) if f.frame_type == FRAME_TYPE_DATA => { first_data = Some(t1.elapsed()); break; }
+                        Ok(Some(_)) => continue,
+                        Ok(None) => continue,
+                        Err(e) => panic!("decode: {e}"),
+                    }
+                }
+                eprintln!("[{i}] dial+TLS+auth={:?}  preface→firstDATA={:?}", t_auth, first_data);
+            }
+        });
+    }
+
     #[test]
     fn method_id_is_veil_front() {
         let obf = VeilFrontObfuscator::new();

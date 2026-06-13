@@ -128,10 +128,14 @@ where
 
     loop {
         // Drain any complete frames already in the buffer.
+        let mut wrote_payload = false;
         loop {
             match codec.decode(&mut buf)? {
                 Some(frame) => match frame.frame_type {
-                    FRAME_TYPE_DATA => backend_wr.write_all(&frame.payload).await?,
+                    FRAME_TYPE_DATA => {
+                        backend_wr.write_all(&frame.payload).await?;
+                        wrote_payload = true;
+                    }
                     FRAME_TYPE_CHAFF => { /* cover traffic — discard */ }
                     other => {
                         // AUTH (already consumed) or unknown mid-stream frame.
@@ -141,6 +145,18 @@ where
                 },
                 None => break, // need more bytes
             }
+        }
+
+        // Flush before blocking on the next client read. The backend is a
+        // `tokio_rustls` TLS stream (`--backend-tls`); `write_all` only buffers
+        // plaintext, so without this flush a small client→backend request (a
+        // unary gRPC call) can sit unsent in the TLS buffer until more bytes
+        // arrive — the request never reaches the backend, no response comes
+        // back, and the client RPC dies with clientSideTimeout. The opposite
+        // direction (`frame_backend_to_client`) already flushes per DATA write,
+        // which is why server→client stream data flowed while unary sends hung.
+        if wrote_payload {
+            backend_wr.flush().await?;
         }
 
         let n = client_rd.read_buf(&mut buf).await?;
