@@ -399,7 +399,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "construct-veil"
-version = "3.0.7"
+version = "3.0.8"
 dependencies = [
  "async-trait",
  "base64",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "construct-veil-protocol"
-version = "3.0.7"
+version = "3.0.8"
 dependencies = [
  "bytes",
  "hex",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "construct-veil-relay"
-version = "3.0.7"
+version = "3.0.8"
 dependencies = [
  "base64",
  "bytes",
