@@ -22,10 +22,15 @@ use bytes::{Bytes, BytesMut};
 use construct_veil_protocol::{
     FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, Frame, LENGTH_BUCKETS, VeilFrontCodec,
 };
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
 use rand::Rng;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::codec::{Decoder, Encoder};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Read buffer size for the backend → client direction.
 const COPY_BUF: usize = 8192;
@@ -69,6 +74,7 @@ pub async fn forward_tunnel<S, B>(
     client_stream: S,
     leftover: BytesMut,
     backend: B,
+    peer: SocketAddr,
 ) -> Result<(), std::io::Error>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -76,6 +82,30 @@ where
 {
     let (client_rd, mut client_wr) = io::split(client_stream);
     let (backend_rd, backend_wr) = io::split(backend);
+
+    // ── Diagnostics: per-direction byte counters + a periodic progress log, so a
+    // stall is localised to a direction (request not sent / no response / low
+    // throughput) instead of guessed at. TEMPORARY — lower to debug or remove once
+    // veil-front throughput is understood.
+    let up_bytes = Arc::new(AtomicU64::new(0)); // client → backend (requests)
+    let down_bytes = Arc::new(AtomicU64::new(0)); // backend → client (responses)
+    let start = Instant::now();
+    let progress = {
+        let (u, d) = (up_bytes.clone(), down_bytes.clone());
+        tokio::spawn(async move {
+            let (mut lu, mut ld) = (0u64, 0u64);
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let (cu, cd) = (u.load(Ordering::Relaxed), d.load(Ordering::Relaxed));
+                info!(
+                    peer = %peer, up = cu, down = cd,
+                    up_d = cu - lu, down_d = cd - ld,
+                    "tunnel progress (up=client→backend, down=backend→client)"
+                );
+                (lu, ld) = (cu, cd);
+            }
+        })
+    };
 
     // ── First-response alignment (§6.6): emit an initial CHAFF frame
     // before any backend data. This ensures the tunnel path's first emitted
@@ -89,11 +119,20 @@ where
     debug!("emitted initial CHAFF for first-response alignment");
 
     // client → backend: de-frame DATA, drop CHAFF.
-    let up = deframe_client_to_backend(client_rd, leftover, backend_wr);
+    let up = deframe_client_to_backend(client_rd, leftover, backend_wr, up_bytes.clone());
     // backend → client: wrap raw bytes in DATA frames.
-    let down = frame_backend_to_client(backend_rd, client_wr);
+    let down = frame_backend_to_client(backend_rd, client_wr, down_bytes.clone());
 
-    match tokio::try_join!(up, down) {
+    let result = tokio::try_join!(up, down);
+    progress.abort();
+    info!(
+        peer = %peer,
+        up = up_bytes.load(Ordering::Relaxed),
+        down = down_bytes.load(Ordering::Relaxed),
+        dur_ms = start.elapsed().as_millis() as u64,
+        "tunnel closed"
+    );
+    match result {
         Ok(_) => {
             debug!("tunnel forwarding completed normally");
             Ok(())
@@ -118,6 +157,7 @@ async fn deframe_client_to_backend<R, W>(
     mut client_rd: R,
     leftover: BytesMut,
     mut backend_wr: W,
+    bytes: Arc<AtomicU64>,
 ) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin,
@@ -134,6 +174,7 @@ where
                 Some(frame) => match frame.frame_type {
                     FRAME_TYPE_DATA => {
                         backend_wr.write_all(&frame.payload).await?;
+                        bytes.fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
                         wrote_payload = true;
                     }
                     FRAME_TYPE_CHAFF => { /* cover traffic — discard */ }
@@ -172,6 +213,7 @@ where
 async fn frame_backend_to_client<R, W>(
     mut backend_rd: R,
     mut client_wr: W,
+    bytes: Arc<AtomicU64>,
 ) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin,
@@ -189,7 +231,10 @@ where
                 client_wr.shutdown().await?;
                 return Ok(());
             }
-            Ok(Ok(n)) => n,
+            Ok(Ok(n)) => {
+                bytes.fetch_add(n as u64, Ordering::Relaxed);
+                n
+            }
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 // Backend idle — inject a CHAFF frame (symmetric padding).
@@ -239,7 +284,8 @@ mod tests {
         let backend_conn = tokio::net::TcpStream::connect(backend_addr).await.unwrap();
         backend_conn.set_nodelay(true).unwrap();
         let tunnel = tokio::spawn(async move {
-            forward_tunnel(client_inner, BytesMut::new(), backend_conn).await
+            let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+            forward_tunnel(client_inner, BytesMut::new(), backend_conn, peer).await
         });
 
         let (mut test_rd, mut test_wr) = tokio::io::split(client_test);

@@ -258,14 +258,14 @@ async fn handle_connection(
             backend.set_nodelay(true)?;
             match &backend_dialer {
                 BackendDialer::Plain => {
-                    tunnel::forward_tunnel(stream, leftover, backend).await?;
+                    tunnel::forward_tunnel(stream, leftover, backend, peer).await?;
                 }
                 BackendDialer::Tls {
                     connector,
                     server_name,
                 } => {
                     let tls_backend = connector.connect(server_name.clone(), backend).await?;
-                    tunnel::forward_tunnel(stream, leftover, tls_backend).await?;
+                    tunnel::forward_tunnel(stream, leftover, tls_backend, peer).await?;
                 }
             }
         }
