@@ -89,20 +89,27 @@ where
     // veil-front throughput is understood.
     let up_bytes = Arc::new(AtomicU64::new(0)); // client → backend (requests)
     let down_bytes = Arc::new(AtomicU64::new(0)); // backend → client (responses)
+    let chaff_bytes = Arc::new(AtomicU64::new(0)); // relay-injected chaff toward client
     let start = Instant::now();
     let progress = {
-        let (u, d) = (up_bytes.clone(), down_bytes.clone());
+        let (u, d, c) = (up_bytes.clone(), down_bytes.clone(), chaff_bytes.clone());
         tokio::spawn(async move {
-            let (mut lu, mut ld) = (0u64, 0u64);
+            let (mut lu, mut ld, mut lc) = (0u64, 0u64, 0u64);
             loop {
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                let (cu, cd) = (u.load(Ordering::Relaxed), d.load(Ordering::Relaxed));
+                let (cu, cd, cc) = (
+                    u.load(Ordering::Relaxed),
+                    d.load(Ordering::Relaxed),
+                    c.load(Ordering::Relaxed),
+                );
+                // chaff_d>0 while down_d=0 → down loop alive, backend silent (D1).
+                // chaff_d=0 while up still flows → down loop blocked on client write (D2).
                 info!(
-                    peer = %peer, up = cu, down = cd,
-                    up_d = cu - lu, down_d = cd - ld,
+                    peer = %peer, up = cu, down = cd, chaff = cc,
+                    up_d = cu - lu, down_d = cd - ld, chaff_d = cc - lc,
                     "tunnel progress (up=client→backend, down=backend→client)"
                 );
-                (lu, ld) = (cu, cd);
+                (lu, ld, lc) = (cu, cd, cc);
             }
         })
     };
@@ -121,7 +128,7 @@ where
     // client → backend: de-frame DATA, drop CHAFF.
     let up = deframe_client_to_backend(client_rd, leftover, backend_wr, up_bytes.clone());
     // backend → client: wrap raw bytes in DATA frames.
-    let down = frame_backend_to_client(backend_rd, client_wr, down_bytes.clone());
+    let down = frame_backend_to_client(backend_rd, client_wr, down_bytes.clone(), chaff_bytes.clone());
 
     let result = tokio::try_join!(up, down);
     progress.abort();
@@ -129,6 +136,7 @@ where
         peer = %peer,
         up = up_bytes.load(Ordering::Relaxed),
         down = down_bytes.load(Ordering::Relaxed),
+        chaff = chaff_bytes.load(Ordering::Relaxed),
         dur_ms = start.elapsed().as_millis() as u64,
         "tunnel closed"
     );
@@ -214,6 +222,7 @@ async fn frame_backend_to_client<R, W>(
     mut backend_rd: R,
     mut client_wr: W,
     bytes: Arc<AtomicU64>,
+    chaff_bytes: Arc<AtomicU64>,
 ) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin,
@@ -242,6 +251,7 @@ where
                 let mut out = BytesMut::with_capacity(2 + 9 + chaff.len());
                 codec.encode(Frame::chaff(chaff), &mut out)?;
                 client_wr.write_all(&out).await?;
+                chaff_bytes.fetch_add(out.len() as u64, Ordering::Relaxed);
                 // Don't flush immediately — wait for backend data to batch.
                 continue;
             }
