@@ -26,11 +26,13 @@
 #![warn(missing_docs, clippy::all)]
 
 mod auth;
+mod capability;
 mod framing;
 pub mod ticket;
 mod varint;
 
 pub use auth::*;
+pub use capability::*;
 pub use framing::*;
 pub use ticket::*;
 pub use varint::*;
@@ -66,3 +68,9 @@ pub const FRAME_TYPE_DATA: u8 = 0x01;
 
 /// Frame type: chaff / padding (silently dropped on receipt).
 pub const FRAME_TYPE_CHAFF: u8 = 0x02;
+
+/// Frame type: AUTH v2 — carries a backend-signed `Capability` instead of a bare
+/// ticket_id. The relay validates the issuer signature offline (no ticket store).
+/// Distinct type from `FRAME_TYPE_AUTH` so the cutover is clean: an old relay sees
+/// 0x03 as an unknown frame and rejects it. See `capability` module + ticket ADR B2.
+pub const FRAME_TYPE_AUTH_V2: u8 = 0x03;
