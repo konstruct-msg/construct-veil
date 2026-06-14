@@ -517,6 +517,250 @@ mod tests {
         });
     }
 
+    /// Live end-to-end: run the real ferry locally, speak h2c gRPC over it to the
+    /// relay→ams backend, and see whether a response comes back through the tunnel.
+    /// Sends an UNauthenticated request on a JWT-gated path → expect a fast
+    /// `Unauthenticated` response. If it times out, the in-tunnel stall is reproduced
+    /// from a fast network (deterministic relay/h2 bug, not the device's slow link).
+    /// Ticket via VEIL_TEST_TICKET or deploy/data/tickets/tickets.json. Run with:
+    ///   cargo test -p construct-veil --features utls,coordinator --lib \
+    ///     veil::veil_front_adapter::tests::live_grpc_roundtrip -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_grpc_roundtrip() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ticket = std::env::var("VEIL_TEST_TICKET")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .or_else(|| {
+                    std::fs::read_to_string("deploy/data/tickets/tickets.json")
+                        .ok()
+                        .and_then(|s| s.split('"').nth(1).map(str::to_string))
+                        .filter(|t| !t.is_empty())
+                })
+                .unwrap_or_default();
+            if ticket.is_empty() {
+                eprintln!("skip: no ticket (VEIL_TEST_TICKET or deploy/data/tickets/tickets.json)");
+                return;
+            }
+            // Env overrides let this point at a LOCAL relay (VEIL_TEST_RELAY=127.0.0.1:8443
+            // VEIL_TEST_SNI=localhost VEIL_TEST_SPKI= ) for full both-sides instrumentation.
+            let relay = std::env::var("VEIL_TEST_RELAY").unwrap_or_else(|_| "api.divany-kresla.uk:443".into());
+            let sni = std::env::var("VEIL_TEST_SNI").unwrap_or_else(|_| "api.divany-kresla.uk".into());
+            let spki = std::env::var("VEIL_TEST_SPKI").unwrap_or_else(|_| "b2361c0448a33a10e6521300aa4de8d8fe402791dd4fd5b0fe10fbb09457570c".into());
+
+            // Local ferry: bridges a plaintext h2c socket ↔ the veil tunnel, exactly
+            // as the on-device coordinator does after a probe wins.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let local = listener.local_addr().unwrap();
+            let t = ticket.clone();
+            tokio::spawn(async move {
+                let (sock, _) = listener.accept().await.unwrap();
+                if let Err(e) = run_veil_front_ferry(sock, &relay, &sni, &spki, &t).await {
+                    eprintln!("ferry ended: {e:?}");
+                }
+            });
+
+            // h2c client over the local ferry socket (prior-knowledge HTTP/2, no TLS).
+            let tcp = TcpStream::connect(local).await.unwrap();
+            tcp.set_nodelay(true).unwrap();
+            let (mut send_req, conn) = h2::client::handshake(tcp).await.expect("h2 handshake");
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    eprintln!("h2 conn ended: {e}");
+                }
+            });
+
+            // Several sequential unauthenticated requests on the SAME h2 connection.
+            // Mimics the device's unary RPC pattern (send → fetch_bundle → …). Each
+            // gated path → envoy should reject fast with Unauthenticated. We time each:
+            // if request #1 is slow then #2+ stall, that's the device's exact pattern.
+            // gRPC frame for CheckUsernameAvailabilityRequest{ username } (unauth, hits
+            // user-service — a real service round-trip, closest to the device's path).
+            let grpc_body = |username: &str| -> Bytes {
+                let mut msg = Vec::new();
+                msg.push(0x0A); // field 1, wire type 2 (length-delimited)
+                msg.push(username.len() as u8);
+                msg.extend_from_slice(username.as_bytes());
+                let mut frame = Vec::with_capacity(5 + msg.len());
+                frame.push(0x00); // uncompressed
+                frame.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+                frame.extend_from_slice(&msg);
+                Bytes::from(frame)
+            };
+
+            // SEQUENTIAL batch (baseline — known to work).
+            for i in 1..=3 {
+                let req = http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri("https://ams.konstruct.cc/shared.proto.services.v1.UserService/CheckUsernameAvailability")
+                    .header("content-type", "application/grpc")
+                    .header("te", "trailers")
+                    .body(())
+                    .unwrap();
+                let t0 = std::time::Instant::now();
+                let (resp_fut, mut body) = match send_req.send_request(req, false) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        eprintln!("[seq {i}] send_request err: {e}");
+                        break;
+                    }
+                };
+                let _ = body.send_data(grpc_body(&format!("veilseq{i}")), true);
+                match tokio::time::timeout(Duration::from_secs(15), resp_fut).await {
+                    Ok(Ok(resp)) => eprintln!("[seq {i}] RESPONSE in {:?}: trl={:?}", t0.elapsed(),
+                        { let mut b = resp.into_body(); while b.data().await.is_some() {}; b.trailers().await.ok().flatten().and_then(|t| t.get("grpc-status").cloned()) }),
+                    Ok(Err(e)) => eprintln!("[seq {i}] h2 err in {:?}: {e}", t0.elapsed()),
+                    Err(_) => eprintln!("[seq {i}] TIMEOUT 15s", ),
+                }
+            }
+
+            // CONCURRENT batch — the device fires SendMessage + SenderSync + fetchMissed
+            // multiplexed at once. Fire 5 streams without awaiting, then collect. If later
+            // ones freeze while #1 succeeds, that's the device's "only one gets through".
+            let t_all = std::time::Instant::now();
+            let mut futs = Vec::new();
+            for i in 1..=5 {
+                let req = http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri("https://ams.konstruct.cc/shared.proto.services.v1.UserService/CheckUsernameAvailability")
+                    .header("content-type", "application/grpc")
+                    .header("te", "trailers")
+                    .body(())
+                    .unwrap();
+                match send_req.send_request(req, false) {
+                    Ok((resp_fut, mut body)) => {
+                        let _ = body.send_data(grpc_body(&format!("veilcon{i}")), true);
+                        futs.push((i, resp_fut));
+                    }
+                    Err(e) => eprintln!("[con {i}] send_request err: {e}"),
+                }
+            }
+            for (i, resp_fut) in futs {
+                match tokio::time::timeout(Duration::from_secs(20), resp_fut).await {
+                    Ok(Ok(resp)) => eprintln!("[con {i}] RESPONSE at +{:?}: status={}", t_all.elapsed(), resp.status()),
+                    Ok(Err(e)) => eprintln!("[con {i}] h2 err at +{:?}: {e}", t_all.elapsed()),
+                    Err(_) => eprintln!("[con {i}] TIMEOUT 20s — CONCURRENT STALL REPRODUCED", ),
+                }
+            }
+
+            // JWKS-path probe: a GATED path WITH a structurally-valid but wrong-signature
+            // JWT forces envoy jwt_authn to validate against the JWKS (unlike a missing
+            // token, which is rejected WITHOUT touching the JWKS). The device's failing
+            // RPCs are authenticated → this is the path they actually hit. If this stalls
+            // while the unauth calls above returned, the freeze == envoy JWKS validation
+            // hanging. Fast reject → JWKS path healthy and the freeze is elsewhere.
+            {
+                let bad_jwt = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ2ZWlsIn0.AAAA";
+                let req = http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri("https://ams.konstruct.cc/shared.proto.services.v1.MessagingService/SendMessage")
+                    .header("content-type", "application/grpc")
+                    .header("te", "trailers")
+                    .header("authorization", format!("Bearer {bad_jwt}"))
+                    .body(())
+                    .unwrap();
+                let t0 = std::time::Instant::now();
+                if let Ok((resp_fut, mut body)) = send_req.send_request(req, false) {
+                    let _ = body.send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), true);
+                    match tokio::time::timeout(Duration::from_secs(15), resp_fut).await {
+                        Ok(Ok(resp)) => {
+                            let status = resp.status();
+                            let gs = resp.headers().get("grpc-status").cloned();
+                            let gm = resp.headers().get("grpc-message").cloned();
+                            eprintln!(
+                                "[JWT] RESPONSE in {:?}: http={} grpc-status={:?} msg={:?} — JWKS path OK",
+                                t0.elapsed(),
+                                status,
+                                gs,
+                                gm
+                            );
+                        }
+                        Ok(Err(e)) => eprintln!("[JWT] h2 error in {:?}: {e}", t0.elapsed()),
+                        Err(_) => eprintln!(
+                            "[JWT] TIMEOUT 15s — JWKS validation path STALLS (matches the device authenticated-RPC freeze)"
+                        ),
+                    }
+                }
+            }
+        });
+    }
+
+    /// Isolation: 5 concurrent gRPC streams DIRECT to ams (no veil tunnel). If these
+    /// all respond while `live_grpc_roundtrip`'s concurrent batch stalls, the bug is
+    /// 100% the tunnel (ferry/relay), not ams. Run with:
+    ///   cargo test -p construct-veil --features utls,coordinator --lib \
+    ///     veil::veil_front_adapter::tests::live_grpc_direct_concurrent -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_grpc_direct_concurrent() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Empty SPKI → accept ams's real cert without pinning (test only).
+            let (connector, server_name) = crate::tls_pinned::build_connector(
+                "ams.konstruct.cc",
+                "",
+                "ams.konstruct.cc:443",
+                crate::TlsProfile::Chrome131,
+                Some(vec![b"h2".to_vec()]),
+            )
+            .expect("build_connector");
+            let tcp = TcpStream::connect("ams.konstruct.cc:443").await.expect("tcp");
+            tcp.set_nodelay(true).unwrap();
+            let tls = connector.connect(server_name, tcp).await.expect("tls");
+            let (mut send_req, conn) = h2::client::handshake(tls).await.expect("h2 handshake");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+
+            let grpc_body = |u: &str| -> Bytes {
+                let mut m = vec![0x0A, u.len() as u8];
+                m.extend_from_slice(u.as_bytes());
+                let mut f = vec![0x00];
+                f.extend_from_slice(&(m.len() as u32).to_be_bytes());
+                f.extend_from_slice(&m);
+                Bytes::from(f)
+            };
+
+            let t_all = std::time::Instant::now();
+            let mut futs = Vec::new();
+            for i in 1..=5 {
+                let req = http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri("https://ams.konstruct.cc/shared.proto.services.v1.UserService/CheckUsernameAvailability")
+                    .header("content-type", "application/grpc")
+                    .header("te", "trailers")
+                    .body(())
+                    .unwrap();
+                match send_req.send_request(req, false) {
+                    Ok((resp_fut, mut body)) => {
+                        let _ = body.send_data(grpc_body(&format!("direct{i}")), true);
+                        futs.push((i, resp_fut));
+                    }
+                    Err(e) => eprintln!("[direct {i}] send err: {e}"),
+                }
+            }
+            for (i, resp_fut) in futs {
+                match tokio::time::timeout(Duration::from_secs(20), resp_fut).await {
+                    Ok(Ok(resp)) => eprintln!("[direct {i}] RESPONSE at +{:?}: status={}", t_all.elapsed(), resp.status()),
+                    Ok(Err(e)) => eprintln!("[direct {i}] h2 err at +{:?}: {e}", t_all.elapsed()),
+                    Err(_) => eprintln!("[direct {i}] TIMEOUT 20s (ams itself can't multiplex?!)"),
+                }
+            }
+        });
+    }
+
     #[test]
     fn method_id_is_veil_front() {
         let obf = VeilFrontObfuscator::new();

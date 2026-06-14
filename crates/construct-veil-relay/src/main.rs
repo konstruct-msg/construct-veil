@@ -20,6 +20,7 @@
 
 mod gate;
 mod site;
+mod ticket_sync;
 mod tickets;
 mod tls;
 mod tunnel;
@@ -79,6 +80,26 @@ struct Args {
     /// Cover site address (local HTTP server with long-lived H2). Accepts host:port or IP:port.
     #[arg(long, default_value = "127.0.0.1:8080")]
     site: String,
+
+    /// Backend ticket-authority gRPC endpoint, e.g. `https://ams.konstruct.cc:443`.
+    /// When set, the relay subscribes to the active ticket set (SubscribeVeilTickets)
+    /// and applies updates live. When unset, only `--tickets` (static JSON) is used.
+    #[arg(long)]
+    ticket_control: Option<String>,
+
+    /// TLS SNI for --ticket-control. Defaults to the host part of the endpoint.
+    #[arg(long)]
+    ticket_control_sni: Option<String>,
+
+    /// This relay's id (scope) for ticket subscription. Defaults to --listen host
+    /// or "default". The backend filters the pushed set by this.
+    #[arg(long, default_value = "default")]
+    relay_id: String,
+
+    /// Bearer credential authorising this relay to subscribe. Prefer the
+    /// VEIL_RELAY_TOKEN env var over the CLI flag (avoids leaking via process list).
+    #[arg(long, env = "VEIL_RELAY_TOKEN")]
+    relay_token: Option<String>,
 }
 
 /// How the relay connects to the backend after authenticating a tunnel.
@@ -140,6 +161,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let ticket_store = Arc::new(ticket_store);
+
+    // ── Ticket sync (subscribe to backend authority) ────────────────────────
+    // Backend is the source of truth; static --tickets is bootstrap/fallback.
+    if let Some(control) = &args.ticket_control {
+        match &args.relay_token {
+            Some(token) if !token.is_empty() => {
+                let sni = args.ticket_control_sni.clone().unwrap_or_else(|| {
+                    control
+                        .trim_start_matches("https://")
+                        .trim_start_matches("http://")
+                        .rsplit_once(':')
+                        .map(|(h, _)| h.to_string())
+                        .unwrap_or_else(|| control.clone())
+                });
+                info!("Ticket sync enabled — control={control}, relay_id={}", args.relay_id);
+                ticket_sync::spawn(
+                    Arc::clone(&ticket_store),
+                    ticket_sync::TicketSyncConfig {
+                        control_endpoint: control.clone(),
+                        control_sni: sni,
+                        relay_id: args.relay_id.clone(),
+                        relay_token: token.clone(),
+                    },
+                );
+            }
+            _ => warn!("--ticket-control set but no relay token (VEIL_RELAY_TOKEN) — ticket sync disabled"),
+        }
+    }
 
     // ── Backend dialer ─────────────────────────────────────────────────────
     // h2c by default (co-located backend); TLS+ALPN-h2 for a remote backend

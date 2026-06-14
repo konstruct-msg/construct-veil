@@ -40,6 +40,45 @@ impl TicketStore {
         self.inner.write().await.tickets.insert(id_hex, ticket);
     }
 
+    // ── Dynamic sync (SubscribeVeilTickets) ────────────────────────────────
+    // The backend is the source of truth; the relay subscribes and applies these
+    // live, with no restart. `tickets.json` (load_from_json) is only a
+    // bootstrap/offline fallback used until the first SNAPSHOT arrives.
+
+    /// Replace the entire store with a fresh snapshot (`SNAPSHOT`). Returns the
+    /// new ticket count.
+    pub async fn replace_all(&self, tickets: Vec<Ticket>) -> usize {
+        let mut inner = self.inner.write().await;
+        inner.tickets.clear();
+        for t in tickets {
+            inner.tickets.insert(hex::encode(t.ticket_id), t);
+        }
+        inner.tickets.len()
+    }
+
+    /// Insert or update tickets (`UPSERT`). Returns the number applied.
+    pub async fn upsert_many(&self, tickets: Vec<Ticket>) -> usize {
+        let mut inner = self.inner.write().await;
+        let n = tickets.len();
+        for t in tickets {
+            inner.tickets.insert(hex::encode(t.ticket_id), t);
+        }
+        n
+    }
+
+    /// Remove tickets by id (`REVOKE`). Accepts raw id byte slices (as they arrive
+    /// on the wire). Returns the number actually removed.
+    pub async fn revoke_many(&self, ids: &[Vec<u8>]) -> usize {
+        let mut inner = self.inner.write().await;
+        let mut removed = 0;
+        for id in ids {
+            if inner.tickets.remove(&hex::encode(id)).is_some() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// Load tickets from a JSON file.
     ///
     /// File format: array of base64-encoded 65-byte ticket blobs.
@@ -232,5 +271,63 @@ mod tests {
             .validate(&ticket.ticket_id, &authcode, &exporter)
             .await;
         assert!(result.is_none());
+    }
+
+    fn ticket_with_id(id_byte: u8) -> Ticket {
+        let mut t = make_test_ticket();
+        t.ticket_id = [id_byte; TICKET_ID_LEN];
+        t
+    }
+
+    #[tokio::test]
+    async fn replace_all_swaps_the_whole_set() {
+        let store = TicketStore::new();
+        store.insert(ticket_with_id(0x01)).await;
+        store.insert(ticket_with_id(0x02)).await;
+        assert_eq!(store.len().await, 2);
+
+        // SNAPSHOT with a disjoint set replaces everything.
+        let n = store
+            .replace_all(vec![ticket_with_id(0x03), ticket_with_id(0x04)])
+            .await;
+        assert_eq!(n, 2);
+        assert_eq!(store.len().await, 2);
+
+        let exporter = fake_exporter();
+        // Old ticket gone, new ticket present.
+        let old = ticket_with_id(0x01);
+        assert!(store
+            .validate(&old.ticket_id, &compute_authcode(&old, &exporter), &exporter)
+            .await
+            .is_none());
+        let new = ticket_with_id(0x03);
+        assert!(store
+            .validate(&new.ticket_id, &compute_authcode(&new, &exporter), &exporter)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn upsert_and_revoke_apply_deltas() {
+        let store = TicketStore::new();
+        store.insert(ticket_with_id(0x01)).await;
+
+        let added = store.upsert_many(vec![ticket_with_id(0x02), ticket_with_id(0x03)]).await;
+        assert_eq!(added, 2);
+        assert_eq!(store.len().await, 3);
+
+        // Revoke one existing + one unknown id → only the existing one counts.
+        let removed = store
+            .revoke_many(&[vec![0x02; TICKET_ID_LEN], vec![0xEE; TICKET_ID_LEN]])
+            .await;
+        assert_eq!(removed, 1);
+        assert_eq!(store.len().await, 2);
+
+        let exporter = fake_exporter();
+        let revoked = ticket_with_id(0x02);
+        assert!(store
+            .validate(&revoked.ticket_id, &compute_authcode(&revoked, &exporter), &exporter)
+            .await
+            .is_none());
     }
 }
