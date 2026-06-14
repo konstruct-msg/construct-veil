@@ -23,9 +23,8 @@ use tokio_util::sync::CancellationToken;
 use crate::veil::fsm::MethodId;
 use crate::veil::obfuscator::{Obfuscator, ObfuscatorError, ObfuscatorHandle, ProbeRequest};
 use crate::veil::veil_front::WriteStrategy;
-use construct_veil_protocol::ticket::{TICKET_WIRE_LEN, Ticket, ticket_from_bytes};
 use construct_veil_protocol::{
-    AUTH_PAYLOAD_LEN, AuthRecord, EXPORTER_LABEL, EXPORTER_LEN, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA,
+    AuthRecordV2, Capability, EXPORTER_LABEL, EXPORTER_LEN, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA,
     Frame, LENGTH_BUCKETS, VeilFrontCodec,
 };
 
@@ -91,7 +90,7 @@ async fn dial_and_authenticate(
     relay_addr: &str,
     tls_sni: &str,
     spki_hex: &str,
-    ticket_b64: &str,
+    capability_b64: &str,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ObfuscatorError> {
     // TCP connect with timeout.
     let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(relay_addr))
@@ -109,26 +108,23 @@ async fn dial_and_authenticate(
     // TLS handshake with SPKI pinning.
     let mut tls_stream = dial_utls_tcp(tcp, tls_sni, spki_hex, relay_addr).await?;
 
-    // Parse the base64-encoded 65-byte veil-front ticket blob.
-    let ticket = parse_ticket(ticket_b64)?;
+    // Parse the base64-encoded backend-signed capability blob.
+    let capability = parse_capability(capability_b64)?;
 
-    // Derive TLS exporter keying material (32 bytes) and build the auth record:
-    // HMAC(auth_key, exporter || ticket_id || not_after).
+    // Derive TLS exporter keying material (32 bytes) and build the AUTH v2 record:
+    // the signed capability + HMAC(auth_key, exporter || ticket_id || not_after).
+    // The relay verifies the issuer signature offline (no ticket store) then the
+    // exporter-bound authcode.
     let exporter = derive_exporter(&tls_stream)?;
-    let auth = AuthRecord::from_ticket(&ticket, &exporter);
+    let auth = AuthRecordV2::from_capability(&capability, &exporter);
 
-    // Send the AUTH frame as the first application record, encoded with the SAME
-    // wire codec the relay's gate decodes with: `WIRE_VER || type || payload_len
-    // || pad_len || payload`. Do NOT use `AuthRecord::encode()` — it emits a
-    // legacy, codec-incompatible framing (no version byte, no pad_len), which the
-    // relay rejects → routes the connection to the cover site.
-    let mut auth_payload = BytesMut::with_capacity(AUTH_PAYLOAD_LEN);
-    auth_payload.extend_from_slice(&auth.ticket_id);
-    auth_payload.extend_from_slice(&auth.authcode);
+    // Send the AUTH v2 frame as the first application record, encoded with the SAME
+    // wire codec the relay's gate decodes with (`Frame::auth_v2`, type 0x03):
+    // `WIRE_VER || type || payload_len || pad_len || (capability || authcode)`.
     let mut auth_frame = BytesMut::new();
     VeilFrontCodec::default()
         .with_buckets(LENGTH_BUCKETS)
-        .encode(Frame::auth(auth_payload.freeze()), &mut auth_frame)
+        .encode(Frame::auth_v2(auth.encode_payload()), &mut auth_frame)
         .map_err(ObfuscatorError::Io)?;
     tls_stream
         .write_all(&auth_frame)
@@ -415,19 +411,19 @@ fn derive_exporter(
 /// encoded for transport over string-typed channels (FFI, manifest).
 /// An empty input returns a handshake error, which the coordinator treats as
 /// "veil-front not configured" — the probe fails and the FSM moves on.
-fn parse_ticket(ticket_b64: &str) -> Result<Ticket, ObfuscatorError> {
-    if ticket_b64.is_empty() {
+fn parse_capability(capability_b64: &str) -> Result<Capability, ObfuscatorError> {
+    if capability_b64.is_empty() {
         return Err(ObfuscatorError::Handshake(
-            "veil-front ticket is empty (not configured)".into(),
+            "veil-front capability is empty (not configured)".into(),
         ));
     }
 
-    let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, ticket_b64)
-        .map_err(|e| ObfuscatorError::Handshake(format!("ticket base64 decode: {e}")))?;
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, capability_b64)
+        .map_err(|e| ObfuscatorError::Handshake(format!("capability base64 decode: {e}")))?;
 
-    ticket_from_bytes(&raw).ok_or_else(|| {
+    Capability::decode_slice(&raw).ok_or_else(|| {
         ObfuscatorError::Handshake(format!(
-            "invalid ticket: expected {TICKET_WIRE_LEN} bytes, got {}",
+            "invalid capability: malformed blob ({} bytes)",
             raw.len()
         ))
     })
@@ -436,7 +432,7 @@ fn parse_ticket(ticket_b64: &str) -> Result<Ticket, ObfuscatorError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use construct_veil_protocol::ticket::{AUTH_KEY_LEN, AuthKey, TICKET_ID_LEN, ticket_to_bytes};
+    use construct_veil_protocol::ticket::{AuthKey, Ticket, AUTH_KEY_LEN, TICKET_ID_LEN};
 
     /// Live latency breakdown against the production relay. Requires the matching
     /// debug ticket in the relay's tickets.json. Ignored by default; run with:
@@ -767,9 +763,8 @@ mod tests {
         assert_eq!(obf.method_id(), MethodId::VeilFront);
     }
 
-    #[test]
-    fn parse_ticket_from_base64() {
-        // Build a valid 65-byte ticket.
+    /// Build a base64 capability blob signed by a fixed test seed.
+    fn test_capability_b64() -> String {
         let ticket = Ticket {
             ticket_id: [0xAB; TICKET_ID_LEN],
             auth_key: AuthKey::new([0xCD; AUTH_KEY_LEN]),
@@ -777,36 +772,39 @@ mod tests {
             not_after: 1_000_000 + 6 * 3600,
             suite_id: 0x01,
         };
-
-        let bytes = ticket_to_bytes(&ticket);
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
-
-        let parsed = parse_ticket(&b64).expect("parse should succeed");
-        assert_eq!(parsed.ticket_id, ticket.ticket_id);
-        assert_eq!(parsed.auth_key.0, ticket.auth_key.0);
-        assert_eq!(parsed.not_before, ticket.not_before);
-        assert_eq!(parsed.not_after, ticket.not_after);
-        assert_eq!(parsed.suite_id, ticket.suite_id);
+        let cap = Capability::sign(ticket, "test".into(), &[7u8; 32]);
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, cap.encode())
     }
 
     #[test]
-    fn parse_ticket_empty_input() {
-        let err = parse_ticket("").unwrap_err();
+    fn parse_capability_from_base64() {
+        let b64 = test_capability_b64();
+        let parsed = parse_capability(&b64).expect("parse should succeed");
+        assert_eq!(parsed.ticket.ticket_id, [0xAB; TICKET_ID_LEN]);
+        assert_eq!(parsed.ticket.auth_key.0, [0xCD; AUTH_KEY_LEN]);
+        assert_eq!(parsed.scope, "test");
+        // Signature verifies against the matching issuer pubkey.
+        let pubkey = construct_veil_protocol::issuer_public_key(&[7u8; 32]);
+        assert!(parsed.verify_signature(&pubkey));
+    }
+
+    #[test]
+    fn parse_capability_empty_input() {
+        let err = parse_capability("").unwrap_err();
         assert!(matches!(err, ObfuscatorError::Handshake(_)));
     }
 
     #[test]
-    fn parse_ticket_invalid_base64() {
-        let err = parse_ticket("not-valid-base64!!!").unwrap_err();
+    fn parse_capability_invalid_base64() {
+        let err = parse_capability("not-valid-base64!!!").unwrap_err();
         assert!(matches!(err, ObfuscatorError::Handshake(_)));
     }
 
     #[test]
-    fn parse_ticket_wrong_length() {
-        // 10 bytes, not 65.
+    fn parse_capability_wrong_length() {
         let bytes = [0u8; 10];
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
-        let err = parse_ticket(&b64).unwrap_err();
+        let err = parse_capability(&b64).unwrap_err();
         assert!(matches!(err, ObfuscatorError::Handshake(_)));
     }
 }

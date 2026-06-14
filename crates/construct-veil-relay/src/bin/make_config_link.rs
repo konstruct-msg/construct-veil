@@ -1,22 +1,23 @@
 //! make-config-link — generate a signed veil-front config link (+ terminal QR) for
-//! manual tester provisioning, before the email/provisioning service exists.
+//! manual tester bootstrap provisioning, before the in-band issuance service is wired.
 //!
-//! It issues a fresh ticket, optionally appends it to the relay's `tickets.json`,
-//! builds the config blob, Ed25519-signs the canonical JSON exactly as the iOS client
+//! It mints a fresh **backend-signed capability** (the relay validates it offline
+//! against the issuer public key — no tickets.json), wraps it in a config blob with
+//! the relay coords, Ed25519-signs the canonical JSON exactly as the iOS client
 //! verifies it, and prints a `konstruct://veil-config?d=…` link + a scannable QR.
 //!
-//! The signing key is the Ed25519 **private seed** (32-byte hex) corresponding to the
-//! app's `relayConfigSigningKey` (public). Keep it secret. The tool prints the derived
-//! public key so you can confirm it matches the value pinned in the app.
+//! The signing key is the Ed25519 **private seed** (32-byte hex) = the issuer key
+//! (`relayConfigSigningKey`). Keep it secret. The tool prints the derived public key —
+//! it must equal both the app's `relayConfigSigningKey` AND the relay's `--issuer-pubkey`.
 //!
 //! ```text
 //! make-config-link --signing-key <64-hex-seed> --spki <relay-spki-hex> \
-//!     --relay api.divany-kresla.uk:443 --days 60 \
-//!     --append /opt/construct-veil/deploy/data/tickets/tickets.json
+//!     --relay api.divany-kresla.uk:443 --scope "" --days 60
 //! ```
 //!
-//! The link/QR only works once the issued ticket is in the relay's tickets.json AND
-//! the relay has reloaded it (restart after `--append`, or batch-issue then restart).
+//! No relay restart / tickets.json needed: the relay validates the capability's
+//! signature offline, so the link works as soon as the relay runs with the matching
+//! `--issuer-pubkey`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -24,9 +25,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use clap::Parser;
-use construct_veil_protocol::ticket::{
-    AUTH_KEY_LEN, AuthKey, TICKET_ID_LEN, Ticket, ticket_to_bytes,
-};
+use construct_veil_protocol::ticket::{AuthKey, Ticket, AUTH_KEY_LEN, TICKET_ID_LEN};
+use construct_veil_protocol::Capability;
 use rand::RngCore;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
@@ -60,9 +60,10 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     suite_id: u8,
 
-    /// Append the issued ticket to this tickets.json (JSON array of base64 strings).
-    #[arg(long, value_name = "PATH")]
-    append: Option<String>,
+    /// Relay scope the capability is valid on (must match the relay's --relay-scope;
+    /// empty = any scope).
+    #[arg(long, default_value = "")]
+    scope: String,
 
     /// Also write the QR to an SVG file (open in a browser, scan, or send to a tester).
     #[arg(long, value_name = "PATH")]
@@ -103,7 +104,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         not_after: exp,
         suite_id: args.suite_id,
     };
-    let ticket_b64 = base64::engine::general_purpose::STANDARD.encode(ticket_to_bytes(&ticket));
+    // Sign the capability with the issuer seed (same key, domain "veil-cap-v1").
+    let seed32: [u8; 32] = seed.as_slice().try_into().expect("seed length checked above");
+    let capability = Capability::sign(ticket, args.scope.clone(), &seed32);
+    let cap_b64 = base64::engine::general_purpose::STANDARD.encode(capability.encode());
 
     // ── Build + sign the config blob ────────────────────────────────────────
     let sni = args.sni.clone().unwrap_or_else(|| {
@@ -119,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fields.insert("relay", args.relay.clone().into());
     fields.insert("sni", sni.into());
     fields.insert("spki", args.spki.clone().into());
-    fields.insert("ticket", ticket_b64.clone().into());
+    fields.insert("capability", cap_b64.clone().into());
     fields.insert("exp", serde_json::Value::Number((exp as i64).into()));
     let canonical = serde_json::to_string(&fields)?;
     let sig = key_pair.sign(canonical.as_bytes());
@@ -135,29 +139,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let d = B64URL.encode(serde_json::to_string(&full)?.as_bytes());
     let link = format!("konstruct://veil-config?d={d}");
 
-    // ── Append to tickets.json if requested ─────────────────────────────────
-    if let Some(path) = &args.append {
-        let mut existing: Vec<String> = fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        existing.push(ticket_b64.clone());
-        fs::write(path, serde_json::to_string_pretty(&existing)?)?;
-        eprintln!("✓ appended ticket to {path} (total {})", existing.len());
-        eprintln!("  ⚠ restart the relay so it reloads tickets.json");
-    } else {
-        eprintln!(
-            "⚠ ticket NOT added to any relay. Add this to the relay's tickets.json + restart:"
-        );
-        eprintln!("    {ticket_b64}");
-    }
-
     // ── Output ──────────────────────────────────────────────────────────────
+    // No tickets.json / restart: the relay validates the capability signature offline.
     eprintln!();
-    eprintln!("signing pubkey: {pub_hex}");
-    eprintln!("  (must equal the app's relayConfigSigningKey)");
+    eprintln!("signing/issuer pubkey: {pub_hex}");
+    eprintln!("  (must equal the app's relayConfigSigningKey AND the relay's --issuer-pubkey)");
     eprintln!("relay:   {}", args.relay);
+    eprintln!("scope:   {}", if args.scope.is_empty() { "(any)" } else { &args.scope });
     eprintln!("expires: {exp}  (+{} days)", args.days);
+    eprintln!("capability (base64, for DEBUG baking if needed):");
+    eprintln!("    {cap_b64}");
     eprintln!();
     // The link goes to stdout so it can be piped/copied; everything else is stderr.
     println!("{link}");
