@@ -20,8 +20,6 @@
 
 mod gate;
 mod site;
-mod ticket_sync;
-mod tickets;
 mod tls;
 mod tunnel;
 
@@ -33,7 +31,6 @@ use gate::{GateResult, gate_with_exporter};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use crate::tickets::TicketStore;
 use crate::tls::RelayTls;
 
 /// Veil-front relay CLI arguments.
@@ -57,9 +54,16 @@ struct Args {
     #[arg(long)]
     key: Option<String>,
 
-    /// Path to tickets JSON file.
+    /// Issuer (home-server) Ed25519 public key, hex (64 chars / 32 bytes). The relay
+    /// validates each presented capability's signature against this key — offline, with
+    /// no ticket store and no backend sync. Required outside --dev.
     #[arg(long)]
-    tickets: Option<String>,
+    issuer_pubkey: Option<String>,
+
+    /// Relay scope id. A capability is accepted if its scope matches this (empty on
+    /// either side = wildcard). Lets one issuer mint capabilities scoped to relay groups.
+    #[arg(long, default_value = "")]
+    relay_scope: String,
 
     /// Backend address (Construct gRPC). Accepts host:port or IP:port. Plaintext
     /// h2c by default; with --backend-tls the relay connects over TLS (ALPN h2).
@@ -80,26 +84,6 @@ struct Args {
     /// Cover site address (local HTTP server with long-lived H2). Accepts host:port or IP:port.
     #[arg(long, default_value = "127.0.0.1:8080")]
     site: String,
-
-    /// Backend ticket-authority gRPC endpoint, e.g. `https://ams.konstruct.cc:443`.
-    /// When set, the relay subscribes to the active ticket set (SubscribeVeilTickets)
-    /// and applies updates live. When unset, only `--tickets` (static JSON) is used.
-    #[arg(long)]
-    ticket_control: Option<String>,
-
-    /// TLS SNI for --ticket-control. Defaults to the host part of the endpoint.
-    #[arg(long)]
-    ticket_control_sni: Option<String>,
-
-    /// This relay's id (scope) for ticket subscription. Defaults to --listen host
-    /// or "default". The backend filters the pushed set by this.
-    #[arg(long, default_value = "default")]
-    relay_id: String,
-
-    /// Bearer credential authorising this relay to subscribe. Prefer the
-    /// VEIL_RELAY_TOKEN env var over the CLI flag (avoids leaking via process list).
-    #[arg(long, env = "VEIL_RELAY_TOKEN")]
-    relay_token: Option<String>,
 }
 
 /// How the relay connects to the backend after authenticating a tunnel.
@@ -146,49 +130,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RelayTls::from_pem_files(cert_path, key_path)?
     };
 
-    // ── Ticket store ───────────────────────────────────────────────────────
-
-    let ticket_store = TicketStore::new();
-
-    if let Some(tickets_path) = &args.tickets {
-        let count = ticket_store
-            .load_from_json(tickets_path)
-            .await
-            .map_err(|e| format!("Failed to load tickets from {tickets_path}: {e}"))?;
-        info!("Loaded {count} tickets from {tickets_path}");
-    } else if !args.dev {
-        warn!("No tickets loaded — all connections will route to site");
-    }
-
-    let ticket_store = Arc::new(ticket_store);
-
-    // ── Ticket sync (subscribe to backend authority) ────────────────────────
-    // Backend is the source of truth; static --tickets is bootstrap/fallback.
-    if let Some(control) = &args.ticket_control {
-        match &args.relay_token {
-            Some(token) if !token.is_empty() => {
-                let sni = args.ticket_control_sni.clone().unwrap_or_else(|| {
-                    control
-                        .trim_start_matches("https://")
-                        .trim_start_matches("http://")
-                        .rsplit_once(':')
-                        .map(|(h, _)| h.to_string())
-                        .unwrap_or_else(|| control.clone())
-                });
-                info!("Ticket sync enabled — control={control}, relay_id={}", args.relay_id);
-                ticket_sync::spawn(
-                    Arc::clone(&ticket_store),
-                    ticket_sync::TicketSyncConfig {
-                        control_endpoint: control.clone(),
-                        control_sni: sni,
-                        relay_id: args.relay_id.clone(),
-                        relay_token: token.clone(),
-                    },
-                );
-            }
-            _ => warn!("--ticket-control set but no relay token (VEIL_RELAY_TOKEN) — ticket sync disabled"),
-        }
-    }
+    // ── Issuer public key (capability verification) ─────────────────────────
+    // The relay validates each presented capability's Ed25519 signature against
+    // this key, offline. No ticket store, no sync, no secrets at rest.
+    let issuer_pubkey: [u8; 32] = {
+        let hex_key = args.issuer_pubkey.as_ref().ok_or(
+            "--issuer-pubkey is required (home-server Ed25519 public key, 64 hex chars)",
+        )?;
+        let bytes = hex::decode(hex_key.trim())
+            .map_err(|e| format!("invalid --issuer-pubkey hex: {e}"))?;
+        bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| format!("--issuer-pubkey must be 32 bytes (64 hex chars), got {}", bytes.len()))?
+    };
+    let relay_scope: Arc<str> = Arc::from(args.relay_scope.as_str());
 
     // ── Backend dialer ─────────────────────────────────────────────────────
     // h2c by default (co-located backend); TLS+ALPN-h2 for a remote backend
@@ -238,7 +194,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     info!("║  spki       {}", relay_tls.spki_hex);
-    info!("║  tickets    {}", ticket_store.len().await);
+    info!("║  issuer     {} (pubkey pfx)", hex::encode(&issuer_pubkey[..6]));
+    info!(
+        "║  scope      {}",
+        if relay_scope.is_empty() { "(any)" } else { &relay_scope }
+    );
     info!("╚══════════════════════════════════════════════════════════");
 
     // ── Bind ───────────────────────────────────────────────────────────────
@@ -269,14 +229,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tcp.set_nodelay(true).ok();
 
         let acceptor = acceptor.clone();
-        let store = Arc::clone(&ticket_store);
         let dialer = backend_dialer.clone();
         let backend = Arc::clone(&backend);
         let site = Arc::clone(&site);
+        let scope = Arc::clone(&relay_scope);
 
         tokio::spawn(async move {
             if let Err(e) =
-                handle_connection(tcp, peer, acceptor, store, &backend, dialer, &site).await
+                handle_connection(tcp, peer, acceptor, &issuer_pubkey, &scope, &backend, dialer, &site).await
             {
                 warn!(peer = %peer, error = %e, "connection handler error");
             }
@@ -289,7 +249,8 @@ async fn handle_connection(
     tcp: tokio::net::TcpStream,
     peer: SocketAddr,
     acceptor: tokio_rustls::TlsAcceptor,
-    store: Arc<TicketStore>,
+    issuer_pubkey: &[u8; 32],
+    relay_scope: &str,
     backend: &str,
     backend_dialer: BackendDialer,
     site: &str,
@@ -298,8 +259,8 @@ async fn handle_connection(
     let tls_stream = acceptor.accept(tcp).await?;
     info!(peer = %peer, "TLS handshake complete");
 
-    // Run the constant-shape gate.
-    match gate_with_exporter(tls_stream, &store).await {
+    // Run the constant-shape gate (offline capability validation).
+    match gate_with_exporter(tls_stream, issuer_pubkey, relay_scope).await {
         Ok(GateResult::Tunnel { stream, leftover }) => {
             // Valid auth — connect to the backend (plain h2c or TLS+ALPN-h2) and tunnel.
             // `backend` is a host:port string, resolved here (per connection).

@@ -50,7 +50,7 @@ bytes = "1.6"
 thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive"] }
 
 # Crypto (for ticket store — in-memory HMAC verification)
 hmac = "0.12"
@@ -63,16 +63,6 @@ serde_json = "1"
 base64 = "0.22"
 hex = "0.4"
 rand = "0.8"
-
-# gRPC client for ticket sync (SubscribeVeilTickets → backend ticket authority).
-# Versions mirror construct-server (tonic 0.14.4 / prost 0.14.3). webpki roots so the
-# relay can verify the backend's public Let's Encrypt cert (ams.konstruct.cc).
-tonic = { version = "0.14.4", features = ["transport", "tls-ring", "tls-webpki-roots"] }
-tonic-prost = "0.14.4"
-prost = "0.14.3"
-
-[build-dependencies]
-tonic-prost-build = "0.14.4"
 
 [dev-dependencies]
 tempfile = "3"

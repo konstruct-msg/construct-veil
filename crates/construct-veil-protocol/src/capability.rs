@@ -31,9 +31,12 @@
 //! capability blob = ticket_id[16] || auth_key[32] || not_before[8 LE] || not_after[8 LE]
 //!                   || suite_id[1] || scope_len[u8] || scope[scope_len] || sig[64]
 //!
-//! AUTH v2 frame   = FRAME_TYPE_AUTH_V2 || varint(payload_len)
-//!                   || capability blob || authcode[32]
+//! AUTH v2 payload = capability blob || authcode[32]
 //! ```
+//!
+//! The AUTH v2 *payload* is wrapped by the normal `VeilFrontCodec` / `Frame`
+//! (`Frame::auth_v2`, type `FRAME_TYPE_AUTH_V2`) — `AuthRecordV2` does not do its
+//! own framing (mirrors how `AuthRecord` produces only the v1 payload).
 //!
 //! The signing key is domain-separated (`veil-cap-v1` prefix) so a capability
 //! signature can never be confused with any other signature made by the same key
@@ -45,8 +48,6 @@ use subtle::ConstantTimeEq;
 
 use crate::auth::{AuthRecord, AUTHCODE_LEN};
 use crate::ticket::{AuthKey, Ticket, AUTH_KEY_LEN, TICKET_ID_LEN};
-use crate::varint::{decode_varint, encode_varint};
-use crate::FRAME_TYPE_AUTH_V2;
 
 /// Length of an Ed25519 signature in bytes.
 pub const CAP_SIG_LEN: usize = 64;
@@ -56,6 +57,13 @@ pub const CAP_DOMAIN: &[u8] = b"veil-cap-v1";
 
 /// Fixed-size portion of an encoded capability (everything except scope + sig).
 const CAP_FIXED_LEN: usize = TICKET_ID_LEN + AUTH_KEY_LEN + 8 + 8 + 1 + 1; // 66
+
+/// Derive the issuer's Ed25519 public key (32 bytes) from its 32-byte seed.
+/// Used by the relay (config), the backend issuer, and tooling to agree on the
+/// pubkey the relay must pin.
+pub fn issuer_public_key(seed: &[u8; 32]) -> [u8; 32] {
+    SigningKey::from_bytes(seed).verifying_key().to_bytes()
+}
 
 /// A backend-signed, self-contained veil-front access capability.
 #[derive(Debug, Clone)]
@@ -206,50 +214,32 @@ impl AuthRecordV2 {
         expected.ct_eq(&self.authcode).into()
     }
 
-    /// Encode as a wire frame: `FRAME_TYPE_AUTH_V2 || varint(len) || cap || authcode`.
-    pub fn encode(&self) -> Bytes {
+    /// Encode the AUTH v2 *payload*: `capability_blob || authcode[32]`.
+    /// Wrap this in `Frame::auth_v2(...)` for the wire.
+    pub fn encode_payload(&self) -> Bytes {
         let cap = self.capability.encode();
-        let payload_len = cap.len() + AUTHCODE_LEN;
-        let mut buf = BytesMut::with_capacity(1 + 4 + payload_len);
-        buf.put_u8(FRAME_TYPE_AUTH_V2);
-        encode_varint(payload_len as u64, &mut buf);
+        let mut buf = BytesMut::with_capacity(cap.len() + AUTHCODE_LEN);
         buf.put_slice(&cap);
         buf.put_slice(&self.authcode);
         buf.freeze()
     }
 
-    /// Decode an AUTH v2 frame. Returns `None` on wrong type / malformation.
-    pub fn decode(data: &mut impl Buf) -> Option<Self> {
-        if !data.has_remaining() {
-            return None;
-        }
-        if data.get_u8() != FRAME_TYPE_AUTH_V2 {
-            return None;
-        }
-        let (payload_len, _) = decode_varint(data)?;
-        let payload_len = payload_len as usize;
-        if payload_len < AUTHCODE_LEN || data.remaining() < payload_len {
-            return None;
-        }
-        // Carve out exactly the payload so the capability can't over-read into
-        // following frames; the trailer must be exactly the authcode.
-        let mut payload = data.copy_to_bytes(payload_len);
-        let capability = Capability::decode(&mut payload)?;
-        if payload.remaining() != AUTHCODE_LEN {
+    /// Decode an AUTH v2 payload (`capability_blob || authcode[32]`), i.e. the
+    /// `payload` of a `Frame` whose type is `FRAME_TYPE_AUTH_V2`. The capability is
+    /// variable-length and the authcode is the fixed 32-byte trailer; the payload
+    /// must end exactly after the authcode.
+    pub fn decode_payload(payload: &[u8]) -> Option<Self> {
+        let mut buf = payload;
+        let capability = Capability::decode(&mut buf)?;
+        if buf.remaining() != AUTHCODE_LEN {
             return None;
         }
         let mut authcode = [0u8; AUTHCODE_LEN];
-        payload.copy_to_slice(&mut authcode);
+        buf.copy_to_slice(&mut authcode);
         Some(Self {
             capability,
             authcode,
         })
-    }
-
-    /// Decode from a byte slice.
-    pub fn decode_slice(data: &[u8]) -> Option<Self> {
-        let mut buf = data;
-        Self::decode(&mut buf)
     }
 }
 
@@ -367,22 +357,24 @@ mod tests {
     }
 
     #[test]
-    fn auth_v2_frame_roundtrip() {
+    fn auth_v2_payload_roundtrip() {
         let (seed, _) = issuer_keypair();
         let cap = Capability::sign(make_ticket(), "default".into(), &seed);
         let rec = AuthRecordV2::from_capability(&cap, &exporter());
-        let frame = rec.encode();
-        let decoded = AuthRecordV2::decode_slice(&frame).expect("decode");
+        let payload = rec.encode_payload();
+        let decoded = AuthRecordV2::decode_payload(&payload).expect("decode");
         assert_eq!(decoded.authcode, rec.authcode);
         assert_eq!(decoded.capability.scope, "default");
         assert_eq!(decoded.capability.sig, cap.sig);
     }
 
     #[test]
-    fn auth_v2_decode_wrong_type() {
-        // A v1 AUTH frame must not decode as v2.
-        let ticket = make_ticket();
-        let v1 = AuthRecord::from_ticket(&ticket, &exporter()).encode();
-        assert!(AuthRecordV2::decode_slice(&v1).is_none());
+    fn auth_v2_decode_payload_rejects_garbage() {
+        // Too short to hold a capability + authcode.
+        assert!(AuthRecordV2::decode_payload(&[0u8; 10]).is_none());
+        // A bare capability with no authcode trailer.
+        let (seed, _) = issuer_keypair();
+        let cap = Capability::sign(make_ticket(), "default".into(), &seed);
+        assert!(AuthRecordV2::decode_payload(&cap.encode()).is_none());
     }
 }

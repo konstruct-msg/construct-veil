@@ -21,16 +21,21 @@
 //! This means an active probe sees the same timing whether it sends 1 byte or
 //! 100 bytes — the cover app's own response timing dominates.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::BytesMut;
-use construct_veil_protocol::{AUTH_PAYLOAD_LEN, EXPORTER_LABEL, VeilFrontCodec};
+use construct_veil_protocol::{AuthRecordV2, EXPORTER_LABEL, VeilFrontCodec};
 use tokio::io::AsyncReadExt;
 use tokio_rustls::server::TlsStream;
 use tokio_util::codec::Decoder;
 use tracing::{debug, warn};
 
-use crate::tickets::TicketStore;
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Timeout for the second read attempt during the gate.
 ///
@@ -78,7 +83,8 @@ pub enum GateResult<S> {
 /// 4. If valid auth → Tunnel.
 pub async fn gate_with_exporter(
     tls_stream: TlsStream<tokio::net::TcpStream>,
-    store: &TicketStore,
+    issuer_pubkey: &[u8; 32],
+    relay_scope: &str,
 ) -> Result<GateResult<TlsStream<tokio::net::TcpStream>>, std::io::Error> {
     // Extract TLS exporter BEFORE splitting the stream.
     let exporter = {
@@ -114,7 +120,7 @@ pub async fn gate_with_exporter(
     }
 
     // Try to decode immediately — no fixed threshold.
-    if let Some(result) = try_decode_auth(&buf, &exporter, store).await {
+    if let Some(result) = try_decode_auth(&buf, &exporter, issuer_pubkey, relay_scope) {
         return Ok(result.consume(reader, buf));
     }
 
@@ -129,7 +135,7 @@ pub async fn gate_with_exporter(
         }
         Ok(Ok(_n2)) => {
             // Got more data, try decode again.
-            if let Some(result) = try_decode_auth(&buf, &exporter, store).await {
+            if let Some(result) = try_decode_auth(&buf, &exporter, issuer_pubkey, relay_scope) {
                 return Ok(result.consume(reader, buf));
             }
             // Still incomplete/invalid → Site.
@@ -166,40 +172,45 @@ pub async fn gate_with_exporter(
 /// (valid or invalid). Returns `None` if the frame is incomplete (need more data).
 ///
 /// This is the core gate logic — extracted for testability.
-async fn try_decode_auth(
+fn try_decode_auth(
     buf: &BytesMut,
     exporter: &[u8; 32],
-    store: &TicketStore,
+    issuer_pubkey: &[u8; 32],
+    relay_scope: &str,
 ) -> Option<GateDecision> {
     let mut decode_buf = buf.clone();
     match VeilFrontCodec::default().decode(&mut decode_buf) {
-        Ok(Some(frame)) if frame.is_auth() && frame.payload.len() == AUTH_PAYLOAD_LEN => {
-            let ticket_id: [u8; 16] = {
-                let mut id = [0u8; 16];
-                id.copy_from_slice(&frame.payload[..16]);
-                id
-            };
-            let authcode: [u8; 32] = {
-                let mut code = [0u8; 32];
-                code.copy_from_slice(&frame.payload[16..48]);
-                code
+        Ok(Some(frame)) if frame.is_auth_v2() => {
+            // Parse the signed capability + authcode from the frame payload.
+            let Some(rec) = AuthRecordV2::decode_payload(&frame.payload) else {
+                debug!("malformed AUTH v2 payload, routing to site");
+                return Some(GateDecision::Site);
             };
 
-            // Validate against the ticket store (constant-time compare).
-            if let Some(_ticket) = store.validate(&ticket_id, &authcode, exporter).await {
-                debug!(ticket_id = ?hex::encode(ticket_id), "auth valid, routing to tunnel");
+            // Scope gate: empty cap scope or empty relay scope = wildcard.
+            let scope_ok = rec.capability.scope.is_empty()
+                || relay_scope.is_empty()
+                || rec.capability.scope == relay_scope;
+
+            // Offline validation: issuer signature + validity window + exporter-bound
+            // authcode (constant-time). No ticket store, no network.
+            if scope_ok && rec.verify(issuer_pubkey, exporter, now_unix()) {
+                debug!(
+                    ticket_id = ?hex::encode(rec.capability.ticket.ticket_id),
+                    "capability valid, routing to tunnel"
+                );
                 Some(GateDecision::Tunnel {
                     leftover: decode_buf,
                 })
             } else {
-                debug!(ticket_id = ?hex::encode(ticket_id), "auth invalid, routing to site");
+                debug!("capability invalid (sig/expiry/scope/authcode), routing to site");
                 Some(GateDecision::Site)
             }
         }
         Ok(Some(frame)) => {
             debug!(
                 frame_type = frame.frame_type,
-                "non-auth frame, routing to site"
+                "non-auth-v2 frame, routing to site"
             );
             Some(GateDecision::Site)
         }
@@ -244,6 +255,73 @@ impl GateDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use construct_veil_protocol::ticket::{AuthKey, Ticket};
+    use construct_veil_protocol::{issuer_public_key, AuthRecordV2, Capability, Frame};
+    use tokio_util::codec::Encoder;
+
+    const SEED: [u8; 32] = [7u8; 32];
+    const EXPORTER: [u8; 32] = [0xCDu8; 32];
+
+    /// Build a wire buffer holding one AUTH v2 frame for `scope`, signed by SEED.
+    fn auth_v2_buf(scope: &str) -> BytesMut {
+        let ticket = Ticket {
+            ticket_id: [0x11; 16],
+            auth_key: AuthKey::new([0x22; 32]),
+            not_before: 0,
+            not_after: u64::MAX,
+            suite_id: 1,
+        };
+        let cap = Capability::sign(ticket, scope.to_string(), &SEED);
+        let rec = AuthRecordV2::from_capability(&cap, &EXPORTER);
+        let mut buf = BytesMut::new();
+        VeilFrontCodec::default()
+            .encode(Frame::auth_v2(rec.encode_payload()), &mut buf)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn gate_accepts_valid_capability() {
+        let pubkey = issuer_public_key(&SEED);
+        let buf = auth_v2_buf("");
+        let decision = try_decode_auth(&buf, &EXPORTER, &pubkey, "");
+        assert!(matches!(decision, Some(GateDecision::Tunnel { .. })));
+    }
+
+    #[test]
+    fn gate_rejects_wrong_issuer() {
+        let wrong = issuer_public_key(&[9u8; 32]);
+        let buf = auth_v2_buf("");
+        let decision = try_decode_auth(&buf, &EXPORTER, &wrong, "");
+        assert!(matches!(decision, Some(GateDecision::Site)));
+    }
+
+    #[test]
+    fn gate_rejects_wrong_exporter() {
+        let pubkey = issuer_public_key(&SEED);
+        let buf = auth_v2_buf("");
+        let mut other = EXPORTER;
+        other[0] ^= 0x01;
+        let decision = try_decode_auth(&buf, &other, &pubkey, "");
+        assert!(matches!(decision, Some(GateDecision::Site)));
+    }
+
+    #[test]
+    fn gate_rejects_scope_mismatch() {
+        let pubkey = issuer_public_key(&SEED);
+        let buf = auth_v2_buf("ru-relay");
+        let decision = try_decode_auth(&buf, &EXPORTER, &pubkey, "nl-relay");
+        assert!(matches!(decision, Some(GateDecision::Site)));
+    }
+
+    #[test]
+    fn gate_scope_wildcard_matches() {
+        let pubkey = issuer_public_key(&SEED);
+        // Capability scoped to "ru-relay" but relay accepts any (empty scope).
+        let buf = auth_v2_buf("ru-relay");
+        let decision = try_decode_auth(&buf, &EXPORTER, &pubkey, "");
+        assert!(matches!(decision, Some(GateDecision::Tunnel { .. })));
+    }
 
     #[test]
     fn gate_result_is_send() {

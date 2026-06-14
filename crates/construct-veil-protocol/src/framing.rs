@@ -36,7 +36,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::varint::{decode_varint, encode_varint};
-use crate::{FRAME_TYPE_AUTH, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, WIRE_VER};
+use crate::{FRAME_TYPE_AUTH, FRAME_TYPE_AUTH_V2, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, WIRE_VER};
 
 /// Default maximum frame payload size (1 MiB).
 const DEFAULT_MAX_PAYLOAD: usize = 1024 * 1024;
@@ -158,9 +158,24 @@ impl Frame {
         }
     }
 
+    /// Create an AUTH v2 frame carrying a signed capability.
+    ///
+    /// The payload is `capability_blob || authcode[32]` (see `AuthRecordV2`).
+    pub fn auth_v2(payload: Bytes) -> Self {
+        Self {
+            frame_type: FRAME_TYPE_AUTH_V2,
+            payload,
+        }
+    }
+
     /// Check if this is an AUTH frame.
     pub fn is_auth(&self) -> bool {
         self.frame_type == FRAME_TYPE_AUTH
+    }
+
+    /// Check if this is an AUTH v2 (capability) frame.
+    pub fn is_auth_v2(&self) -> bool {
+        self.frame_type == FRAME_TYPE_AUTH_V2
     }
 
     /// Check if this is a DATA frame.
