@@ -378,3 +378,31 @@ mod tests {
         assert!(AuthRecordV2::decode_payload(&cap.encode()).is_none());
     }
 }
+
+#[cfg(test)]
+mod golden {
+    use super::*;
+
+    /// Cross-repo interop anchor. The backend (construct-server `veil-service`)
+    /// re-implements this exact signing message + blob layout; both pin the same
+    /// vector. If either side drifts, this fails — and a drift would mean the relay
+    /// rejects backend-issued capabilities on-device (hard to debug). Fixed inputs:
+    /// seed=[7;32], ticket_id=[1;16], auth_key=[2;32], nb=0, na=100, suite=1, scope="ru".
+    const GOLDEN_BLOB_HEX: &str = "0101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020000000000000000640000000000000001027275e00cdb9124a3225a53aa46712bcdee0aab51b01c58f674b1b8d13898bd7dc33dec404cf0e035472ab64689a0163d4f68375b2546ccd83eb8536ecb5daea8130e";
+
+    #[test]
+    fn capability_blob_matches_golden_vector() {
+        let cap = Capability::sign(
+            Ticket {
+                ticket_id: [1u8; TICKET_ID_LEN],
+                auth_key: AuthKey::new([2u8; AUTH_KEY_LEN]),
+                not_before: 0,
+                not_after: 100,
+                suite_id: 1,
+            },
+            "ru".into(),
+            &[7u8; 32],
+        );
+        assert_eq!(hex::encode(cap.encode()), GOLDEN_BLOB_HEX);
+    }
+}
