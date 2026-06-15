@@ -276,6 +276,11 @@ impl PayloadQueue {
         self.frames.len()
     }
 
+    /// Whether there are no pending frames.
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
     /// Clear all pending frames.
     pub fn clear(&mut self) {
         self.frames.clear();

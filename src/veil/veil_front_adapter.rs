@@ -307,19 +307,16 @@ pub async fn run_veil_front_ferry_with_metrics(
 
         loop {
             // Drain any complete frames already in the buffer.
-            loop {
-                match codec.decode(&mut buf).map_err(ObfuscatorError::Io)? {
-                    Some(frame) => match frame.frame_type {
-                        FRAME_TYPE_DATA => {
-                            local_wr
-                                .write_all(&frame.payload)
-                                .await
-                                .map_err(ObfuscatorError::Io)?;
-                        }
-                        FRAME_TYPE_CHAFF => { /* cover traffic — discard */ }
-                        _ => { /* AUTH/unknown mid-stream — ignore */ }
-                    },
-                    None => break,
+            while let Some(frame) = codec.decode(&mut buf).map_err(ObfuscatorError::Io)? {
+                match frame.frame_type {
+                    FRAME_TYPE_DATA => {
+                        local_wr
+                            .write_all(&frame.payload)
+                            .await
+                            .map_err(ObfuscatorError::Io)?;
+                    }
+                    FRAME_TYPE_CHAFF => { /* cover traffic — discard */ }
+                    _ => { /* AUTH/unknown mid-stream — ignore */ }
                 }
             }
 
@@ -803,7 +800,7 @@ mod tests {
     #[test]
     fn parse_capability_wrong_length() {
         let bytes = [0u8; 10];
-        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
         let err = parse_capability(&b64).unwrap_err();
         assert!(matches!(err, ObfuscatorError::Handshake(_)));
     }

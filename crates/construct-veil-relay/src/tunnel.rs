@@ -182,22 +182,19 @@ where
     loop {
         // Drain any complete frames already in the buffer.
         let mut wrote_payload = false;
-        loop {
-            match codec.decode(&mut buf)? {
-                Some(frame) => match frame.frame_type {
-                    FRAME_TYPE_DATA => {
-                        backend_wr.write_all(&frame.payload).await?;
-                        bytes.fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
-                        wrote_payload = true;
-                    }
-                    FRAME_TYPE_CHAFF => { /* cover traffic — discard */ }
-                    other => {
-                        // AUTH (already consumed) or unknown mid-stream frame.
-                        // Drop it rather than corrupt the backend stream.
-                        debug!(frame_type = other, "unexpected mid-tunnel frame, dropping");
-                    }
-                },
-                None => break, // need more bytes
+        while let Some(frame) = codec.decode(&mut buf)? {
+            match frame.frame_type {
+                FRAME_TYPE_DATA => {
+                    backend_wr.write_all(&frame.payload).await?;
+                    bytes.fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
+                    wrote_payload = true;
+                }
+                FRAME_TYPE_CHAFF => { /* cover traffic — discard */ }
+                other => {
+                    // AUTH (already consumed) or unknown mid-stream frame.
+                    // Drop it rather than corrupt the backend stream.
+                    debug!(frame_type = other, "unexpected mid-tunnel frame, dropping");
+                }
             }
         }
 

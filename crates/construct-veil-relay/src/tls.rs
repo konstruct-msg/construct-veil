@@ -82,11 +82,11 @@ impl RelayTls {
             "127.0.0.1".to_string(),
             "::1".to_string(),
         ])
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
         let cert_der = certified.cert.der().clone();
         let key_der = PrivateKeyDer::try_from(certified.key_pair.serialize_der())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
 
         let spki_hex = compute_spki_hex(&cert_der);
 

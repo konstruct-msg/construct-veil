@@ -264,6 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Handle a single incoming connection.
+#[allow(clippy::too_many_arguments)] // connection handler threads per-conn config + dialer
 async fn handle_connection(
     tcp: tokio::net::TcpStream,
     peer: SocketAddr,
