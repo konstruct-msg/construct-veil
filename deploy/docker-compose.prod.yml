@@ -38,7 +38,6 @@ services:
       - "443:443"
     volumes:
       - letsencrypt:/etc/letsencrypt:ro
-      - ./data/tickets:/etc/veil-front:ro
     environment:
       RUST_LOG: "${RUST_LOG:-info}"
       # Passed through so the healthcheck's `openssl s_client -servername ${DOMAIN}`
@@ -46,6 +45,10 @@ services:
       # openssl shifts and uses `-brief` as the servername, and the relay rejects the
       # handshake (ServerNameMustContainOneHostName) → container marked unhealthy.
       DOMAIN: "${DOMAIN}"
+      # Issuer (home-server) Ed25519 PUBLIC key, hex. The relay validates each client
+      # capability's signature against this — offline, no ticket store. MUST equal the
+      # veil-service issuer pubkey and the app's relayConfigSigningKey.
+      ISSUER_PUBKEY: "${ISSUER_PUBKEY}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     # Remote front topology: this relay (e.g. in RU, reachable by IP) terminates
@@ -61,7 +64,8 @@ services:
       --backend ${BACKEND:-ams.konstruct.cc:443}
       --backend-tls
       --backend-sni ${BACKEND_SNI:-ams.konstruct.cc}
-      --tickets /etc/veil-front/tickets.json
+      --issuer-pubkey ${ISSUER_PUBKEY}
+      --relay-scope ${RELAY_SCOPE:-}
     healthcheck:
       test: ["CMD-SHELL", "echo | openssl s_client -connect 127.0.0.1:443 -servername $$(echo $${DOMAIN}) -brief 2>&1 | grep -q 'Verification: OK\\|verify error' || exit 1"]
       interval: 30s
