@@ -65,7 +65,6 @@ services:
       --backend-tls
       --backend-sni ${BACKEND_SNI:-ams.konstruct.cc}
       --issuer-pubkey ${ISSUER_PUBKEY}
-      --relay-scope ${RELAY_SCOPE:-}
     healthcheck:
       test: ["CMD-SHELL", "echo | openssl s_client -connect 127.0.0.1:443 -servername $$(echo $${DOMAIN}) -brief 2>&1 | grep -q 'Verification: OK\\|verify error' || exit 1"]
       interval: 30s
