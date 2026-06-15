@@ -25,8 +25,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use clap::Parser;
-use construct_veil_protocol::ticket::{AuthKey, Ticket, AUTH_KEY_LEN, TICKET_ID_LEN};
 use construct_veil_protocol::Capability;
+use construct_veil_protocol::ticket::{AUTH_KEY_LEN, AuthKey, TICKET_ID_LEN, Ticket};
 use rand::RngCore;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
@@ -105,7 +105,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         suite_id: args.suite_id,
     };
     // Sign the capability with the issuer seed (same key, domain "veil-cap-v1").
-    let seed32: [u8; 32] = seed.as_slice().try_into().expect("seed length checked above");
+    let seed32: [u8; 32] = seed
+        .as_slice()
+        .try_into()
+        .expect("seed length checked above");
     let capability = Capability::sign(ticket, args.scope.clone(), &seed32);
     let cap_b64 = base64::engine::general_purpose::STANDARD.encode(capability.encode());
 
@@ -145,7 +148,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("signing/issuer pubkey: {pub_hex}");
     eprintln!("  (must equal the app's relayConfigSigningKey AND the relay's --issuer-pubkey)");
     eprintln!("relay:   {}", args.relay);
-    eprintln!("scope:   {}", if args.scope.is_empty() { "(any)" } else { &args.scope });
+    eprintln!(
+        "scope:   {}",
+        if args.scope.is_empty() {
+            "(any)"
+        } else {
+            &args.scope
+        }
+    );
     eprintln!("expires: {exp}  (+{} days)", args.days);
     eprintln!("capability (base64, for DEBUG baking if needed):");
     eprintln!("    {cap_b64}");

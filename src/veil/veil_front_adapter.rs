@@ -432,7 +432,7 @@ fn parse_capability(capability_b64: &str) -> Result<Capability, ObfuscatorError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use construct_veil_protocol::ticket::{AuthKey, Ticket, AUTH_KEY_LEN, TICKET_ID_LEN};
+    use construct_veil_protocol::ticket::{AUTH_KEY_LEN, AuthKey, TICKET_ID_LEN, Ticket};
 
     /// Live latency breakdown against the production relay. Requires the matching
     /// debug ticket in the relay's tickets.json. Ignored by default; run with:

@@ -46,8 +46,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use subtle::ConstantTimeEq;
 
-use crate::auth::{AuthRecord, AUTHCODE_LEN};
-use crate::ticket::{AuthKey, Ticket, AUTH_KEY_LEN, TICKET_ID_LEN};
+use crate::auth::{AUTHCODE_LEN, AuthRecord};
+use crate::ticket::{AUTH_KEY_LEN, AuthKey, TICKET_ID_LEN, Ticket};
 
 /// Length of an Ed25519 signature in bytes.
 pub const CAP_SIG_LEN: usize = 64;
@@ -108,7 +108,8 @@ impl Capability {
             Err(_) => return false,
         };
         let msg = Self::signing_message(&self.ticket, &self.scope);
-        vk.verify_strict(&msg, &Signature::from_bytes(&self.sig)).is_ok()
+        vk.verify_strict(&msg, &Signature::from_bytes(&self.sig))
+            .is_ok()
     }
 
     /// Whether the capability's validity window contains `now_secs`.
@@ -283,7 +284,9 @@ mod tests {
     fn wrong_pubkey_rejected() {
         let (seed, _) = issuer_keypair();
         let cap = Capability::sign(make_ticket(), "default".into(), &seed);
-        let other_pk = SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
+        let other_pk = SigningKey::from_bytes(&[9u8; 32])
+            .verifying_key()
+            .to_bytes();
         assert!(!cap.verify_signature(&other_pk));
     }
 
@@ -310,7 +313,10 @@ mod tests {
         let blob = cap.encode();
         let decoded = Capability::decode_slice(&blob).expect("decode");
         assert_eq!(decoded.ticket.ticket_id, cap.ticket.ticket_id);
-        assert_eq!(decoded.ticket.auth_key.as_bytes(), cap.ticket.auth_key.as_bytes());
+        assert_eq!(
+            decoded.ticket.auth_key.as_bytes(),
+            cap.ticket.auth_key.as_bytes()
+        );
         assert_eq!(decoded.ticket.not_after, cap.ticket.not_after);
         assert_eq!(decoded.scope, "ru-relay");
         assert_eq!(decoded.sig, cap.sig);

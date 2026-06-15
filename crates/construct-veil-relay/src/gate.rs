@@ -256,7 +256,7 @@ impl GateDecision {
 mod tests {
     use super::*;
     use construct_veil_protocol::ticket::{AuthKey, Ticket};
-    use construct_veil_protocol::{issuer_public_key, AuthRecordV2, Capability, Frame};
+    use construct_veil_protocol::{AuthRecordV2, Capability, Frame, issuer_public_key};
     use tokio_util::codec::Encoder;
 
     const SEED: [u8; 32] = [7u8; 32];

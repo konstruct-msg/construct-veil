@@ -134,15 +134,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The relay validates each presented capability's Ed25519 signature against
     // this key, offline. No ticket store, no sync, no secrets at rest.
     let issuer_pubkey: [u8; 32] = {
-        let hex_key = args.issuer_pubkey.as_ref().ok_or(
-            "--issuer-pubkey is required (home-server Ed25519 public key, 64 hex chars)",
-        )?;
-        let bytes = hex::decode(hex_key.trim())
-            .map_err(|e| format!("invalid --issuer-pubkey hex: {e}"))?;
-        bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| format!("--issuer-pubkey must be 32 bytes (64 hex chars), got {}", bytes.len()))?
+        let hex_key = args
+            .issuer_pubkey
+            .as_ref()
+            .ok_or("--issuer-pubkey is required (home-server Ed25519 public key, 64 hex chars)")?;
+        let bytes =
+            hex::decode(hex_key.trim()).map_err(|e| format!("invalid --issuer-pubkey hex: {e}"))?;
+        bytes.as_slice().try_into().map_err(|_| {
+            format!(
+                "--issuer-pubkey must be 32 bytes (64 hex chars), got {}",
+                bytes.len()
+            )
+        })?
     };
     let relay_scope: Arc<str> = Arc::from(args.relay_scope.as_str());
 
@@ -194,10 +197,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     info!("║  spki       {}", relay_tls.spki_hex);
-    info!("║  issuer     {} (pubkey pfx)", hex::encode(&issuer_pubkey[..6]));
+    info!(
+        "║  issuer     {} (pubkey pfx)",
+        hex::encode(&issuer_pubkey[..6])
+    );
     info!(
         "║  scope      {}",
-        if relay_scope.is_empty() { "(any)" } else { &relay_scope }
+        if relay_scope.is_empty() {
+            "(any)"
+        } else {
+            &relay_scope
+        }
     );
     info!("╚══════════════════════════════════════════════════════════");
 
@@ -235,8 +245,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let scope = Arc::clone(&relay_scope);
 
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(tcp, peer, acceptor, &issuer_pubkey, &scope, &backend, dialer, &site).await
+            if let Err(e) = handle_connection(
+                tcp,
+                peer,
+                acceptor,
+                &issuer_pubkey,
+                &scope,
+                &backend,
+                dialer,
+                &site,
+            )
+            .await
             {
                 warn!(peer = %peer, error = %e, "connection handler error");
             }

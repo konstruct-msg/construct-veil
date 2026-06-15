@@ -128,7 +128,12 @@ where
     // client → backend: de-frame DATA, drop CHAFF.
     let up = deframe_client_to_backend(client_rd, leftover, backend_wr, up_bytes.clone());
     // backend → client: wrap raw bytes in DATA frames.
-    let down = frame_backend_to_client(backend_rd, client_wr, down_bytes.clone(), chaff_bytes.clone());
+    let down = frame_backend_to_client(
+        backend_rd,
+        client_wr,
+        down_bytes.clone(),
+        chaff_bytes.clone(),
+    );
 
     let result = tokio::try_join!(up, down);
     progress.abort();
