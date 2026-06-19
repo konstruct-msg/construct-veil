@@ -26,7 +26,7 @@ use crate::veil::fsm::{
     MethodId, MethodSet, NetworkFingerprint, ProbeFailureReason, TransportFailureKind, VeilConfig,
     VeilEffect, VeilEvent, VeilState, reduce,
 };
-use crate::veil::obfuscator::{Obfuscator, ObfuscatorError, ProbeRequest};
+use crate::veil::obfuscator::{Obfuscator, ObfuscatorError, ProbeRequest, VeilFrontAuthV3};
 use crate::veil::scoring::{CachedScoreLookup, PersistentScores};
 
 /// Result of a single probe attempt.
@@ -112,6 +112,7 @@ impl VeilCoordinator {
         host_header: String,
         wt_base_path: String,
         veil_front_ticket_b64: String,
+        veil_front_auth_v3: VeilFrontAuthV3,
     ) -> Result<CoordinatorStartResult, CoordinatorError> {
         let start_time = Instant::now();
         let mut state = VeilState::Idle;
@@ -194,6 +195,7 @@ impl VeilCoordinator {
                     &host_header,
                     &wt_base_path,
                     &veil_front_ticket_b64,
+                    &veil_front_auth_v3,
                     start_time,
                 )
                 .await?;
@@ -252,6 +254,7 @@ impl VeilCoordinator {
             String::new(),
             String::new(),
             String::new(),
+            VeilFrontAuthV3::default(),
         )
         .await
     }
@@ -271,6 +274,7 @@ impl VeilCoordinator {
         host_header: &str,
         wt_base_path: &str,
         veil_front_ticket_b64: &str,
+        veil_front_auth_v3: &VeilFrontAuthV3,
         _start_time: Instant,
     ) -> Result<(), CoordinatorError> {
         match effect {
@@ -296,6 +300,7 @@ impl VeilCoordinator {
                         host_header,
                         wt_base_path,
                         veil_front_ticket_b64,
+                        veil_front_auth_v3,
                     )
                     .await?;
                 } else {
@@ -312,6 +317,7 @@ impl VeilCoordinator {
                         host_header,
                         wt_base_path,
                         veil_front_ticket_b64,
+                        veil_front_auth_v3,
                     )
                     .await?;
                 }
@@ -376,6 +382,7 @@ impl VeilCoordinator {
         host_header: &str,
         wt_base_path: &str,
         veil_front_ticket_b64: &str,
+        veil_front_auth_v3: &VeilFrontAuthV3,
     ) -> Result<(), CoordinatorError> {
         for &method in methods {
             let probe_start = Instant::now();
@@ -390,6 +397,7 @@ impl VeilCoordinator {
                     host_header,
                     wt_base_path,
                     veil_front_ticket_b64,
+                    veil_front_auth_v3,
                 )
                 .await;
 
@@ -405,6 +413,7 @@ impl VeilCoordinator {
                         tls_sni,
                         spki_hex,
                         veil_front_ticket_b64,
+                        veil_front_auth_v3,
                         state,
                         scores_cache,
                     )
@@ -452,6 +461,7 @@ impl VeilCoordinator {
         host_header: &str,
         wt_base_path: &str,
         veil_front_ticket_b64: &str,
+        veil_front_auth_v3: &VeilFrontAuthV3,
     ) -> Result<(), CoordinatorError> {
         let num_probes = methods.len();
         let (tx, mut rx) = mpsc::channel::<ProbeResult>(num_probes);
@@ -470,6 +480,7 @@ impl VeilCoordinator {
             let host_header_str = host_header.to_owned();
             let wt_base_path_str = wt_base_path.to_owned();
             let veil_front_ticket_b64_str = veil_front_ticket_b64.to_owned();
+            let veil_front_auth_v3_owned = veil_front_auth_v3.clone();
             let probe_timeout = self.config.probe_timeout;
             let obfuscator = self.obfuscators.get(&method);
             let has_obfuscator = obfuscator.is_some();
@@ -519,6 +530,7 @@ impl VeilCoordinator {
                     host_header: host_header_str,
                     wt_base_path: wt_base_path_str,
                     veil_front_ticket_b64: veil_front_ticket_b64_str,
+                    auth_v3: veil_front_auth_v3_owned,
                 };
 
                 let handle = match obf.start(&req, cancel.clone()).await {
@@ -680,6 +692,7 @@ impl VeilCoordinator {
                 tls_sni: tls_sni.to_owned(),
                 spki_hex: spki_hex.to_owned(),
                 veil_front_ticket_b64: veil_front_ticket_b64.to_owned(),
+                veil_front_auth_v3: veil_front_auth_v3.clone(),
             };
 
             {
@@ -745,6 +758,7 @@ impl VeilCoordinator {
         tls_sni: &str,
         spki_hex: &str,
         veil_front_ticket_b64: &str,
+        veil_front_auth_v3: &VeilFrontAuthV3,
         state: &mut VeilState,
         scores_cache: &CachedScoreLookup,
     ) -> Result<(), CoordinatorError> {
@@ -807,6 +821,7 @@ impl VeilCoordinator {
             tls_sni: tls_sni.to_owned(),
             spki_hex: spki_hex.to_owned(),
             veil_front_ticket_b64: veil_front_ticket_b64.to_owned(),
+            veil_front_auth_v3: veil_front_auth_v3.clone(),
         };
 
         {
@@ -909,6 +924,7 @@ impl VeilCoordinator {
         host_header: &str,
         wt_base_path: &str,
         veil_front_ticket_b64: &str,
+        veil_front_auth_v3: &VeilFrontAuthV3,
     ) -> Result<(), ProbeFailureReason> {
         let obfuscator = match self.obfuscators.get(&method) {
             Some(o) => o.clone(),
@@ -923,6 +939,7 @@ impl VeilCoordinator {
             host_header: host_header.to_owned(),
             wt_base_path: wt_base_path.to_owned(),
             veil_front_ticket_b64: veil_front_ticket_b64.to_owned(),
+            auth_v3: veil_front_auth_v3.clone(),
         };
         let cancel = CancellationToken::new();
 
@@ -993,9 +1010,12 @@ struct ProxyParams {
     /// SPKI hex pin (TLS-wrapped methods). Read only by the veil-front (utls) path.
     #[cfg_attr(not(feature = "utls"), allow(dead_code))]
     spki_hex: String,
-    /// Base64-encoded veil-front ticket. Empty for non-veil-front methods.
+    /// Base64-encoded veil-front ticket (AUTH v2). Empty for non-veil-front methods.
     #[cfg_attr(not(feature = "utls"), allow(dead_code))]
     veil_front_ticket_b64: String,
+    /// AUTH v3 (key-bound capability) params. Read only by the veil-front path.
+    #[cfg_attr(not(feature = "utls"), allow(dead_code))]
+    veil_front_auth_v3: VeilFrontAuthV3,
 }
 
 /// Run the proxy loop: accept local connections and forward through the winning
@@ -1034,6 +1054,7 @@ async fn handle_proxy_connection(local: TcpStream, params: ProxyParams) {
                 &params.tls_sni,
                 &params.spki_hex,
                 &params.veil_front_ticket_b64,
+                &params.veil_front_auth_v3,
             )
             .await
             {

@@ -91,6 +91,21 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for ObfuscatorError {
     }
 }
 
+/// VeilFront AUTH v3 (key-bound capability, ticket B1) parameters.
+///
+/// Both fields empty means "not configured" — the veil-front adapter falls back
+/// to the existing AUTH v2 bearer ticket (`ProbeRequest::veil_front_ticket_b64`).
+/// No flag-day: a build can carry both and the adapter picks v3 whenever it's
+/// present. See `decisions/veil-ticket-provisioning-system.md` (B1).
+#[derive(Clone, Default)]
+pub struct VeilFrontAuthV3 {
+    /// Base64-encoded `CapabilityV2` blob (key-bound capability).
+    pub capability_v2_b64: String,
+    /// Hex-encoded 32-byte Ed25519 `veil_sk` seed. The holder's private key —
+    /// never sent anywhere; used locally to sign the TLS exporter.
+    pub veil_sk_hex: String,
+}
+
 /// Information passed to an obfuscator to start a probe.
 #[derive(Clone, Default)]
 pub struct ProbeRequest {
@@ -106,9 +121,13 @@ pub struct ProbeRequest {
     pub host_header: String,
     /// WebTunnel: WebSocket base path.
     pub wt_base_path: String,
-    /// VeilFront: base64-encoded 65-byte ticket blob.
-    /// Empty string = no ticket (probe will fail, as expected without auth).
+    /// VeilFront: base64-encoded 65-byte ticket blob (AUTH v2, bearer capability).
+    /// Empty string = no ticket (probe will fail, as expected without auth) unless
+    /// `auth_v3` is configured instead.
     pub veil_front_ticket_b64: String,
+    /// VeilFront: AUTH v3 (key-bound capability) parameters. Takes priority over
+    /// `veil_front_ticket_b64` when configured.
+    pub auth_v3: VeilFrontAuthV3,
 }
 
 /// Trait that every obfuscation method must implement.

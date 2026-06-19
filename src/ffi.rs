@@ -975,7 +975,19 @@ pub struct VeilStartRequest {
     /// parsing and the FSM moves on to the other methods. Must be set by
     /// clients that ship veil-front; obfs4 / WebTunnel callers can leave it
     /// NULL. Added in WIRE_VER 3 of the FFI — rebuild Swift/Kotlin bindings.
+    /// Superseded (but not replaced) by `veil_capability_v2_b64` below — ticket
+    /// B1 (`decisions/veil-ticket-provisioning-system.md`); kept as the fallback
+    /// when the v2 fields are NULL/empty, no flag-day.
     pub veil_front_ticket_b64: *const c_char,
+    /// Base64-encoded key-bound `CapabilityV2` blob (ticket B1, AUTH v3). NULL /
+    /// empty = not configured — falls back to `veil_front_ticket_b64` (AUTH v2).
+    /// Must be paired with `veil_sk_hex` below.
+    pub veil_capability_v2_b64: *const c_char,
+    /// Hex-encoded 32-byte Ed25519 `veil_sk` seed — the device/relay's own
+    /// access keypair, generated and stored locally by the caller (Keychain on
+    /// iOS). Never derived from or sent to the relay. NULL / empty = AUTH v3 not
+    /// configured.
+    pub veil_sk_hex: *const c_char,
 }
 
 /// Result struct returned by `veil_start`.
@@ -1057,6 +1069,24 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
             .and_then(|p| CStr::from_ptr(p).to_str().ok())
             .unwrap_or("")
             .to_owned()
+    };
+    let veil_capability_v2_b64 = unsafe {
+        req.veil_capability_v2_b64
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let veil_sk_hex = unsafe {
+        req.veil_sk_hex
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let veil_front_auth_v3 = crate::veil::VeilFrontAuthV3 {
+        capability_v2_b64: veil_capability_v2_b64,
+        veil_sk_hex,
     };
     let fingerprint = if !req.network_fingerprint.is_null() && req.network_fingerprint_len > 0 {
         let bytes = unsafe {
@@ -1145,6 +1175,7 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
                 host_header,
                 wt_base_path,
                 veil_front_ticket_b64,
+                veil_front_auth_v3,
             )
             .await;
 

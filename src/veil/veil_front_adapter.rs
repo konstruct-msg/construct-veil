@@ -21,12 +21,15 @@ use tokio_util::codec::{Decoder, Encoder};
 use tokio_util::sync::CancellationToken;
 
 use crate::veil::fsm::MethodId;
-use crate::veil::obfuscator::{Obfuscator, ObfuscatorError, ObfuscatorHandle, ProbeRequest};
+use crate::veil::obfuscator::{
+    Obfuscator, ObfuscatorError, ObfuscatorHandle, ProbeRequest, VeilFrontAuthV3,
+};
 use crate::veil::veil_front::WriteStrategy;
 use construct_veil_protocol::{
-    AuthRecordV2, Capability, EXPORTER_LABEL, EXPORTER_LEN, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA,
-    Frame, LENGTH_BUCKETS, VeilFrontCodec,
+    AuthRecordV2, AuthRecordV3, Capability, CapabilityV2, EXPORTER_LABEL, EXPORTER_LEN,
+    FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, Frame, LENGTH_BUCKETS, VeilFrontCodec,
 };
+use ed25519_dalek::SigningKey;
 
 /// HTTP/2 client connection preface (RFC 7540 §3.5) + an empty SETTINGS frame.
 /// Sent inside the first DATA frame so the h2c backend responds, giving the
@@ -84,6 +87,11 @@ impl Obfuscator for VeilFrontObfuscator {
 
 /// Dial the relay, complete TLS (uTLS + SPKI pin), and send the AUTH frame.
 ///
+/// If `auth_v3` carries a key-bound capability + `veil_sk`, sends AUTH v3 (no
+/// bearer secret ever crosses the wire). Otherwise falls back to the AUTH v2
+/// bearer capability in `capability_b64`. See `decisions/veil-ticket-provisioning-system.md`
+/// (ticket B1) — no flag-day, both paths coexist.
+///
 /// Returns the authenticated TLS stream with the AUTH frame already written and
 /// flushed. The caller drives the tunnel (probe round-trip or data ferry).
 async fn dial_and_authenticate(
@@ -91,6 +99,7 @@ async fn dial_and_authenticate(
     tls_sni: &str,
     spki_hex: &str,
     capability_b64: &str,
+    auth_v3: &VeilFrontAuthV3,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ObfuscatorError> {
     // TCP connect with timeout.
     let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(relay_addr))
@@ -107,24 +116,33 @@ async fn dial_and_authenticate(
 
     // TLS handshake with SPKI pinning.
     let mut tls_stream = dial_utls_tcp(tcp, tls_sni, spki_hex, relay_addr).await?;
-
-    // Parse the base64-encoded backend-signed capability blob.
-    let capability = parse_capability(capability_b64)?;
-
-    // Derive TLS exporter keying material (32 bytes) and build the AUTH v2 record:
-    // the signed capability + HMAC(auth_key, exporter || ticket_id || not_after).
-    // The relay verifies the issuer signature offline (no ticket store) then the
-    // exporter-bound authcode.
     let exporter = derive_exporter(&tls_stream)?;
-    let auth = AuthRecordV2::from_capability(&capability, &exporter);
 
-    // Send the AUTH v2 frame as the first application record, encoded with the SAME
-    // wire codec the relay's gate decodes with (`Frame::auth_v2`, type 0x03):
-    // `WIRE_VER || type || payload_len || pad_len || (capability || authcode)`.
+    let auth_frame_payload =
+        if !auth_v3.capability_v2_b64.is_empty() && !auth_v3.veil_sk_hex.is_empty() {
+            // AUTH v3: key-bound capability + client signature over the exporter.
+            // The relay never learns a reusable secret (only a public key and a
+            // signature bound to this TLS session).
+            let capability = parse_capability_v2(&auth_v3.capability_v2_b64)?;
+            let veil_sk = parse_veil_sk(&auth_v3.veil_sk_hex)?;
+            let auth = AuthRecordV3::from_capability(&capability, &veil_sk, &exporter);
+            Frame::auth_v3(auth.encode_payload())
+        } else {
+            // AUTH v2: backend-signed bearer capability + HMAC(auth_key, exporter
+            // || ticket_id || not_after). The relay verifies the issuer signature
+            // offline (no ticket store) then the exporter-bound authcode.
+            let capability = parse_capability(capability_b64)?;
+            let auth = AuthRecordV2::from_capability(&capability, &exporter);
+            Frame::auth_v2(auth.encode_payload())
+        };
+
+    // Send the AUTH frame as the first application record, encoded with the SAME
+    // wire codec the relay's gate decodes with:
+    // `WIRE_VER || type || payload_len || pad_len || payload`.
     let mut auth_frame = BytesMut::new();
     VeilFrontCodec::default()
         .with_buckets(LENGTH_BUCKETS)
-        .encode(Frame::auth_v2(auth.encode_payload()), &mut auth_frame)
+        .encode(auth_frame_payload, &mut auth_frame)
         .map_err(ObfuscatorError::Io)?;
     tls_stream
         .write_all(&auth_frame)
@@ -149,6 +167,7 @@ async fn probe_veil_front(req: &ProbeRequest) -> Result<(), ObfuscatorError> {
         &req.tls_sni,
         &req.spki_hex,
         &req.veil_front_ticket_b64,
+        &req.auth_v3,
     )
     .await?;
 
@@ -233,8 +252,10 @@ pub async fn run_veil_front_ferry_with_metrics(
     tls_sni: &str,
     spki_hex: &str,
     ticket_b64: &str,
+    auth_v3: &VeilFrontAuthV3,
 ) -> Result<WriteStrategy, ObfuscatorError> {
-    let tls_stream = dial_and_authenticate(relay_addr, tls_sni, spki_hex, ticket_b64).await?;
+    let tls_stream =
+        dial_and_authenticate(relay_addr, tls_sni, spki_hex, ticket_b64, auth_v3).await?;
 
     let (relay_rd, relay_wr) = tokio::io::split(tls_stream);
     let (local_rd, local_wr) = tokio::io::split(local);
@@ -348,9 +369,12 @@ pub async fn run_veil_front_ferry(
     tls_sni: &str,
     spki_hex: &str,
     ticket_b64: &str,
+    auth_v3: &VeilFrontAuthV3,
 ) -> Result<(), ObfuscatorError> {
-    let _ =
-        run_veil_front_ferry_with_metrics(local, relay_addr, tls_sni, spki_hex, ticket_b64).await?;
+    let _ = run_veil_front_ferry_with_metrics(
+        local, relay_addr, tls_sni, spki_hex, ticket_b64, auth_v3,
+    )
+    .await?;
     Ok(())
 }
 
@@ -426,9 +450,36 @@ fn parse_capability(capability_b64: &str) -> Result<Capability, ObfuscatorError>
     })
 }
 
+/// Parse a base64-encoded `CapabilityV2` blob (AUTH v3, ticket B1).
+fn parse_capability_v2(capability_v2_b64: &str) -> Result<CapabilityV2, ObfuscatorError> {
+    let raw = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        capability_v2_b64,
+    )
+    .map_err(|e| ObfuscatorError::Handshake(format!("capability_v2 base64 decode: {e}")))?;
+
+    CapabilityV2::decode_slice(&raw).ok_or_else(|| {
+        ObfuscatorError::Handshake(format!(
+            "invalid capability_v2: malformed blob ({} bytes)",
+            raw.len()
+        ))
+    })
+}
+
+/// Parse a hex-encoded 32-byte Ed25519 `veil_sk` seed.
+fn parse_veil_sk(veil_sk_hex: &str) -> Result<SigningKey, ObfuscatorError> {
+    let raw = hex::decode(veil_sk_hex)
+        .map_err(|e| ObfuscatorError::Handshake(format!("veil_sk hex decode: {e}")))?;
+    let seed: [u8; 32] = raw.try_into().map_err(|v: Vec<u8>| {
+        ObfuscatorError::Handshake(format!("veil_sk must be 32 bytes, got {}", v.len()))
+    })?;
+    Ok(SigningKey::from_bytes(&seed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use construct_veil_protocol::ROLE_USER;
     use construct_veil_protocol::ticket::{AUTH_KEY_LEN, AuthKey, TICKET_ID_LEN, Ticket};
 
     /// Live latency breakdown against the production relay. Requires the matching
@@ -475,12 +526,14 @@ mod tests {
                 host_header: "api.divany-kresla.uk".into(),
                 wt_base_path: "/api/stream".into(),
                 veil_front_ticket_b64: ticket,
+                auth_v3: VeilFrontAuthV3::default(),
             };
 
             for i in 1..=3 {
                 let t0 = std::time::Instant::now();
                 let tls = dial_and_authenticate(
                     &req.relay_addr, &req.tls_sni, &req.spki_hex, &req.veil_front_ticket_b64,
+                    &req.auth_v3,
                 ).await.expect("dial+auth");
                 let t_auth = t0.elapsed();
 
@@ -555,7 +608,10 @@ mod tests {
             let t = ticket.clone();
             tokio::spawn(async move {
                 let (sock, _) = listener.accept().await.unwrap();
-                if let Err(e) = run_veil_front_ferry(sock, &relay, &sni, &spki, &t).await {
+                if let Err(e) =
+                    run_veil_front_ferry(sock, &relay, &sni, &spki, &t, &VeilFrontAuthV3::default())
+                        .await
+                {
                     eprintln!("ferry ended: {e:?}");
                 }
             });
@@ -803,5 +859,77 @@ mod tests {
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
         let err = parse_capability(&b64).unwrap_err();
         assert!(matches!(err, ObfuscatorError::Handshake(_)));
+    }
+
+    /// Build a base64 `CapabilityV2` blob + matching hex `veil_sk`, signed by a
+    /// fixed test issuer seed.
+    fn test_auth_v3() -> VeilFrontAuthV3 {
+        let veil_sk = SigningKey::from_bytes(&[3u8; 32]);
+        let veil_pk = veil_sk.verifying_key().to_bytes();
+        let cap = CapabilityV2::sign(
+            [0xAB; TICKET_ID_LEN],
+            veil_pk,
+            ROLE_USER,
+            1_000_000,
+            1_000_000 + 6 * 3600,
+            0x01,
+            "test".into(),
+            &[7u8; 32],
+        );
+        VeilFrontAuthV3 {
+            capability_v2_b64: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                cap.encode(),
+            ),
+            veil_sk_hex: hex::encode(veil_sk.to_bytes()),
+        }
+    }
+
+    #[test]
+    fn parse_capability_v2_from_base64() {
+        let auth_v3 = test_auth_v3();
+        let parsed = parse_capability_v2(&auth_v3.capability_v2_b64).expect("parse should succeed");
+        assert_eq!(parsed.ticket_id, [0xAB; TICKET_ID_LEN]);
+        assert_eq!(parsed.role, ROLE_USER);
+        assert_eq!(parsed.scope, "test");
+        let pubkey = construct_veil_protocol::issuer_public_key(&[7u8; 32]);
+        assert!(parsed.verify_signature(&pubkey));
+    }
+
+    #[test]
+    fn parse_veil_sk_from_hex() {
+        let auth_v3 = test_auth_v3();
+        let sk = parse_veil_sk(&auth_v3.veil_sk_hex).expect("parse should succeed");
+        assert_eq!(sk.to_bytes(), [3u8; 32]);
+    }
+
+    #[test]
+    fn parse_veil_sk_wrong_length() {
+        let err = parse_veil_sk("aabb").unwrap_err();
+        assert!(matches!(err, ObfuscatorError::Handshake(_)));
+    }
+
+    #[test]
+    fn parse_veil_sk_invalid_hex() {
+        let err = parse_veil_sk("not-hex!!").unwrap_err();
+        assert!(matches!(err, ObfuscatorError::Handshake(_)));
+    }
+
+    /// End-to-end (offline): building an AUTH v3 record from a `VeilFrontAuthV3`
+    /// round-trips through encode/decode and verifies against the issuer pubkey +
+    /// a TLS exporter, exactly as the relay gate would.
+    #[test]
+    fn auth_v3_record_from_parsed_auth_v3_verifies() {
+        let auth_v3 = test_auth_v3();
+        let capability = parse_capability_v2(&auth_v3.capability_v2_b64).unwrap();
+        let veil_sk = parse_veil_sk(&auth_v3.veil_sk_hex).unwrap();
+        let exporter = [0xEEu8; 32];
+
+        let rec = AuthRecordV3::from_capability(&capability, &veil_sk, &exporter);
+        let payload = rec.encode_payload();
+        let decoded = AuthRecordV3::decode_payload(&payload).expect("decode");
+
+        let pubkey = construct_veil_protocol::issuer_public_key(&[7u8; 32]);
+        assert!(decoded.verify(&pubkey, ROLE_USER, &exporter, 1_000_000 + 60));
     }
 }

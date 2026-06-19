@@ -409,6 +409,7 @@ dependencies = [
  "criterion",
  "crypto_secretbox",
  "curve25519-elligator2",
+ "ed25519-dalek",
  "h2",
  "hex",
  "hkdf",
