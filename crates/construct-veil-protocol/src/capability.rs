@@ -928,4 +928,25 @@ mod golden {
         );
         assert_eq!(hex::encode(cap.encode()), GOLDEN_BLOB_HEX);
     }
+
+    /// Cross-repo interop anchor for **B1** (`CapabilityV2`). Same role as the B2
+    /// vector above, pinned against the backend's re-implementation. Fixed inputs:
+    /// seed=[7;32], ticket_id=[1;16], veil_pk=[2;32], role=1 (ROLE_RELAY), nb=0,
+    /// na=100, suite=1, scope="ru".
+    const GOLDEN_BLOB_V2_HEX: &str = "010101010101010101010101010101010202020202020202020202020202020202020202020202020202020202020202010000000000000000640000000000000001027275548ee6e76270611644a8c7ac26407d6c9aed69e375472ee445384f0936661d7cdf3c08b88e448aa1d349f8e6f544fb26662bdbdc99ca2c412fdc232cfee49f06";
+
+    #[test]
+    fn capability_v2_blob_matches_golden_vector() {
+        let cap = CapabilityV2::sign(
+            [1u8; TICKET_ID_LEN],
+            [2u8; VEIL_PK_LEN],
+            ROLE_RELAY,
+            0,
+            100,
+            1,
+            "ru".into(),
+            &[7u8; 32],
+        );
+        assert_eq!(hex::encode(cap.encode()), GOLDEN_BLOB_V2_HEX);
+    }
 }
