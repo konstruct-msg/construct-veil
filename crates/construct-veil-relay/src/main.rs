@@ -18,19 +18,23 @@
 //!   --site 127.0.0.1:8080
 //! ```
 
+mod chain;
 mod gate;
 mod site;
 mod tls;
 mod tunnel;
+mod upstream_tls;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
+use ed25519_dalek::SigningKey;
 use gate::{GateResult, gate_with_exporter};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+use crate::chain::ChainConfig;
 use crate::tls::RelayTls;
 
 /// Veil-front relay CLI arguments.
@@ -84,6 +88,38 @@ struct Args {
     /// Cover site address (local HTTP server with long-lived H2). Accepts host:port or IP:port.
     #[arg(long, default_value = "127.0.0.1:8080")]
     site: String,
+
+    /// Generate a new Ed25519 `veil_sk`/`veil_pk` keypair for chain relay mode
+    /// and exit, printing the pubkey (hex) to stdout. The private seed is
+    /// written to `--chain-veil-sk-file` (created with 0600 perms) and never
+    /// printed. See decisions/veil-ticket-provisioning-system.md (B1).
+    #[arg(long, default_value_t = false)]
+    generate_relay_keypair: bool,
+
+    /// Chain relay mode: upstream (`relay_clean`) address, host:port. When set
+    /// (together with the other --chain-* flags), validated client tunnels are
+    /// not forwarded to a local backend — they are ferried through this
+    /// upstream relay instead. See decisions/veil-relay-topology.md §3.
+    #[arg(long)]
+    chain_upstream_addr: Option<String>,
+
+    /// Chain relay mode: TLS SNI to present to the upstream relay.
+    #[arg(long)]
+    chain_upstream_sni: Option<String>,
+
+    /// Chain relay mode: SPKI pin (hex) of the upstream relay's certificate.
+    #[arg(long)]
+    chain_upstream_spki: Option<String>,
+
+    /// Chain relay mode: path to this relay's `ROLE_RELAY` capability
+    /// (base64 `CapabilityV2` blob, issued by the upstream's home-server).
+    #[arg(long)]
+    chain_capability_file: Option<String>,
+
+    /// Chain relay mode: path to this relay's `veil_sk` seed file (32 raw
+    /// bytes or hex — see `--generate-relay-keypair`). Never logged.
+    #[arg(long)]
+    chain_veil_sk_file: Option<String>,
 }
 
 /// How the relay connects to the backend after authenticating a tunnel.
@@ -115,6 +151,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+
+    // ── Relay keypair generation (chain relay mode bootstrap) ──────────────
+    // Operator-run, one-off: generates the keypair locally so the private
+    // seed never leaves this box, prints only the pubkey, then exits.
+    if args.generate_relay_keypair {
+        let sk_path = args
+            .chain_veil_sk_file
+            .as_ref()
+            .ok_or("--generate-relay-keypair requires --chain-veil-sk-file")?;
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+        let sk = SigningKey::from_bytes(&seed);
+        std::fs::write(sk_path, hex::encode(sk.to_bytes()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(sk_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        println!("veil_pk: {}", hex::encode(sk.verifying_key().to_bytes()));
+        println!(
+            "veil_sk written to {sk_path} (0600) — send the pubkey above to the upstream's admin for capability issuance, the seed never leaves this box"
+        );
+        return Ok(());
+    }
+
+    // ── Chain relay mode config (optional) ──────────────────────────────────
+    let chain_config = match (
+        &args.chain_upstream_addr,
+        &args.chain_upstream_sni,
+        &args.chain_upstream_spki,
+        &args.chain_capability_file,
+        &args.chain_veil_sk_file,
+    ) {
+        (Some(addr), Some(sni), Some(spki), Some(cap_file), Some(sk_file)) => {
+            let capability_v2_b64 = std::fs::read_to_string(cap_file)
+                .map_err(|e| format!("reading --chain-capability-file: {e}"))?
+                .trim()
+                .to_string();
+            let sk_hex = std::fs::read_to_string(sk_file)
+                .map_err(|e| format!("reading --chain-veil-sk-file: {e}"))?
+                .trim()
+                .to_string();
+            let sk_bytes = hex::decode(&sk_hex).map_err(|e| format!("veil_sk hex: {e}"))?;
+            let seed: [u8; 32] = sk_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| "veil_sk must be 32 bytes".to_string())?;
+            info!("Chain relay mode ENABLED — upstream {addr} (SNI {sni})");
+            Some(Arc::new(ChainConfig {
+                upstream_addr: addr.clone(),
+                upstream_sni: sni.clone(),
+                upstream_spki_hex: spki.clone(),
+                capability_v2_b64,
+                veil_sk: SigningKey::from_bytes(&seed),
+            }))
+        }
+        (None, None, None, None, None) => None,
+        _ => {
+            return Err(
+                "chain relay mode requires ALL of --chain-upstream-addr, --chain-upstream-sni, \
+                 --chain-upstream-spki, --chain-capability-file, --chain-veil-sk-file"
+                    .into(),
+            );
+        }
+    };
 
     // ── TLS setup ──────────────────────────────────────────────────────────
 
@@ -243,6 +344,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let backend = Arc::clone(&backend);
         let site = Arc::clone(&site);
         let scope = Arc::clone(&relay_scope);
+        let chain_config = chain_config.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(
@@ -254,6 +356,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &backend,
                 dialer,
                 &site,
+                chain_config,
             )
             .await
             {
@@ -274,6 +377,7 @@ async fn handle_connection(
     backend: &str,
     backend_dialer: BackendDialer,
     site: &str,
+    chain_config: Option<Arc<ChainConfig>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // TLS handshake.
     let tls_stream = acceptor.accept(tcp).await?;
@@ -282,6 +386,14 @@ async fn handle_connection(
     // Run the constant-shape gate (offline capability validation).
     match gate_with_exporter(tls_stream, issuer_pubkey, relay_scope).await {
         Ok(GateResult::Tunnel { stream, leftover }) => {
+            if let Some(cfg) = chain_config {
+                // Chain relay mode — ferry through the upstream relay instead
+                // of a local backend (decisions/veil-relay-topology.md §3).
+                let upstream = chain::dial_upstream(&cfg).await?;
+                chain::forward_chain(stream, leftover, upstream, peer).await?;
+                return Ok(());
+            }
+
             // Valid auth — connect to the backend (plain h2c or TLS+ALPN-h2) and tunnel.
             // `backend` is a host:port string, resolved here (per connection).
             let backend = tokio::net::TcpStream::connect(backend).await?;

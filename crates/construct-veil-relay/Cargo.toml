@@ -63,7 +63,9 @@ serde_json = "1"
 base64 = "0.22"
 hex = "0.4"
 rand = "0.8"
+# Ed25519 — chain relay mode signs its own AUTH v3 record when dialing
+# upstream as a client (decisions/veil-relay-topology.md §3).
+ed25519-dalek = "2"
 
 [dev-dependencies]
 tempfile = "3"
-ed25519-dalek = "2"
