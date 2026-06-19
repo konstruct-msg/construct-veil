@@ -74,3 +74,11 @@ pub const FRAME_TYPE_CHAFF: u8 = 0x02;
 /// Distinct type from `FRAME_TYPE_AUTH` so the cutover is clean: an old relay sees
 /// 0x03 as an unknown frame and rejects it. See `capability` module + ticket ADR B2.
 pub const FRAME_TYPE_AUTH_V2: u8 = 0x03;
+
+/// Frame type: AUTH v3 — carries a key-bound `CapabilityV2` (binds a `veil_pk`,
+/// no bearer `auth_key`) plus a client-side Ed25519 signature over the TLS
+/// exporter. The relay learns no reusable secret — neither a user nor a
+/// chaining relay can be impersonated by replaying a captured AUTH v3 record.
+/// Coexists with `FRAME_TYPE_AUTH_V2` (no flag-day); v2 retires once all live
+/// capabilities have rolled over. See `capability` module + ticket ADR B1.
+pub const FRAME_TYPE_AUTH_V3: u8 = 0x04;

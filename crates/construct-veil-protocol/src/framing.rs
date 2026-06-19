@@ -36,7 +36,10 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::varint::{decode_varint, encode_varint};
-use crate::{FRAME_TYPE_AUTH, FRAME_TYPE_AUTH_V2, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, WIRE_VER};
+use crate::{
+    FRAME_TYPE_AUTH, FRAME_TYPE_AUTH_V2, FRAME_TYPE_AUTH_V3, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA,
+    WIRE_VER,
+};
 
 /// Default maximum frame payload size (1 MiB).
 const DEFAULT_MAX_PAYLOAD: usize = 1024 * 1024;
@@ -168,6 +171,16 @@ impl Frame {
         }
     }
 
+    /// Create an AUTH v3 frame carrying a key-bound capability + client signature.
+    ///
+    /// The payload is `capability_v2_blob || client_sig[64]` (see `AuthRecordV3`).
+    pub fn auth_v3(payload: Bytes) -> Self {
+        Self {
+            frame_type: FRAME_TYPE_AUTH_V3,
+            payload,
+        }
+    }
+
     /// Check if this is an AUTH frame.
     pub fn is_auth(&self) -> bool {
         self.frame_type == FRAME_TYPE_AUTH
@@ -176,6 +189,11 @@ impl Frame {
     /// Check if this is an AUTH v2 (capability) frame.
     pub fn is_auth_v2(&self) -> bool {
         self.frame_type == FRAME_TYPE_AUTH_V2
+    }
+
+    /// Check if this is an AUTH v3 (key-bound capability) frame.
+    pub fn is_auth_v3(&self) -> bool {
+        self.frame_type == FRAME_TYPE_AUTH_V3
     }
 
     /// Check if this is a DATA frame.
@@ -521,6 +539,12 @@ mod tests {
 
         assert!(Frame::auth(Bytes::new()).is_auth());
         assert!(Frame::chaff(Bytes::new()).is_chaff());
+
+        assert!(Frame::auth_v2(Bytes::new()).is_auth_v2());
+        assert!(!Frame::auth_v2(Bytes::new()).is_auth_v3());
+
+        assert!(Frame::auth_v3(Bytes::new()).is_auth_v3());
+        assert!(!Frame::auth_v3(Bytes::new()).is_auth_v2());
     }
 
     #[test]
