@@ -467,6 +467,7 @@ dependencies = [
  "chrono",
  "clap",
  "construct-veil-protocol",
+ "ed25519-dalek",
  "h2",
  "hex",
  "hmac",

@@ -24,7 +24,9 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::BytesMut;
-use construct_veil_protocol::{AuthRecordV2, EXPORTER_LABEL, VeilFrontCodec};
+use construct_veil_protocol::{
+    AuthRecordV2, AuthRecordV3, EXPORTER_LABEL, ROLE_USER, VeilFrontCodec,
+};
 use tokio::io::AsyncReadExt;
 use tokio_rustls::server::TlsStream;
 use tokio_util::codec::Decoder;
@@ -197,20 +199,52 @@ fn try_decode_auth(
             if scope_ok && rec.verify(issuer_pubkey, exporter, now_unix()) {
                 debug!(
                     ticket_id = ?hex::encode(rec.capability.ticket.ticket_id),
-                    "capability valid, routing to tunnel"
+                    "capability (v2) valid, routing to tunnel"
                 );
                 Some(GateDecision::Tunnel {
                     leftover: decode_buf,
                 })
             } else {
-                debug!("capability invalid (sig/expiry/scope/authcode), routing to site");
+                debug!("capability (v2) invalid (sig/expiry/scope/authcode), routing to site");
+                Some(GateDecision::Site)
+            }
+        }
+        Ok(Some(frame)) if frame.is_auth_v3() => {
+            // Parse the key-bound capability + client signature from the frame payload.
+            let Some(rec) = AuthRecordV3::decode_payload(&frame.payload) else {
+                debug!("malformed AUTH v3 payload, routing to site");
+                return Some(GateDecision::Site);
+            };
+
+            // Scope gate: empty cap scope or empty relay scope = wildcard.
+            let scope_ok = rec.capability.scope.is_empty()
+                || relay_scope.is_empty()
+                || rec.capability.scope == relay_scope;
+
+            // This listener is client-facing only — chaining relays authenticate
+            // on a separate upstream-facing listener with ROLE_RELAY (not yet
+            // built, see decisions/veil-relay-topology.md §3/§4). Offline
+            // validation: issuer signature + role + validity window + a client
+            // signature over the exporter — no shared secret is ever presented.
+            if scope_ok && rec.verify(issuer_pubkey, ROLE_USER, exporter, now_unix()) {
+                debug!(
+                    ticket_id = ?hex::encode(rec.capability.ticket_id),
+                    "capability (v3) valid, routing to tunnel"
+                );
+                Some(GateDecision::Tunnel {
+                    leftover: decode_buf,
+                })
+            } else {
+                debug!(
+                    "capability (v3) invalid (sig/role/expiry/scope/client_sig), routing to site"
+                );
                 Some(GateDecision::Site)
             }
         }
         Ok(Some(frame)) => {
             debug!(
                 frame_type = frame.frame_type,
-                "non-auth-v2 frame, routing to site"
+                "non-auth frame, routing to site"
             );
             Some(GateDecision::Site)
         }
@@ -256,7 +290,11 @@ impl GateDecision {
 mod tests {
     use super::*;
     use construct_veil_protocol::ticket::{AuthKey, Ticket};
-    use construct_veil_protocol::{AuthRecordV2, Capability, Frame, issuer_public_key};
+    use construct_veil_protocol::{
+        AuthRecordV2, AuthRecordV3, Capability, CapabilityV2, Frame, ROLE_RELAY, ROLE_USER,
+        issuer_public_key,
+    };
+    use ed25519_dalek::SigningKey;
     use tokio_util::codec::Encoder;
 
     const SEED: [u8; 32] = [7u8; 32];
@@ -276,6 +314,28 @@ mod tests {
         let mut buf = BytesMut::new();
         VeilFrontCodec::default()
             .encode(Frame::auth_v2(rec.encode_payload()), &mut buf)
+            .unwrap();
+        buf
+    }
+
+    /// Build a wire buffer holding one AUTH v3 frame for `scope`/`role`, signed by SEED.
+    fn auth_v3_buf(scope: &str, role: u8) -> BytesMut {
+        let veil_sk = SigningKey::from_bytes(&[3u8; 32]);
+        let veil_pk = veil_sk.verifying_key().to_bytes();
+        let cap = CapabilityV2::sign(
+            [0x11; 16],
+            veil_pk,
+            role,
+            0,
+            u64::MAX,
+            1,
+            scope.to_string(),
+            &SEED,
+        );
+        let rec = AuthRecordV3::from_capability(&cap, &veil_sk, &EXPORTER);
+        let mut buf = BytesMut::new();
+        VeilFrontCodec::default()
+            .encode(Frame::auth_v3(rec.encode_payload()), &mut buf)
             .unwrap();
         buf
     }
@@ -321,6 +381,50 @@ mod tests {
         let buf = auth_v2_buf("ru-relay");
         let decision = try_decode_auth(&buf, &EXPORTER, &pubkey, "");
         assert!(matches!(decision, Some(GateDecision::Tunnel { .. })));
+    }
+
+    #[test]
+    fn gate_accepts_valid_v3_user_capability() {
+        let pubkey = issuer_public_key(&SEED);
+        let buf = auth_v3_buf("", ROLE_USER);
+        let decision = try_decode_auth(&buf, &EXPORTER, &pubkey, "");
+        assert!(matches!(decision, Some(GateDecision::Tunnel { .. })));
+    }
+
+    #[test]
+    fn gate_rejects_v3_relay_capability_on_client_listener() {
+        // This listener is client-facing only (ROLE_USER) — a relay capability
+        // (ROLE_RELAY), even with a perfectly valid signature, must not tunnel.
+        let pubkey = issuer_public_key(&SEED);
+        let buf = auth_v3_buf("", ROLE_RELAY);
+        let decision = try_decode_auth(&buf, &EXPORTER, &pubkey, "");
+        assert!(matches!(decision, Some(GateDecision::Site)));
+    }
+
+    #[test]
+    fn gate_rejects_v3_wrong_issuer() {
+        let wrong = issuer_public_key(&[9u8; 32]);
+        let buf = auth_v3_buf("", ROLE_USER);
+        let decision = try_decode_auth(&buf, &EXPORTER, &wrong, "");
+        assert!(matches!(decision, Some(GateDecision::Site)));
+    }
+
+    #[test]
+    fn gate_rejects_v3_wrong_exporter() {
+        let pubkey = issuer_public_key(&SEED);
+        let buf = auth_v3_buf("", ROLE_USER);
+        let mut other = EXPORTER;
+        other[0] ^= 0x01;
+        let decision = try_decode_auth(&buf, &other, &pubkey, "");
+        assert!(matches!(decision, Some(GateDecision::Site)));
+    }
+
+    #[test]
+    fn gate_rejects_v3_scope_mismatch() {
+        let pubkey = issuer_public_key(&SEED);
+        let buf = auth_v3_buf("ru-relay", ROLE_USER);
+        let decision = try_decode_auth(&buf, &EXPORTER, &pubkey, "nl-relay");
+        assert!(matches!(decision, Some(GateDecision::Site)));
     }
 
     #[test]
