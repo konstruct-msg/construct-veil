@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::BytesMut;
 use construct_veil_protocol::{
-    AuthRecordV2, AuthRecordV3, EXPORTER_LABEL, ROLE_USER, VeilFrontCodec,
+    AuthRecordV2, AuthRecordV3, EXPORTER_LABEL, ROLE_RELAY, ROLE_USER, VeilFrontCodec,
 };
 use tokio::io::AsyncReadExt;
 use tokio_rustls::server::TlsStream;
@@ -221,14 +221,19 @@ fn try_decode_auth(
                 || relay_scope.is_empty()
                 || rec.capability.scope == relay_scope;
 
-            // This listener is client-facing only — chaining relays authenticate
-            // on a separate upstream-facing listener with ROLE_RELAY (not yet
-            // built, see decisions/veil-relay-topology.md §3/§4). Offline
-            // validation: issuer signature + role + validity window + a client
-            // signature over the exporter — no shared secret is ever presented.
-            if scope_ok && rec.verify(issuer_pubkey, ROLE_USER, exporter, now_unix()) {
+            // Accept ROLE_USER (end clients) and ROLE_RELAY (chain domestic→clean hop).
+            // A dedicated upstream-facing listener was sketched in
+            // decisions/veil-relay-topology.md §3 but not shipped; until then both
+            // roles share this gate. Role is still *checked* (cannot forge USER as
+            // RELAY or vice versa) — only the listener split is deferred.
+            // Offline: issuer sig + role + window + client_sig over exporter.
+            let now = now_unix();
+            let user_ok = rec.verify(issuer_pubkey, ROLE_USER, exporter, now);
+            let relay_ok = rec.verify(issuer_pubkey, ROLE_RELAY, exporter, now);
+            if scope_ok && (user_ok || relay_ok) {
                 debug!(
                     ticket_id = ?hex::encode(rec.capability.ticket_id),
+                    role = if relay_ok { "relay" } else { "user" },
                     "capability (v3) valid, routing to tunnel"
                 );
                 Some(GateDecision::Tunnel {
@@ -392,13 +397,13 @@ mod tests {
     }
 
     #[test]
-    fn gate_rejects_v3_relay_capability_on_client_listener() {
-        // This listener is client-facing only (ROLE_USER) — a relay capability
-        // (ROLE_RELAY), even with a perfectly valid signature, must not tunnel.
+    fn gate_accepts_v3_relay_capability_for_chain_hop() {
+        // Chain mode (relay_domestic → this clean front) presents ROLE_RELAY.
+        // Accepted on the same listener until a dedicated upstream port exists.
         let pubkey = issuer_public_key(&SEED);
         let buf = auth_v3_buf("", ROLE_RELAY);
         let decision = try_decode_auth(&buf, &EXPORTER, &pubkey, "");
-        assert!(matches!(decision, Some(GateDecision::Site)));
+        assert!(matches!(decision, Some(GateDecision::Tunnel { .. })));
     }
 
     #[test]
