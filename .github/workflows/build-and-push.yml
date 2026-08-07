@@ -29,16 +29,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Cover-site ──────────────────────────────────────────────────────
-      - name: Build & push cover image
-        uses: docker/build-push-action@v6
-        with:
-          context: deploy/example-cover
-          file: deploy/Dockerfile.cover
-          push: true
-          tags: ${{ env.REGISTRY }}/konstruct-msg/construct-veil/cover:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      # Cover applications are private / operator-owned — not built from this repo.
+      # See deploy/COVER.md and construct-docs decisions/veil-example-cover-modularity.md
 
       # ── Relay ───────────────────────────────────────────────────────────
       - name: Build & push relay image

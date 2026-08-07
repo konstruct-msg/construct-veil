@@ -1,14 +1,15 @@
-# Production compose — pulls pre-built images from GHCR.
-# No `build` sections — images come from GitHub Actions CI.
+# Production compose — relay from GHCR; cover from YOUR private image.
+# No cover source is built from this repository.
 #
 # Usage on VPS:
+#   export COVER_IMAGE=ghcr.io/<you>/<private-cover>:latest
 #   docker compose -f docker-compose.prod.yml pull
 #   docker compose -f docker-compose.prod.yml up -d cover
-#   ... (then run bootstrap.sh with --prod flag or follow manual steps)
+#   ... (then bootstrap / certs as in README.md)
 
 services:
   cover:
-    image: ghcr.io/example/private-cover:latest
+    image: ${COVER_IMAGE:?Set COVER_IMAGE to your private cover image (see deploy/COVER.md)}
     container_name: veil-front-cover
     restart: unless-stopped
     ports:
@@ -51,9 +52,9 @@ services:
       ISSUER_PUBKEY: "${ISSUER_PUBKEY}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    # Remote front topology: this relay (e.g. in RU, reachable by IP) terminates
-    # the veil-TLS and re-wraps the gRPC stream in a fresh TLS connection to the
-    # Construct backend's public endpoint (Traefik :443 → h2c → envoy:8080).
+    # Remote front topology: this relay terminates the veil-TLS and re-wraps the
+    # gRPC stream in a fresh TLS connection to the Construct backend's public
+    # endpoint (Traefik :443 → h2c → envoy:8080).
     # --backend-sni keeps the cert hostname correct even when BACKEND is set to a
     # raw IP (e.g. when the backend domain is DNS-blocked on the relay's network).
     command: >

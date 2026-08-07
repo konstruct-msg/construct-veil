@@ -1,42 +1,53 @@
 # `construct-veil-relay` Docker deployment
 
-One-VPS deployment of the veil-front relay + cover application via
-`docker compose`. Implements the operational checklist from
-`construct-docs/raw/02_Core_Crypto/protocols/M0_COVER_APP_DEPLOYMENT.md`.
+One-VPS deployment of the veil-front **relay** plus a **pluggable cover** image via
+`docker compose`.
+
+Cover applications are **not** in this repository. See:
+
+- [`COVER.md`](./COVER.md) — wire-up and contract summary
+- construct-docs `decisions/veil-example-cover-modularity.md`
+- construct-docs `manuals&Instructions/veil-example-cover-operator-checklist.md`
 
 ## Services
 
 | Container | What | Host port |
 |---|---|---|
-| `cover` | Node.js example-cover on internal `:8080` + ACME on host `:80`. **Primary front today:** furniture workshop (`example-cover/` / example-cover). **Second front:** weather cover (`example-weather-cover/` / ExampleWeather) — build a separate image, never re-use the same brand on two hosts. | `80` |
-| `relay` | `construct-veil-relay` Rust binary. Terminates TLS, runs the constant-shape gate, routes valid AUTH to gRPC backend / everything else to `cover:8080`. | `443` |
-| `certbot` | Let's Encrypt cert issuance + renewal via webroot challenge. Invoked manually (bootstrap) and from `cron` (renewal). | — |
+| `cover` | **Your** private cover image (`COVER_IMAGE`). Serves ACME on host `:80` and the app on internal `:8080`. | `80` |
+| `relay` | `construct-veil-relay` Rust binary. Terminates TLS, constant-shape gate, valid AUTH → gRPC backend / else → `cover:8080`. | `443` |
+| `certbot` | Let's Encrypt cert issuance + renewal via webroot. Invoked manually (bootstrap) and from `cron` (renewal). | — |
 
 ## Prerequisites
 
 - A VPS with Docker + `docker compose` plugin (Docker 20.10+).
-- DNS A/AAAA record for `$DOMAIN` (and every name in `$EXTRA_DOMAINS`) pointing at the VPS — required so ACME http-01 challenge passes for each SAN name.
-- Ports `80` and `443` free on the VPS host.
-- A reachable Construct gRPC backend (host:port) — the relay's tunnel target.
+- DNS A/AAAA for `$DOMAIN` (and every name in `$EXTRA_DOMAINS`) → VPS (ACME http-01).
+- Ports `80` and `443` free on the host.
+- A reachable Construct gRPC backend (host:port).
+- A **private cover image** that meets `COVER.md` (long-lived H2/SSE, no protocol branding).
+
+```bash
+export COVER_IMAGE=ghcr.io/<you>/<private-cover>:latest
+# VPS must be able to pull it (docker login to the private registry if needed)
+```
 
 ### Single-name vs SAN (multi-name) cert
 
-The cert is a single Let's Encrypt cert issued for `$DOMAIN` plus every comma-separated entry in `$EXTRA_DOMAINS`. Typical layout for our case:
+The cert is a single Let's Encrypt cert for `$DOMAIN` plus every comma-separated entry
+in `$EXTRA_DOMAINS`. Typical pattern:
 
-| Env var | Value | What it does |
-|---|---|---|
-| `DOMAIN` | `front.example.com` | Primary name — this is the cert directory key (`/etc/letsencrypt/live/front.example.com/`), the relay's `--cert` path, the client manifest's `address`/`tls_sni`. |
-| `EXTRA_DOMAINS` | `front.example.com` | Additional SAN entries on the same cert. The example-cover's host-aware routing serves the marketing landing on the root domain and a minimal JSON identity on the `api.*` subdomain. |
+| Env var | Role |
+|---|---|
+| `DOMAIN` | Primary name — cert directory key, relay `--cert` path, client manifest `address` / `tls_sni`. |
+| `EXTRA_DOMAINS` | Additional SANs on the same cert (e.g. apex + `api.*`). Host-aware routing is a **cover** concern. |
 
-Adding/removing names after first bootstrap: re-run `./scripts/bootstrap.sh` — certbot is invoked with `--expand`, which transparently grows the existing cert to cover new SANs (or shrinks it if you remove entries).
+Adding/removing names after first bootstrap: re-run `./scripts/bootstrap.sh` — certbot
+`--expand` grows/shrinks the cert.
 
-If you're reusing one of the existing `ice.*.konstruct.cc` hosts that
-was running `construct-relay`, stop the old service first:
+If you're reusing a host that previously ran another service, stop it first:
 
 ```bash
 ssh <vps>
 sudo systemctl stop construct-relay   # or whichever unit name
-sudo systemctl disable construct-relay
 sudo docker stop <old-container>      # if container-based
 ```
 
@@ -45,63 +56,55 @@ sudo docker stop <old-container>      # if container-based
 ```bash
 cd construct-veil/deploy
 cp .env.example .env
-$EDITOR .env                                # fill DOMAIN, EMAIL, BACKEND
+$EDITOR .env                                # DOMAIN, EMAIL, BACKEND, ISSUER_PUBKEY, …
+export COVER_IMAGE=ghcr.io/<you>/<private-cover>:latest
 ./scripts/bootstrap.sh
 ```
 
-`bootstrap.sh` runs the orchestrated sequence:
+`bootstrap.sh` roughly:
 
-1. `docker compose up -d cover` — example-cover listening on `:80` for ACME.
-2. `docker compose run --rm certbot ...` — issues the cert via webroot
-   challenge into the `letsencrypt` named volume.
-3. Generates one veil-front ticket (60-day validity) into
-   `data/tickets/tickets.json`.
-4. `docker compose up -d relay` — relay starts on `:443`.
-5. Prints the SPKI hex from relay logs — copy this into the client
-   manifest as `pinned_spki`.
-6. Prints the issued ticket base64 — copy this into the client manifest
-   as `veil_front_ticket`.
+1. `docker compose up -d cover` — cover listening on `:80` for ACME.
+2. `docker compose run --rm certbot ...` — issues the cert into the `letsencrypt` volume.
+3. Capability / ticket provisioning as configured for your environment.
+4. `docker compose up -d relay` — relay on `:443`.
+5. Prints SPKI from relay logs — pin this in the client manifest.
 
-After bootstrap the relay is live. Verify:
+After bootstrap:
 
 ```bash
-curl -sI https://$DOMAIN/                   # 200, served by example-cover
-curl -sI https://$DOMAIN/api/feed | head    # 200, content-type: text/event-stream
+curl -sI "https://$DOMAIN/" | head -5
+# long-lived path depends on YOUR cover (example SSE):
+# curl -sN -m 5 "https://$DOMAIN/api/feed" | head -5
 ```
 
-## Issue more tickets
+## Issue more tickets / capabilities
 
-```bash
-./scripts/issue-ticket.sh --days 60         # appends to tickets.json
-./scripts/issue-ticket.sh --days 60 --reload-relay   # also restarts relay
-```
-
-The relay reads `tickets.json` once at startup. Restart the relay
-container after appending new tickets if you want the running process
-to pick them up.
+Use the scripts under `scripts/` and your home-server tooling. The relay reads
+issuer material / tickets as documented for your deployment mode; restart the
+relay container after changing mounted credential files when required.
 
 ## Cert renewal (host cron)
 
-Let's Encrypt issues 90-day leaf certs; renew at 60 days. Add to root
-crontab:
+Let's Encrypt issues 90-day leaf certs; renew at ~60 days. Example root crontab:
 
 ```cron
 0 3 * * 1 cd /opt/veil-front && ./scripts/renew-cert.sh >> /var/log/veil-renew.log 2>&1
 ```
 
 The renew script:
+
 1. `docker compose run --rm certbot renew --webroot -w /var/www/certbot`
-2. If cert was renewed (cert mtime changed): `docker compose restart relay`
-3. Re-derives + republishes the SPKI to wherever the manifest lives.
+2. If cert mtime changed: `docker compose restart relay`
+3. Re-derive SPKI if your leaf key rotated (prefer `certbot --reuse-key`)
 
 ## Stop / inspect / debug
 
 ```bash
-docker compose logs -f relay        # follow relay logs
-docker compose logs -f cover        # follow cover logs
-docker compose ps                   # state of services
-docker compose down                 # stop everything (preserves volumes)
-docker compose down -v              # stop + delete volumes (FORCE re-bootstrap)
+docker compose logs -f relay
+docker compose logs -f cover
+docker compose ps
+docker compose down                 # preserves volumes
+docker compose down -v              # FORCE re-bootstrap
 ```
 
 ## File layout
@@ -109,35 +112,25 @@ docker compose down -v              # stop + delete volumes (FORCE re-bootstrap)
 ```
 deploy/
 ├── README.md
+├── COVER.md                    # pluggable cover contract
 ├── .env.example
-├── docker-compose.yml
-├── Dockerfile.relay              # multi-stage Rust build
-├── Dockerfile.cover              # node:22-alpine
-├── example-cover/
-│   ├── package.json
-│   ├── server.js
-│   └── public/
-│       ├── index.html
-│       ├── about.html
-│       ├── app.js
-│       ├── styles.css
-│       ├── robots.txt
-│       ├── favicon.ico         # supply your own
-│       └── .well-known/security.txt
+├── docker-compose.yml          # local relay build + COVER_IMAGE
+├── docker-compose.prod.yml     # GHCR relay + COVER_IMAGE
+├── docker-compose.chain.yml    # optional chain overlay (ops)
+├── Dockerfile.relay
 ├── scripts/
-│   ├── bootstrap.sh            # first-deploy orchestration
-│   ├── issue-ticket.sh         # add tickets
-│   └── renew-cert.sh           # cron-driven renewal
+│   ├── bootstrap.sh
+│   ├── issue-ticket.sh
+│   └── renew-cert.sh
 └── data/
-    └── tickets/                # generated; tickets.json lives here
+    └── tickets/                # local/dev credential material if used
 ```
+
+Production cover source trees live in **private** repositories, not here.
 
 ## Security notes
 
-- `SSLKEYLOGFILE` is **not enabled** in this compose file. Only enable
-  it manually for classifier-capture runs, then re-deploy without it.
-- `tickets.json` is bind-mounted **read-only** into the relay; never
-  edit while the container is running (atomic replacement is fine).
-- The `letsencrypt` and `certbot-www` volumes are docker-managed named
-  volumes; back them up with `docker run --rm -v letsencrypt:/x alpine
-  tar c -C /x .` if you want offsite copies.
+- `SSLKEYLOGFILE` is **not enabled** here. Only enable for classifier-capture runs.
+- Do not commit production domains, SPKI pins, or chain graphs to the public tree.
+- Prefer private registry paths for cover images — not `…/construct-veil/cover`.
+- `letsencrypt` / `certbot-www` are named volumes; back them up if you need offsite copies.

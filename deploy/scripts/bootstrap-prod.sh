@@ -14,8 +14,10 @@ set -a; source .env; set +a
 
 : "${DOMAIN:?DOMAIN must be set in .env}"
 : "${EMAIL:?EMAIL must be set in .env}"
+: "${COVER_IMAGE:?COVER_IMAGE must be set (private cover image — see deploy/COVER.md)}"
 TICKET_DAYS="${TICKET_DAYS:-60}"
 EXTRA_DOMAINS="${EXTRA_DOMAINS:-}"
+export COVER_IMAGE
 
 # Build certbot -d args
 CERTBOT_DOMAINS=("-d" "$DOMAIN")
@@ -27,24 +29,25 @@ if [ -n "$EXTRA_DOMAINS" ]; then
   done
 fi
 
-echo "▸ DOMAIN = $DOMAIN"
-echo "▸ EXTRA  = ${EXTRA_DOMAINS:-(none)}"
-echo "▸ EMAIL  = $EMAIL"
+echo "▸ DOMAIN      = $DOMAIN"
+echo "▸ EXTRA       = ${EXTRA_DOMAINS:-(none)}"
+echo "▸ EMAIL       = $EMAIL"
+echo "▸ COVER_IMAGE = $COVER_IMAGE"
 echo
 
 # ── Pull images ──────────────────────────────────────────────────────────
-echo "▸ Pulling images from GHCR…"
+echo "▸ Pulling relay (GHCR) + cover (COVER_IMAGE)…"
 $COMPOSE pull
 
 # ── Start cover for ACME ─────────────────────────────────────────────────
-echo "▸ Starting example-cover on :80…"
+echo "▸ Starting cover on :80…"
 $COMPOSE up -d cover
 sleep 3
 
 for i in 1 2 3 4 5; do
   if curl -fsS --max-time 2 "http://127.0.0.1/" -o /dev/null 2>&1 \
      || curl -fsSI --max-time 2 "http://127.0.0.1/" 2>&1 | grep -q 'HTTP/.*301'; then
-    echo "✓ example-cover responding"
+    echo "✓ cover responding"
     break
   fi
   sleep 1

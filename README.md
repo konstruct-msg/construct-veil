@@ -59,7 +59,7 @@ construct-veil/
 ```
 [iOS gRPC] ↔ [VeilFront client] ~~~ TLS 1.3 (honest SNI) ~~~ [veil-front relay]
                                                         ├─ valid auth → h2c backend (Construct)
-                                                        └─ invalid auth → cover site (SSE app)
+                                                        └─ invalid auth → cover site (pluggable; see deploy/COVER.md)
 ```
 
 ### Source layout

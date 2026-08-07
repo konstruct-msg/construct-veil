@@ -1,30 +1,23 @@
-# Overlay: domestic (relay_domestic) chains to an upstream clean front by IP.
+# Overlay: relay_domestic chains to an upstream clean front (often by IP).
 #
-# Topology (decisions/veil-relay-topology.md §3):
+# Topology: construct-docs decisions/veil-relay-topology.md §3
+# Ops recipe: deploy/CHAIN.md (no production hostnames in this file).
 #
-#   client → domestic.example.com (Selectel, this compose) ──chain──► 203.0.113.10:443
-#              ExampleWeather cover                              (example-cover, clean)
+#   client → domestic front (this compose) ──chain──► <UPSTREAM_IP>:443 clean front
+#              COVER_IMAGE (private)                    different cover brand
 #                                                              │ --backend-tls
 #                                                              ▼
-#                                                         ams / DO backend
+#                                                         home backend
 #
-# Dial upstream by IP (avoids DNS dependency / poisoning on the RU VPS); TLS still
-# uses the real front SNI + SPKI pin so the LE cert validates.
+# Dial upstream by IP when DNS on the domestic box is flaky; TLS still uses the
+# real clean-front SNI + SPKI pin.
 #
-# Usage on the NEARSKY VPS only (not on <redacted>):
-#   cp docker-compose.chain.yml .   # or -f both files
-#   # fill CHAIN_* in .env — see .env.example chain section
+# Usage on the DOMESTIC VPS only:
+#   export COVER_IMAGE=ghcr.io/<you>/<domestic-private-cover>:latest
+#   # fill CHAIN_* in .env — required, no public defaults
 #   docker compose -f docker-compose.prod.yml -f docker-compose.chain.yml up -d
 #
-# Prerequisites:
-#   1. On this box: relay keypair
-#        docker compose run --rm relay \
-#          --generate-relay-keypair --chain-veil-sk-file /data/chain/veil_sk.hex
-#      (mount a volume for /data/chain — see volumes below)
-#   2. Home issuer signs ROLE_RELAY CapabilityV2 for that veil_pk
-#      (veil-service IssueVeilCapability with role=1, or admin tooling).
-#   3. Save the base64 blob to chain/capability.b64 on this VPS.
-#   4. Deploy a relay image that accepts ROLE_RELAY on the clean front (gate fix).
+# Prerequisites: see deploy/CHAIN.md (keypair, ROLE_RELAY capability, SPKI).
 
 services:
   relay:
@@ -35,10 +28,10 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
       DOMAIN: ${DOMAIN}
       ISSUER_PUBKEY: ${ISSUER_PUBKEY}
-      # Upstream clean front — IP:port (<redacted> VPS). SNI must match the cert on that IP.
-      CHAIN_UPSTREAM_ADDR: ${CHAIN_UPSTREAM_ADDR:-203.0.113.10:443}
-      CHAIN_UPSTREAM_SNI: ${CHAIN_UPSTREAM_SNI:-front.example.com}
-      CHAIN_UPSTREAM_SPKI: ${CHAIN_UPSTREAM_SPKI}
+      # Upstream clean front — IP:port. SNI must match the cert on that IP.
+      CHAIN_UPSTREAM_ADDR: ${CHAIN_UPSTREAM_ADDR:?set CHAIN_UPSTREAM_ADDR}
+      CHAIN_UPSTREAM_SNI: ${CHAIN_UPSTREAM_SNI:?set CHAIN_UPSTREAM_SNI}
+      CHAIN_UPSTREAM_SPKI: ${CHAIN_UPSTREAM_SPKI:?set CHAIN_UPSTREAM_SPKI}
     # Chain mode replaces local --backend dial: validated tunnels ferry through
     # the upstream veil-front. Cover site (--site) still serves unauth probes.
     command:
@@ -53,17 +46,17 @@ services:
       - --issuer-pubkey
       - ${ISSUER_PUBKEY}
       - --chain-upstream-addr
-      - ${CHAIN_UPSTREAM_ADDR:-203.0.113.10:443}
+      - ${CHAIN_UPSTREAM_ADDR}
       - --chain-upstream-sni
-      - ${CHAIN_UPSTREAM_SNI:-front.example.com}
+      - ${CHAIN_UPSTREAM_SNI}
       - --chain-upstream-spki
       - ${CHAIN_UPSTREAM_SPKI}
       - --chain-capability-file
       - /data/chain/capability.b64
       - --chain-veil-sk-file
       - /data/chain/veil_sk.hex
-    # Backend flags unused in chain mode but kept harmless if someone falls back.
-    # Do not set BACKEND to DO from the RU box when chain is active.
+    # Backend flags unused in chain mode. Do not dial the home backend directly
+    # from a hostile-zone box when chain is active.
 
 volumes:
   letsencrypt:

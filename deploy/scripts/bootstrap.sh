@@ -16,8 +16,10 @@ set -a; source .env; set +a
 
 : "${DOMAIN:?DOMAIN must be set in .env}"
 : "${EMAIL:?EMAIL must be set in .env}"
+: "${COVER_IMAGE:?COVER_IMAGE must be set (private cover image — see deploy/COVER.md)}"
 TICKET_DAYS="${TICKET_DAYS:-60}"
 EXTRA_DOMAINS="${EXTRA_DOMAINS:-}"
+export COVER_IMAGE
 
 # Build the -d arg list for certbot. Primary $DOMAIN goes first — this
 # determines which directory under /etc/letsencrypt/live/ the cert lands in
@@ -34,6 +36,7 @@ fi
 echo "▸ DOMAIN         = $DOMAIN"
 echo "▸ EXTRA_DOMAINS  = ${EXTRA_DOMAINS:-(none)}"
 echo "▸ EMAIL          = $EMAIL"
+echo "▸ COVER_IMAGE    = $COVER_IMAGE"
 echo "▸ BACKEND        = ${BACKEND:-host.docker.internal:50051}"
 echo
 
@@ -60,19 +63,21 @@ if command -v dig >/dev/null; then
   done
 fi
 
-# ── Build images ────────────────────────────────────────────────────────────
-echo "▸ Building images…"
-docker compose build
+# ── Pull cover + build relay ────────────────────────────────────────────────
+echo "▸ Pulling cover image (COVER_IMAGE)…"
+docker compose pull cover || docker image inspect "$COVER_IMAGE" >/dev/null
+echo "▸ Building relay image…"
+docker compose build relay
 
 # ── Start cover (needed for ACME http-01) ──────────────────────────────────
-echo "▸ Starting example-cover on :80 for ACME challenge…"
+echo "▸ Starting cover on :80 for ACME challenge…"
 docker compose up -d cover
 
 # Wait for cover to be ready.
 for i in 1 2 3 4 5; do
   if curl -fsS --max-time 2 "http://127.0.0.1/" -o /dev/null 2>&1 \
        || curl -fsSI --max-time 2 "http://127.0.0.1/" 2>&1 | grep -q 'HTTP/.*301'; then
-    echo "✓ example-cover responding on :80"
+    echo "✓ cover responding on :80"
     break
   fi
   sleep 1

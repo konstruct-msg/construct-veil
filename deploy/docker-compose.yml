@@ -1,12 +1,13 @@
-# construct-veil-relay one-VPS deployment.
-# See ./README.md for bootstrap instructions.
+# construct-veil-relay one-VPS deployment (local build of relay).
+# Cover is an external image — see COVER.md and construct-docs modularity ADR.
+#
+#   export COVER_IMAGE=ghcr.io/<you>/<private-cover>:latest
+#   # or: docker build -t my-cover:dev /path/to/private-cover && COVER_IMAGE=my-cover:dev
+#   docker compose up -d
 
 services:
   cover:
-    build:
-      context: ./example-cover
-      dockerfile: ../Dockerfile.cover
-    image: construct-veil/cover:latest
+    image: ${COVER_IMAGE:?Set COVER_IMAGE to your private cover image (see deploy/COVER.md)}
     container_name: veil-front-cover
     restart: unless-stopped
     # :80 exposed on host for ACME http-01 + redirect-to-https.
