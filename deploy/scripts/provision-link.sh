@@ -18,8 +18,8 @@
 # Usage:
 #   ./provision-link.sh [tester-label]
 #
-# Env (override as needed):
-#   RELAY=front.example.com:443     # host:port of the relay (also the SNI host)
+# Env (required / optional):
+#   RELAY=front.example.com:443        # REQUIRED — host:port (also default SNI host)
 #   DAYS=60                            # ticket + config validity
 #   SIGNING_KEY_PEM=~/Code/construct-landing/scripts/signing_key.pem
 #   VEIL_REPO=~/Code/construct-veil    # checkout that builds make-config-link
@@ -32,7 +32,7 @@
 
 set -euo pipefail
 
-RELAY="${RELAY:-front.example.com:443}"
+: "${RELAY:?Set RELAY=host:443 from private ops inventory (no production default)}"
 DAYS="${DAYS:-60}"
 SIGNING_KEY_PEM="${SIGNING_KEY_PEM:-$HOME/Code/construct-landing/scripts/signing_key.pem}"
 VEIL_REPO="${VEIL_REPO:-$HOME/Code/construct-veil}"

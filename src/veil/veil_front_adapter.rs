@@ -516,14 +516,32 @@ mod tests {
                 );
                 return;
             }
+            let relay = match std::env::var("VEIL_TEST_RELAY") {
+                Ok(r) if !r.is_empty() => r,
+                _ => {
+                    eprintln!("skip: set VEIL_TEST_RELAY (and SNI/SPKI) from private ops inventory");
+                    return;
+                }
+            };
+            let sni = std::env::var("VEIL_TEST_SNI").unwrap_or_else(|_| {
+                relay
+                    .split_once(':')
+                    .map(|(h, _)| h.to_string())
+                    .unwrap_or_else(|| relay.clone())
+            });
+            let spki = match std::env::var("VEIL_TEST_SPKI") {
+                Ok(s) if !s.is_empty() => s,
+                _ => {
+                    eprintln!("skip: set VEIL_TEST_SPKI");
+                    return;
+                }
+            };
             let req = ProbeRequest {
-                relay_addr: std::env::var("VEIL_TEST_RELAY")
-                    .unwrap_or_else(|_| "front.example.com:443".into()),
+                relay_addr: relay.clone(),
                 bundle: String::new(),
-                tls_sni: "front.example.com".into(),
-                spki_hex: std::env::var("VEIL_TEST_SPKI")
-                    .unwrap_or_else(|_| "<REDACTED_SPKI>".into()),
-                host_header: "front.example.com".into(),
+                tls_sni: sni.clone(),
+                spki_hex: spki,
+                host_header: sni,
                 wt_base_path: "/api/stream".into(),
                 veil_front_ticket_b64: ticket,
                 auth_v3: VeilFrontAuthV3::default(),
@@ -595,11 +613,28 @@ mod tests {
                 eprintln!("skip: no ticket (VEIL_TEST_TICKET or deploy/data/tickets/tickets.json)");
                 return;
             }
-            // Env overrides let this point at a LOCAL relay (VEIL_TEST_RELAY=127.0.0.1:8443
-            // VEIL_TEST_SNI=localhost VEIL_TEST_SPKI= ) for full both-sides instrumentation.
-            let relay = std::env::var("VEIL_TEST_RELAY").unwrap_or_else(|_| "front.example.com:443".into());
-            let sni = std::env::var("VEIL_TEST_SNI").unwrap_or_else(|_| "front.example.com".into());
-            let spki = std::env::var("VEIL_TEST_SPKI").unwrap_or_else(|_| "<REDACTED_SPKI>".into());
+            // Point at any front via env (private ops inventory), or a local relay:
+            // VEIL_TEST_RELAY=127.0.0.1:8443 VEIL_TEST_SNI=localhost VEIL_TEST_SPKI=…
+            let relay = match std::env::var("VEIL_TEST_RELAY") {
+                Ok(r) if !r.is_empty() => r,
+                _ => {
+                    eprintln!("skip: set VEIL_TEST_RELAY (and SNI/SPKI) from private ops inventory");
+                    return;
+                }
+            };
+            let sni = std::env::var("VEIL_TEST_SNI").unwrap_or_else(|_| {
+                relay
+                    .split_once(':')
+                    .map(|(h, _)| h.to_string())
+                    .unwrap_or_else(|| relay.clone())
+            });
+            let spki = match std::env::var("VEIL_TEST_SPKI") {
+                Ok(s) if !s.is_empty() => s,
+                _ => {
+                    eprintln!("skip: set VEIL_TEST_SPKI");
+                    return;
+                }
+            };
 
             // Local ferry: bridges a plaintext h2c socket ↔ the veil tunnel, exactly
             // as the on-device coordinator does after a probe wins.

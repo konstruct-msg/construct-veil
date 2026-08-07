@@ -200,9 +200,10 @@ mod live_probe {
     use crate::tls_fingerprint::TlsProfile;
     use tokio::net::TcpStream;
 
-    /// Live veil-TLS handshake against the production relay. Ignored by default
-    /// (requires network); run with:
-    ///   cargo test -p construct-veil --lib tls_pinned::live_probe -- --ignored --nocapture
+    /// Live veil-TLS handshake against a real front. Ignored by default
+    /// (requires network + env). Run with:
+    ///   VEIL_TEST_RELAY=host:443 VEIL_TEST_SNI=host VEIL_TEST_SPKI=<hex> \
+    ///   cargo test -p construct-veil --lib tls_pinned::tests::dial_live_relay -- --ignored --nocapture
     #[test]
     #[ignore]
     fn dial_live_relay() {
@@ -212,9 +213,16 @@ mod live_probe {
             .build()
             .unwrap();
         rt.block_on(async {
-            let relay = "front.example.com:443";
-            let sni = "front.example.com";
-            let spki = "<REDACTED_SPKI>";
+            let relay = std::env::var("VEIL_TEST_RELAY")
+                .expect("set VEIL_TEST_RELAY=host:443 (private ops inventory)");
+            let sni = std::env::var("VEIL_TEST_SNI").unwrap_or_else(|_| {
+                relay
+                    .split_once(':')
+                    .map(|(h, _)| h.to_string())
+                    .unwrap_or_else(|| relay.clone())
+            });
+            let spki = std::env::var("VEIL_TEST_SPKI")
+                .expect("set VEIL_TEST_SPKI=<sha256 hex of relay SPKI>");
 
             let (connector, server_name) = build_connector(
                 sni,

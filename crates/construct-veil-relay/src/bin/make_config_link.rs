@@ -40,8 +40,8 @@ struct Args {
     #[arg(long)]
     signing_key: String,
 
-    /// Relay address (host:port).
-    #[arg(long, default_value = "front.example.com:443")]
+    /// Relay address (host:port). Required — no production default (opsec).
+    #[arg(long)]
     relay: String,
 
     /// TLS SNI (defaults to the host part of --relay).
