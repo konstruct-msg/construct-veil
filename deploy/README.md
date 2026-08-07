@@ -6,6 +6,8 @@ One-VPS deployment of the veil-front **relay** plus a **pluggable cover** image 
 Cover applications are **not** in this repository. See:
 
 - [`COVER.md`](./COVER.md) — wire-up and contract summary
+- **Greenfield VPS (start here for a new front):** construct-docs
+  `manuals&Instructions/veil-front-new-vps-runbook.md`
 - construct-docs `decisions/veil-example-cover-modularity.md`
 - construct-docs `manuals&Instructions/veil-example-cover-operator-checklist.md`
 
