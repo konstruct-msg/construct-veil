@@ -21,8 +21,9 @@ docker compose -f docker-compose.prod.yml up -d
 See construct-docs:
 
 - `manuals&Instructions/veil-front-new-vps-runbook.md` — **full greenfield VPS setup**
-- `decisions/veil-example-cover-modularity.md` — why covers stay out of the public tree
-- `manuals&Instructions/veil-example-cover-operator-checklist.md` — ports, long-lived H2/SSE, branding, smoke tests
+  (split repos: public relay deploy vs private cover repos vs private veil-ops)
+- `decisions/veil-cover-site-modularity.md` — why covers stay out of the public tree
+- `manuals&Instructions/veil-cover-site-operator-checklist.md` — ports, long-lived H2/SSE, branding, smoke tests
 
 ### Minimum requirements
 

@@ -8,8 +8,9 @@ Cover applications are **not** in this repository. See:
 - [`COVER.md`](./COVER.md) — wire-up and contract summary
 - **Greenfield VPS (start here for a new front):** construct-docs
   `manuals&Instructions/veil-front-new-vps-runbook.md`
-- construct-docs `decisions/veil-example-cover-modularity.md`
-- construct-docs `manuals&Instructions/veil-example-cover-operator-checklist.md`
+  (public `construct-veil` deploy only; cover sources live in **separate private** repos)
+- construct-docs `decisions/veil-cover-site-modularity.md`
+- construct-docs `manuals&Instructions/veil-cover-site-operator-checklist.md`
 
 ## Services
 
