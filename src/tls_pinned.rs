@@ -225,9 +225,9 @@ mod live_probe {
                 .expect("set VEIL_TEST_SPKI=<sha256 hex of relay SPKI>");
 
             let (connector, server_name) = build_connector(
-                sni,
-                spki,
-                relay,
+                &sni,
+                &spki,
+                &relay,
                 TlsProfile::Chrome131,
                 Some(vec![b"h2".to_vec()]),
             )
