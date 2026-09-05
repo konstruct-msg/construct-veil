@@ -25,14 +25,18 @@ mod tls;
 mod tunnel;
 mod upstream_tls;
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use clap::Parser;
 use ed25519_dalek::SigningKey;
 use gate::{GateResult, gate_with_exporter};
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tokio::sync::Semaphore;
+use tracing::{debug, info, warn};
 
 use crate::chain::ChainConfig;
 use crate::tls::RelayTls;
@@ -89,6 +93,26 @@ struct Args {
     #[arg(long, default_value = "127.0.0.1:8080")]
     site: String,
 
+    /// Ceiling on TLS handshakes in flight at once, across all peers. Bounds the
+    /// CPU a handshake flood can consume; excess connections are dropped at
+    /// accept time, the same shape an overloaded web server presents.
+    #[arg(long, default_value_t = 512)]
+    max_handshakes: usize,
+
+    /// Ceiling on live connections from a single source IP. Stops one peer from
+    /// consuming the whole `--max-handshakes` budget. 0 is clamped to 1.
+    ///
+    /// Sized well above a browser's ~6 connections per host so CGNAT'd mobile
+    /// carriers (many real users behind one address) are not clipped, and well
+    /// below the ~600 sockets a single peer held during the 2026-09-05 flood.
+    #[arg(long, default_value_t = 64)]
+    max_conns_per_ip: u32,
+
+    /// Seconds a peer may take to finish the TLS handshake before the connection
+    /// is dropped. Without this an abandoned handshake holds its slot forever.
+    #[arg(long, default_value_t = 10)]
+    handshake_timeout_secs: u64,
+
     /// Generate a new Ed25519 `veil_sk`/`veil_pk` keypair for chain relay mode
     /// and exit, printing the pubkey (hex) to stdout. The private seed is
     /// written to `--chain-veil-sk-file` (created with 0600 perms) and never
@@ -134,6 +158,135 @@ enum BackendDialer {
         server_name: rustls::pki_types::ServerName<'static>,
     },
 }
+
+/// Admission control for the accept loop.
+///
+/// Two independent caps, both required. The global semaphore bounds the CPU that
+/// concurrent handshakes (ClientHello parse + cert signing) can consume; the
+/// per-IP cap stops a single peer from taking that whole budget for itself.
+///
+/// Why: the accept loop used to spawn an unbounded task per connection with no
+/// handshake timeout. On 2026-09-05 two peers opened ~600 sockets each at
+/// hundreds/sec; the accept backlog overflowed, backend dials started returning
+/// ETIMEDOUT and the cover site went dark for everyone.
+struct Admission {
+    /// Permits for handshakes in flight. Released once TLS is established —
+    /// a long-lived tunnel does not hold a handshake slot.
+    handshakes: Arc<Semaphore>,
+    /// Live connection count per source IP. Only ever holds entries for peers
+    /// with at least one live connection.
+    per_ip: Mutex<HashMap<IpAddr, u32>>,
+    max_per_ip: u32,
+}
+
+impl Admission {
+    fn new(max_handshakes: usize, max_per_ip: u32) -> Arc<Self> {
+        Arc::new(Self {
+            handshakes: Arc::new(Semaphore::new(max_handshakes.max(1))),
+            per_ip: Mutex::new(HashMap::new()),
+            // Clamped to >= 1 so `admit_ip` always increments past 0 and never
+            // leaves a zero-valued entry behind (which would grow the map
+            // without bound under a flood from many source IPs).
+            max_per_ip: max_per_ip.max(1),
+        })
+    }
+
+    /// Reserve a slot for `ip`, or `None` if that peer is already at its cap.
+    fn admit_ip(self: &Arc<Self>, ip: IpAddr) -> Option<IpGuard> {
+        let mut map = lock(&self.per_ip);
+        let count = map.entry(ip).or_insert(0);
+        if *count >= self.max_per_ip {
+            return None;
+        }
+        *count += 1;
+        drop(map);
+        Some(IpGuard {
+            admission: Arc::clone(self),
+            ip,
+        })
+    }
+}
+
+/// Releases the per-IP slot when the connection task ends, by any path.
+struct IpGuard {
+    admission: Arc<Admission>,
+    ip: IpAddr,
+}
+
+impl Drop for IpGuard {
+    fn drop(&mut self) {
+        let mut map = lock(&self.admission.per_ip);
+        if let Some(count) = map.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Take a `Mutex` guard, recovering from poisoning.
+///
+/// The critical sections here are counter arithmetic with no `await` and no
+/// panicking calls, so a poisoned lock carries no torn state — refusing to
+/// serve because some unrelated task panicked would be the worse failure.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Connection outcomes, aggregated into one log line per interval.
+///
+/// This replaces a per-connection `warn!`. Under the flood that line was itself
+/// an amplifier: hundreds of entries/sec into the container log, costing disk
+/// I/O and CPU on a box already saturated. Individual failures are still
+/// available at `debug`.
+#[derive(Default)]
+struct ConnStats {
+    completed: AtomicU64,
+    handshake_timeout: AtomicU64,
+    handshake_failed: AtomicU64,
+    handler_error: AtomicU64,
+    shed_global: AtomicU64,
+    shed_per_ip: AtomicU64,
+}
+
+impl ConnStats {
+    /// Emit one summary line and reset the counters. Silent if nothing happened,
+    /// so an idle relay stays quiet.
+    fn flush(&self, window: Duration) {
+        let completed = self.completed.swap(0, Ordering::Relaxed);
+        let handshake_timeout = self.handshake_timeout.swap(0, Ordering::Relaxed);
+        let handshake_failed = self.handshake_failed.swap(0, Ordering::Relaxed);
+        let handler_error = self.handler_error.swap(0, Ordering::Relaxed);
+        let shed_global = self.shed_global.swap(0, Ordering::Relaxed);
+        let shed_per_ip = self.shed_per_ip.swap(0, Ordering::Relaxed);
+
+        if completed
+            | handshake_timeout
+            | handshake_failed
+            | handler_error
+            | shed_global
+            | shed_per_ip
+            == 0
+        {
+            return;
+        }
+
+        info!(
+            window_secs = window.as_secs(),
+            completed,
+            handshake_timeout,
+            handshake_failed,
+            handler_error,
+            shed_global,
+            shed_per_ip,
+            "connection summary"
+        );
+    }
+}
+
+/// How often the aggregated connection summary is emitted.
+const STATS_WINDOW: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -328,6 +481,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend: Arc<str> = Arc::from(args.backend.as_str());
     let site: Arc<str> = Arc::from(args.site.as_str());
 
+    let admission = Admission::new(args.max_handshakes, args.max_conns_per_ip);
+    let stats = Arc::new(ConnStats::default());
+    let handshake_timeout = Duration::from_secs(args.handshake_timeout_secs.max(1));
+    info!(
+        max_handshakes = args.max_handshakes,
+        max_conns_per_ip = args.max_conns_per_ip,
+        handshake_timeout_secs = handshake_timeout.as_secs(),
+        "admission control active"
+    );
+
+    // Periodic aggregated summary — the only routine per-connection logging.
+    {
+        let stats = Arc::clone(&stats);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(STATS_WINDOW);
+            ticker.tick().await; // the first tick fires immediately; skip it
+            loop {
+                ticker.tick().await;
+                stats.flush(STATS_WINDOW);
+            }
+        });
+    }
+
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(v) => v,
@@ -335,6 +511,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 warn!(error = %e, "TCP accept error");
                 continue;
             }
+        };
+
+        // Shed before spending any work on the connection. Dropping `tcp` closes
+        // it immediately — indistinguishable from an overloaded web server, and
+        // notably not a silent blackhole.
+        let Ok(handshake_permit) = Arc::clone(&admission.handshakes).try_acquire_owned() else {
+            stats.shed_global.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let Some(ip_guard) = admission.admit_ip(peer.ip()) else {
+            stats.shed_per_ip.fetch_add(1, Ordering::Relaxed);
+            continue;
         };
 
         tcp.set_nodelay(true).ok();
@@ -345,12 +533,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let site = Arc::clone(&site);
         let scope = Arc::clone(&relay_scope);
         let chain_config = chain_config.clone();
+        let stats = Arc::clone(&stats);
 
         tokio::spawn(async move {
+            // Held for the whole connection; the handshake permit is not.
+            let _ip_guard = ip_guard;
+
+            let tls_stream =
+                match tokio::time::timeout(handshake_timeout, acceptor.accept(tcp)).await {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(e)) => {
+                        stats.handshake_failed.fetch_add(1, Ordering::Relaxed);
+                        debug!(peer = %peer, error = %e, "TLS handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        stats.handshake_timeout.fetch_add(1, Ordering::Relaxed);
+                        debug!(peer = %peer, "TLS handshake timed out");
+                        return;
+                    }
+                };
+
+            // TLS is up — free the slot so a long-lived tunnel does not occupy
+            // handshake capacity for its entire lifetime.
+            drop(handshake_permit);
+            stats.completed.fetch_add(1, Ordering::Relaxed);
+            debug!(peer = %peer, "TLS handshake complete");
+
             if let Err(e) = handle_connection(
-                tcp,
+                tls_stream,
                 peer,
-                acceptor,
                 &issuer_pubkey,
                 &scope,
                 &backend,
@@ -360,7 +572,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
             {
-                warn!(peer = %peer, error = %e, "connection handler error");
+                stats.handler_error.fetch_add(1, Ordering::Relaxed);
+                debug!(peer = %peer, error = %e, "connection handler error");
             }
         });
     }
@@ -369,9 +582,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Handle a single incoming connection.
 #[allow(clippy::too_many_arguments)] // connection handler threads per-conn config + dialer
 async fn handle_connection(
-    tcp: tokio::net::TcpStream,
+    tls_stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     peer: SocketAddr,
-    acceptor: tokio_rustls::TlsAcceptor,
     issuer_pubkey: &[u8; 32],
     relay_scope: &str,
     backend: &str,
@@ -379,9 +591,8 @@ async fn handle_connection(
     site: &str,
     chain_config: Option<Arc<ChainConfig>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // TLS handshake.
-    let tls_stream = acceptor.accept(tcp).await?;
-    info!(peer = %peer, "TLS handshake complete");
+    // The TLS handshake is done by the caller, under a timeout and a handshake
+    // permit — neither of which should cover the connection's whole lifetime.
 
     // Run the constant-shape gate (offline capability validation).
     match gate_with_exporter(tls_stream, issuer_pubkey, relay_scope).await {
@@ -431,7 +642,7 @@ async fn handle_connection(
             }
         }
         Err(e) => {
-            warn!(peer = %peer, error = %e, "gate error, treating as site traffic");
+            debug!(peer = %peer, error = %e, "gate error, treating as site traffic");
         }
     }
 
