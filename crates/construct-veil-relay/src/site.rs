@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 /// This function performs a raw TCP forward — no protocol parsing.
 /// The cover site sees whatever the client sent, as-is.
 pub async fn forward_to_site<S>(
-    client_stream: S,
+    mut client_stream: S,
     first_bytes: BytesMut,
     site_addr: &str,
 ) -> Result<(), std::io::Error>
@@ -43,13 +43,16 @@ where
     // The TLS stream is still encrypted on the client side, but we already
     // terminated TLS, so this is cleartext to the site backend.
     // The site backend must be able to handle HTTP/1.1 or HTTP/2 cleartext.
-    let (mut client_rd, mut client_wr) = io::split(client_stream);
-    let (mut site_rd, mut site_wr) = site_conn.into_split();
-
-    let client_to_site = async { io::copy(&mut client_rd, &mut site_wr).await };
-    let site_to_client = async { io::copy(&mut site_rd, &mut client_wr).await };
-
-    match tokio::try_join!(client_to_site, site_to_client) {
+    //
+    // `copy_bidirectional`, not two `io::copy`s under `try_join!`: it shuts the
+    // opposite writer down when a direction reaches EOF, so a half-close is
+    // propagated. `io::copy` does not, and joining both directions waits for
+    // both to end — on an HTTP/1.1 keep-alive connection neither ever does.
+    // The cover app closing its side on `keepAliveTimeout` then never reached
+    // the browser: the socket stayed in the browser's connection pool marked
+    // live, the next request was written into a dead connection, and the page
+    // hung after its first load until the relay was restarted.
+    match io::copy_bidirectional(&mut client_stream, &mut site_conn).await {
         Ok(_) => {
             debug!("site forwarding completed normally");
             Ok(())
