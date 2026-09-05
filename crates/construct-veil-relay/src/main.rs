@@ -9,11 +9,11 @@
 //! # Dev mode — self-signed cert, builtin site, no tickets
 //! cargo run -p construct-veil-relay -- --dev
 //!
-//! # Production — ACME cert, real cover site, ticket store
+//! # Production — ACME cert, real cover site, offline capability validation
 //! cargo run -p construct-veil-relay --release -- \
 //!   --cert /etc/letsencrypt/live/example.com/fullchain.pem \
 //!   --key /etc/letsencrypt/live/example.com/privkey.pem \
-//!   --tickets /etc/veil-front/tickets.json \
+//!   --issuer-pubkey <home-server-ed25519-public-key-hex> \
 //!   --backend 127.0.0.1:50051 \
 //!   --site 127.0.0.1:8080
 //! ```

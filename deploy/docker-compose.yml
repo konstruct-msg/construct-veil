@@ -44,13 +44,15 @@ services:
       - "443:443"
     volumes:
       - letsencrypt:/etc/letsencrypt:ro
-      - ./data/tickets:/etc/veil-front:ro
     environment:
       RUST_LOG: "${RUST_LOG:-info}"
       # Passed through so the healthcheck's `openssl s_client -servername ${DOMAIN}`
       # expands to a real hostname inside the container (else SNI is empty and the
       # relay rejects the handshake → container marked unhealthy).
       DOMAIN: "${DOMAIN}"
+      # Issuer (home-server) Ed25519 PUBLIC key, hex. The relay validates each
+      # presented capability offline against this key.
+      ISSUER_PUBKEY: "${ISSUER_PUBKEY}"
     # Construct gRPC backend is reachable via host.docker.internal on Linux
     # only when --add-host is set; expose for portability.
     extra_hosts:
@@ -61,7 +63,7 @@ services:
       --key  /etc/letsencrypt/live/${DOMAIN}/privkey.pem
       --site cover:8080
       --backend ${BACKEND:-host.docker.internal:50051}
-      --tickets /etc/veil-front/tickets.json
+      --issuer-pubkey ${ISSUER_PUBKEY}
     # Healthcheck — quick TLS handshake check.
     healthcheck:
       test:

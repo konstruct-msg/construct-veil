@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# provision-link.sh — issue a working veil-front config link + ticket for one tester.
+# provision-link.sh — issue a working veil-front config link + capability for one tester.
 #
 #   ░░ RUN ON YOUR LAPTOP — NEVER ON THE RELAY ░░
 #
@@ -20,15 +20,15 @@
 #
 # Env (required / optional):
 #   RELAY=front.example.com:443        # REQUIRED — host:port (also default SNI host)
-#   DAYS=60                            # ticket + config validity
+#   DAYS=60                            # capability + config validity
 #   SIGNING_KEY_PEM=~/Code/construct-landing/scripts/signing_key.pem
 #   VEIL_REPO=~/Code/construct-veil    # checkout that builds make-config-link
 #
 # Output:
 #   • the konstruct://veil-config?d=… link (stdout) + QR (stderr)
-#   • the base64 ticket to install on the relay (stderr)
-# The ticket must be appended to the relay's tickets.json AND the relay reloaded
-# before the link works — see the printed next-steps.
+#   • the raw capability base64 for debug/manual bootstrap paths (stderr)
+# No relay restart is needed. The relay validates the signed capability offline
+# with --issuer-pubkey.
 
 set -euo pipefail
 
@@ -79,12 +79,9 @@ echo "▸ issuing link for '$LABEL' (relay=$RELAY, days=$DAYS) …" >&2
 cat >&2 <<EOF
 
 ── next steps ──────────────────────────────────────────────────────────────
-1. Add the base64 ticket above to the relay's tickets.json:
-     ssh <vps> 'cd /opt/veil-front && \\
-       jq ". + [\"<TICKET>\"]" data/tickets/tickets.json | sponge data/tickets/tickets.json && \\
-       docker compose restart relay'
-   (or hand-edit the JSON array + \`docker compose restart relay\`)
+1. Confirm the printed signing/issuer pubkey matches the relay's ISSUER_PUBKEY
+   and the app's relayConfigSigningKey.
 2. Send the konstruct://veil-config link (or QR) to the tester out-of-band.
 3. Tester opens it once — the app verifies the Ed25519 signature against the
-   pinned relayConfigSigningKey and stores the ticket + pin.
+   pinned relayConfigSigningKey and stores the capability + pin.
 EOF

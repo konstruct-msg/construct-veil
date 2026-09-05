@@ -7,10 +7,10 @@ Cover applications are **not** in this repository. See:
 
 - [`COVER.md`](./COVER.md) — wire-up and contract summary
 - **Greenfield VPS (start here for a new front):** construct-docs
-  `manuals&Instructions/veil-front-new-vps-runbook.md`
+  `manuals&instructions/veil-front-new-vps-runbook.md`
   (public `construct-veil` deploy only; cover sources live in **separate private** repos)
 - construct-docs `decisions/veil-cover-site-modularity.md`
-- construct-docs `manuals&Instructions/veil-cover-site-operator-checklist.md`
+- construct-docs `manuals&instructions/veil-cover-site-operator-checklist.md`
 
 ## Services
 
@@ -43,7 +43,7 @@ in `$EXTRA_DOMAINS`. Typical pattern:
 | `DOMAIN` | Primary name — cert directory key, relay `--cert` path, client manifest `address` / `tls_sni`. |
 | `EXTRA_DOMAINS` | Additional SANs on the same cert (e.g. apex + `api.*`). Host-aware routing is a **cover** concern. |
 
-Adding/removing names after first bootstrap: re-run `./scripts/bootstrap.sh` — certbot
+Adding/removing names after first bootstrap: re-run `./scripts/bootstrap-prod.sh` — certbot
 `--expand` grows/shrinks the cert.
 
 If you're reusing a host that previously ran another service, stop it first:
@@ -57,20 +57,20 @@ sudo docker stop <old-container>      # if container-based
 ## Bootstrap (first deploy)
 
 ```bash
-cd construct-veil/deploy
+cd /opt/veil-front
 cp .env.example .env
 $EDITOR .env                                # DOMAIN, EMAIL, BACKEND, ISSUER_PUBKEY, …
 export COVER_IMAGE=ghcr.io/<you>/<private-cover>:latest
-./scripts/bootstrap.sh
+./scripts/preflight.sh
+./scripts/bootstrap-prod.sh
 ```
 
-`bootstrap.sh` roughly:
+`bootstrap-prod.sh` roughly:
 
 1. `docker compose up -d cover` — cover listening on `:80` for ACME.
-2. `docker compose run --rm certbot ...` — issues the cert into the `letsencrypt` volume.
-3. Capability / ticket provisioning as configured for your environment.
-4. `docker compose up -d relay` — relay on `:443`.
-5. Prints SPKI from relay logs — pin this in the client manifest.
+2. `docker compose run --rm certbot ... --reuse-key` — issues the cert into the `letsencrypt` volume while keeping the SPKI pin stable across renewals.
+3. `docker compose up -d relay` — relay on `:443` with offline capability validation via `ISSUER_PUBKEY`.
+4. Prints relay address, SNI, SPKI, and the local `provision-link.sh` command for user capability issuance.
 
 After bootstrap:
 
@@ -80,11 +80,18 @@ curl -sI "https://$DOMAIN/" | head -5
 # curl -sN -m 5 "https://$DOMAIN/api/feed" | head -5
 ```
 
-## Issue more tickets / capabilities
+## Provision user capabilities
 
-Use the scripts under `scripts/` and your home-server tooling. The relay reads
-issuer material / tickets as documented for your deployment mode; restart the
-relay container after changing mounted credential files when required.
+Run capability issuance locally, where the secret Ed25519 signing seed lives — never
+on the relay VPS:
+
+```bash
+cd ~/Code/construct-veil
+RELAY="$DOMAIN:443" DAYS=60 ./deploy/scripts/provision-link.sh <tester-label>
+```
+
+No `tickets.json` or relay restart is needed for current production relays. The relay
+validates each signed capability offline against `ISSUER_PUBKEY`.
 
 ## Cert renewal (host cron)
 
@@ -122,11 +129,12 @@ deploy/
 ├── docker-compose.chain.yml    # optional chain overlay (ops)
 ├── Dockerfile.relay
 ├── scripts/
-│   ├── bootstrap.sh
-│   ├── issue-ticket.sh
+│   ├── preflight.sh
+│   ├── bootstrap-prod.sh
+│   ├── bootstrap.sh            # local relay build variant
+│   ├── provision-link.sh       # local-only capability/config link issuer
+│   ├── issue-ticket.sh         # legacy raw-ticket helper, not production
 │   └── renew-cert.sh
-└── data/
-    └── tickets/                # local/dev credential material if used
 ```
 
 Production cover source trees live in **private** repositories, not here.

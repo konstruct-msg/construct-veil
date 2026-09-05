@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Issue an additional ticket, append to data/tickets/tickets.json.
-# Optionally restart the relay so it picks up the new ticket.
+# Legacy raw-ticket helper for old ticket-store deployments.
+# Current production relays validate signed capabilities via --issuer-pubkey;
+# do not use this script with docker-compose.prod.yml.
 #
 # Usage:
 #   ./scripts/issue-ticket.sh                # 60 days, append, no restart
