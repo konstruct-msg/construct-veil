@@ -1,5 +1,7 @@
 # construct-veil
 
+**VEIL** — *Variable Encoded Interface Layer.*
+
 Pluggable transport suite for Construct Messenger — makes gRPC traffic indistinguishable
 from random noise or cover web traffic. DPI resistance for Iran, China, Russia.
 
