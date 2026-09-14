@@ -1,0 +1,18 @@
+[package]
+name = "construct-veil-trace"
+description = "Measurement rig: what a capture of our traffic looks like to someone who cannot decrypt it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "veil-trace"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+etherparse = "0.15"
+pcap = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
