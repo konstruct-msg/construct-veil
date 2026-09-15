@@ -15,7 +15,7 @@
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder};
 use tokio_util::sync::CancellationToken;
@@ -117,7 +117,28 @@ async fn dial_and_authenticate(
     // TLS handshake with SPKI pinning.
     let mut tls_stream = dial_utls_tcp(tcp, tls_sni, spki_hex, relay_addr).await?;
     let exporter = derive_exporter(&tls_stream)?;
+    authenticate_over(&mut tls_stream, &exporter, capability_b64, auth_v3).await?;
+    Ok(tls_stream)
+}
 
+/// Build and send the veil-front AUTH frame over an already-established relay
+/// stream, binding it to `exporter` — the TLS exporter keying material of that
+/// same stream (`EXPORTER_LABEL`, empty context, 32 bytes).
+///
+/// Split out of [`dial_and_authenticate`] so the two TLS-termination paths share
+/// it: the rustls dial path derives `exporter` from its own connection, while the
+/// host-terminated path (review §3.1 variant A) receives `exporter` from the
+/// platform TLS stack that owns the session. Both must bind AUTH to the exact
+/// exporter the relay will recompute, or the relay's gate rejects the session.
+async fn authenticate_over<W>(
+    relay_wr: &mut W,
+    exporter: &[u8; EXPORTER_LEN],
+    capability_b64: &str,
+    auth_v3: &VeilFrontAuthV3,
+) -> Result<(), ObfuscatorError>
+where
+    W: AsyncWrite + Unpin,
+{
     let auth_frame_payload =
         if !auth_v3.capability_v2_b64.is_empty() && !auth_v3.veil_sk_hex.is_empty() {
             // AUTH v3: key-bound capability + client signature over the exporter.
@@ -125,14 +146,14 @@ async fn dial_and_authenticate(
             // signature bound to this TLS session).
             let capability = parse_capability_v2(&auth_v3.capability_v2_b64)?;
             let veil_sk = parse_veil_sk(&auth_v3.veil_sk_hex)?;
-            let auth = AuthRecordV3::from_capability(&capability, &veil_sk, &exporter);
+            let auth = AuthRecordV3::from_capability(&capability, &veil_sk, exporter);
             Frame::auth_v3(auth.encode_payload())
         } else {
             // AUTH v2: backend-signed bearer capability + HMAC(auth_key, exporter
             // || ticket_id || not_after). The relay verifies the issuer signature
             // offline (no ticket store) then the exporter-bound authcode.
             let capability = parse_capability(capability_b64)?;
-            let auth = AuthRecordV2::from_capability(&capability, &exporter);
+            let auth = AuthRecordV2::from_capability(&capability, exporter);
             Frame::auth_v2(auth.encode_payload())
         };
 
@@ -144,13 +165,12 @@ async fn dial_and_authenticate(
         .with_buckets(LENGTH_BUCKETS)
         .encode(auth_frame_payload, &mut auth_frame)
         .map_err(ObfuscatorError::Io)?;
-    tls_stream
+    relay_wr
         .write_all(&auth_frame)
         .await
         .map_err(ObfuscatorError::Io)?;
-    tls_stream.flush().await.map_err(ObfuscatorError::Io)?;
-
-    Ok(tls_stream)
+    relay_wr.flush().await.map_err(ObfuscatorError::Io)?;
+    Ok(())
 }
 
 /// Execute the veil-front probe: auth, then drive a real end-to-end round-trip.
@@ -256,8 +276,20 @@ pub async fn run_veil_front_ferry_with_metrics(
 ) -> Result<WriteStrategy, ObfuscatorError> {
     let tls_stream =
         dial_and_authenticate(relay_addr, tls_sni, spki_hex, ticket_b64, auth_v3).await?;
+    run_ferry(tls_stream, local).await
+}
 
-    let (relay_rd, relay_wr) = tokio::io::split(tls_stream);
+/// Ferry the local gRPC h2c bytes over an already-authenticated relay stream:
+/// local → payload/chaff → `DATA`/`CHAFF` frames → relay (up), and relay `DATA`
+/// frames → local, dropping `CHAFF` (down). Generic over the relay stream so the
+/// rustls dial path (`TlsStream<TcpStream>`) and the host-terminated path (a
+/// decrypted duplex from the platform TLS stack, review §3.1 variant A) share one
+/// ferry. Runs both directions on the current task via `join!`, so no `Send`.
+async fn run_ferry<S>(relay: S, local: TcpStream) -> Result<WriteStrategy, ObfuscatorError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (relay_rd, relay_wr) = tokio::io::split(relay);
     let (local_rd, local_wr) = tokio::io::split(local);
 
     // Use a WriteStrategy for the up-stream: payload + chaff with priority.
@@ -357,6 +389,29 @@ pub async fn run_veil_front_ferry_with_metrics(
     r2?;
 
     Ok(strategy)
+}
+
+/// Ferry variant for the host-terminated-TLS path (review §3.1 variant A).
+///
+/// The TLS to the relay lives in the platform stack (e.g. Swift Network.framework,
+/// for the native ClientHello fingerprint); it hands us the already-decrypted
+/// duplex `relay` plus the 32-byte TLS `exporter` it derived for that session. We
+/// authenticate over it — binding AUTH to that exact exporter, which the relay
+/// recomputes from its own side — then run the same [`run_ferry`] as the rustls
+/// path. The rustls path ([`run_veil_front_ferry_with_metrics`]) stays as the
+/// fallback and as the only path on non-Apple platforms.
+pub async fn run_veil_front_ferry_external<S>(
+    local: TcpStream,
+    mut relay: S,
+    exporter: &[u8; EXPORTER_LEN],
+    capability_b64: &str,
+    auth_v3: &VeilFrontAuthV3,
+) -> Result<WriteStrategy, ObfuscatorError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    authenticate_over(&mut relay, exporter, capability_b64, auth_v3).await?;
+    run_ferry(relay, local).await
 }
 
 /// Run the veil-front data ferry for one accepted local connection.

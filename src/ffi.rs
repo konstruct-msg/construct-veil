@@ -1002,6 +1002,131 @@ pub struct VeilStartResult {
     pub latency_ms: u32,
 }
 
+#[cfg(unix)]
+static PROXY_VEIL_FRONT_EXT: Mutex<Option<ProxyHandle>> = Mutex::new(None);
+
+/// Start a veil-front ferry over a host-terminated TLS session (review §3.1
+/// variant A). The platform (Swift Network.framework) owns the TLS to the relay
+/// — for the native ClientHello fingerprint — and hands us:
+///
+/// - `relay_fd`: one end of a socketpair carrying the **decrypted** relay duplex;
+///   the host pumps its `NWConnection` ↔ the other end. We take ownership of this
+///   fd unconditionally (it is closed by us on every return, success or failure);
+///   the caller must not close it after the call.
+/// - `exporter_ptr`/`exporter_len`: the 32-byte TLS exporter the host derived for
+///   that session (`sec_protocol_metadata_create_secret`, `EXPORTER_LABEL`), which
+///   the relay recomputes; AUTH is bound to it.
+/// - `capability_v2_b64` + `veil_sk_hex`: AUTH v3 material; empty `veil_sk_hex`
+///   falls back to AUTH v2 with `ticket_b64`.
+///
+/// Binds a local `127.0.0.1` listener, writes its port to `port_out`, accepts a
+/// single local gRPC connection and ferries it to the relay duplex. One relay fd
+/// serves one session (one `NWConnection` = one tunnel); the host re-invokes on
+/// reconnect. Returns 0 on success, -1 on failure.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
+pub extern "C" fn veil_proxy_start_veil_front_external(
+    relay_fd: i32,
+    exporter_ptr: *const u8,
+    exporter_len: usize,
+    capability_v2_b64: *const c_char,
+    veil_sk_hex: *const c_char,
+    ticket_b64: *const c_char,
+    port_out: *mut u16,
+) -> i32 {
+    use construct_veil_protocol::EXPORTER_LEN;
+    use std::os::fd::FromRawFd;
+
+    // Adopt the socketpair fd first, so every return path (including the errors
+    // below) closes it — the ownership contract is unconditional.
+    let std_relay = unsafe { std::os::unix::net::UnixStream::from_raw_fd(relay_fd) };
+
+    if exporter_ptr.is_null() || exporter_len != EXPORTER_LEN {
+        return -1;
+    }
+    let mut exporter = [0u8; EXPORTER_LEN];
+    unsafe { std::ptr::copy_nonoverlapping(exporter_ptr, exporter.as_mut_ptr(), EXPORTER_LEN) };
+
+    let cstr = |p: *const c_char| -> String {
+        unsafe {
+            p.as_ref()
+                .and_then(|p| CStr::from_ptr(p).to_str().ok())
+                .unwrap_or("")
+                .to_owned()
+        }
+    };
+    let auth_v3 = crate::veil::obfuscator::VeilFrontAuthV3 {
+        capability_v2_b64: cstr(capability_v2_b64),
+        veil_sk_hex: cstr(veil_sk_hex),
+    };
+    let ticket_b64 = cstr(ticket_b64);
+
+    if std_relay.set_nonblocking(true).is_err() {
+        return -1;
+    }
+
+    let rt = get_runtime();
+    let result: Result<u16, ()> = rt.block_on(async move {
+        {
+            let guard = PROXY_VEIL_FRONT_EXT.lock().map_err(|_| ())?;
+            if guard.is_some() {
+                return Err(()); // already running
+            }
+        }
+        let relay = tokio::net::UnixStream::from_std(std_relay).map_err(|_| ())?;
+        let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|_| ())?;
+        let port = listener.local_addr().map_err(|_| ())?.port();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        rt.spawn(veil_front_external_loop(
+            listener, relay, exporter, ticket_b64, auth_v3, shutdown_rx,
+        ));
+        let mut guard = PROXY_VEIL_FRONT_EXT.lock().map_err(|_| ())?;
+        *guard = Some(ProxyHandle { port, shutdown_tx });
+        Ok(port)
+    });
+
+    match result {
+        Ok(p) => {
+            if !port_out.is_null() {
+                unsafe { *port_out = p };
+            }
+            0
+        }
+        Err(()) => -1,
+    }
+}
+
+/// Accept exactly one local gRPC connection and ferry it over the host-provided
+/// relay duplex, then clear the slot. See [`veil_proxy_start_veil_front_external`].
+#[cfg(unix)]
+async fn veil_front_external_loop(
+    listener: TcpListener,
+    relay: tokio::net::UnixStream,
+    exporter: [u8; construct_veil_protocol::EXPORTER_LEN],
+    ticket_b64: String,
+    auth_v3: crate::veil::obfuscator::VeilFrontAuthV3,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    let accepted = tokio::select! {
+        _ = &mut shutdown_rx => None,
+        result = listener.accept() => result.ok().map(|(local, _)| local),
+    };
+    if let Some(local) = accepted {
+        let _ = crate::veil::veil_front_adapter::run_veil_front_ferry_external(
+            local,
+            relay,
+            &exporter,
+            &ticket_b64,
+            &auth_v3,
+        )
+        .await;
+    }
+    if let Ok(mut guard) = PROXY_VEIL_FRONT_EXT.lock() {
+        *guard = None;
+    }
+}
+
 /// Start an VEIL session using the FSM-based coordinator.
 ///
 /// Sequential probing (top_k_probes=1) for Phase 1 backward compatibility.
