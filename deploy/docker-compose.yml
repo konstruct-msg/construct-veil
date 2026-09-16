@@ -5,6 +5,10 @@
 #   # or: docker build -t my-cover:dev /path/to/private-cover && COVER_IMAGE=my-cover:dev
 #   docker compose up -d
 
+# Pin the project name so containers/network are stable no matter which directory
+# this is run from. An explicit COMPOSE_PROJECT_NAME in the env still overrides it.
+name: veil-front
+
 services:
   cover:
     image: ${COVER_IMAGE:?Set COVER_IMAGE to your private cover image (see deploy/COVER.md)}
@@ -76,6 +80,13 @@ services:
       retries: 3
       start_period: 5s
 
+# External, fixed-name volumes — see docker-compose.prod.yml for the rationale.
+# The cert volume name must not depend on the compose project, or a run from a
+# different directory attaches a fresh empty volume and crashes the relay.
 volumes:
   letsencrypt:
+    external: true
+    name: ${LETSENCRYPT_VOLUME:-veil_letsencrypt}
   certbot-www:
+    external: true
+    name: ${CERTBOT_WWW_VOLUME:-veil_certbot-www}

@@ -12,7 +12,9 @@ cd "$(dirname "$0")/.."
 set -a; source .env; set +a
 : "${DOMAIN:?DOMAIN must be set in .env}"
 
-CERT_PATH="/var/lib/docker/volumes/$(basename "$PWD" | tr '[:upper:]' '[:lower:]')_letsencrypt/_data/live/${DOMAIN}/cert.pem"
+# Resolve the fixed external volume name (no longer the project/dir basename).
+. scripts/lib.sh
+CERT_PATH="/var/lib/docker/volumes/${LETSENCRYPT_VOLUME}/_data/live/${DOMAIN}/cert.pem"
 PRE_MTIME=$(stat -c '%Y' "$CERT_PATH" 2>/dev/null || echo 0)
 
 # SPKI pin BEFORE renewal (from the live wire cert) — used to assert the pin did
