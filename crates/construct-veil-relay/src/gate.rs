@@ -27,6 +27,7 @@ use bytes::BytesMut;
 use construct_veil_protocol::{
     AuthRecordV2, AuthRecordV3, EXPORTER_LABEL, ROLE_RELAY, ROLE_USER, VeilFrontCodec,
 };
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio_rustls::server::TlsStream;
 use tokio_util::codec::Decoder;
@@ -37,6 +38,14 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// First 6 bytes of SHA-256(exporter) as hex — a short fingerprint for
+/// cross-checking the exporter the host (Swift) derived against the one the
+/// relay computes for the SAME TLS session (review §3.1 variant A diagnostics).
+/// Safe to log: it's a one-way digest of a session-scoped secret, not the secret.
+fn exp_h6(exporter: &[u8; 32]) -> String {
+    hex::encode(&Sha256::digest(exporter)[..6])
 }
 
 /// Timeout for the second read attempt during the gate.
@@ -205,7 +214,16 @@ fn try_decode_auth(
                     leftover: decode_buf,
                 })
             } else {
-                debug!("capability (v2) invalid (sig/expiry/scope/authcode), routing to site");
+                // A well-formed AUTH v2 frame that fails validation is the exact
+                // signature of an exporter mismatch (host-terminated-TLS path):
+                // the frame decoded, so AUTH *arrived* (up-pump works), but the
+                // exporter-bound authcode did not verify. warn! (not debug) so it
+                // surfaces at prod log level; compare exp= against the host's log.
+                warn!(
+                    exp = %exp_h6(exporter),
+                    scope_ok,
+                    "capability (v2) invalid (sig/expiry/scope/authcode), routing to site"
+                );
                 Some(GateDecision::Site)
             }
         }
@@ -240,7 +258,16 @@ fn try_decode_auth(
                     leftover: decode_buf,
                 })
             } else {
-                debug!(
+                // Well-formed AUTH v3 that fails validation = exporter-mismatch
+                // signature (host-terminated-TLS path): the frame decoded (AUTH
+                // arrived, up-pump works) but the client signature over the
+                // exporter did not verify. warn! at prod level; compare exp=
+                // against the host's derived-exporter log to confirm the cause.
+                warn!(
+                    exp = %exp_h6(exporter),
+                    scope_ok,
+                    user_ok,
+                    relay_ok,
                     "capability (v3) invalid (sig/role/expiry/scope/client_sig), routing to site"
                 );
                 Some(GateDecision::Site)
