@@ -7,6 +7,11 @@
 #   docker compose -f docker-compose.prod.yml up -d cover
 #   ... (then bootstrap / certs as in README.md)
 
+# Pin the project name so containers/network are stable no matter which directory
+# this is run from. An explicit COMPOSE_PROJECT_NAME in the env still overrides it
+# (kept for pre-existing nodes). New nodes get `veil-front` deterministically.
+name: veil-front
+
 services:
   cover:
     image: ${COVER_IMAGE:?Set COVER_IMAGE to your private cover image (see deploy/COVER.md)}
@@ -73,6 +78,18 @@ services:
       retries: 3
       start_period: 5s
 
+# External, fixed-name volumes — the cert lives in a volume whose name does NOT
+# depend on the compose project (which is the directory basename by default).
+# Naming it `<project>_letsencrypt` is exactly what let a run from a different
+# directory attach a fresh EMPTY volume and crash the relay on a missing cert.
+# External + fixed name freezes it; `bootstrap*.sh` create them once (compose
+# will not auto-create external volumes). Existing nodes whose cert already sits
+# in a `<project>_letsencrypt` volume set LETSENCRYPT_VOLUME / CERTBOT_WWW_VOLUME
+# to that name instead of migrating.
 volumes:
   letsencrypt:
+    external: true
+    name: ${LETSENCRYPT_VOLUME:-veil_letsencrypt}
   certbot-www:
+    external: true
+    name: ${CERTBOT_WWW_VOLUME:-veil_certbot-www}

@@ -20,6 +20,9 @@ CAPABILITY_DAYS="${CAPABILITY_DAYS:-${TICKET_DAYS:-60}}"
 EXTRA_DOMAINS="${EXTRA_DOMAINS:-}"
 export COVER_IMAGE
 
+# Volume-name contract + helpers (resolves LETSENCRYPT_VOLUME / CERTBOT_WWW_VOLUME).
+. scripts/lib.sh
+
 # Build certbot -d args
 CERTBOT_DOMAINS=("-d" "$DOMAIN")
 if [ -n "$EXTRA_DOMAINS" ]; then
@@ -36,6 +39,9 @@ echo "▸ EMAIL       = $EMAIL"
 echo "▸ COVER_IMAGE = $COVER_IMAGE"
 echo "▸ ISSUER      = ${ISSUER_PUBKEY:0:12}…"
 echo
+
+# ── Ensure the external volumes exist (compose won't auto-create them) ───
+ensure_volumes
 
 # ── Pull images ──────────────────────────────────────────────────────────
 echo "▸ Pulling relay (GHCR) + cover (COVER_IMAGE)…"
@@ -55,13 +61,17 @@ for i in 1 2 3 4 5; do
   sleep 1
 done
 
-# ── Issue cert ───────────────────────────────────────────────────────────
-echo "▸ Requesting Let's Encrypt cert for: ${CERTBOT_DOMAINS[*]}"
-$COMPOSE run --rm certbot certonly \
-  --webroot -w /var/www/certbot \
-  "${CERTBOT_DOMAINS[@]}" \
-  --email "$EMAIL" \
-  --agree-tos --no-eff-email --reuse-key --expand -n
+# ── Issue cert (idempotent: skip if one already exists) ──────────────────
+if cert_exists "$DOMAIN" && [ -z "${FORCE_CERT:-}" ]; then
+  echo "▸ Cert for $DOMAIN already present — skipping issuance (FORCE_CERT=1 to re-issue)."
+else
+  echo "▸ Requesting Let's Encrypt cert for: ${CERTBOT_DOMAINS[*]}"
+  $COMPOSE run --rm certbot certonly \
+    --webroot -w /var/www/certbot \
+    "${CERTBOT_DOMAINS[@]}" \
+    --email "$EMAIL" \
+    --agree-tos --no-eff-email --reuse-key --expand -n
+fi
 
 # ── Make certs readable by the non-root relay (uid 65532) ───────────────────
 # certbot writes privkey.pem 0600 root:root and live/archive dirs 0700, so the
