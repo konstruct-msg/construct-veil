@@ -1079,7 +1079,12 @@ pub extern "C" fn veil_proxy_start_veil_front_external(
         let port = listener.local_addr().map_err(|_| ())?.port();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         rt.spawn(veil_front_external_loop(
-            listener, relay, exporter, ticket_b64, auth_v3, shutdown_rx,
+            listener,
+            relay,
+            exporter,
+            ticket_b64,
+            auth_v3,
+            shutdown_rx,
         ));
         let mut guard = PROXY_VEIL_FRONT_EXT.lock().map_err(|_| ())?;
         *guard = Some(ProxyHandle { port, shutdown_tx });
