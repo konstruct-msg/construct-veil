@@ -1002,7 +1002,10 @@ pub struct VeilStartResult {
     pub latency_ms: u32,
 }
 
-#[cfg(unix)]
+// Gated on `coordinator` (not just `unix`): this path uses `crate::veil`, which
+// only exists with that feature. iOS builds enable it; `ffi-tls`-only builds omit
+// the symbol (the host-terminated-TLS path needs the coordinator machinery anyway).
+#[cfg(all(unix, feature = "coordinator"))]
 static PROXY_VEIL_FRONT_EXT: Mutex<Option<ProxyHandle>> = Mutex::new(None);
 
 /// Start a veil-front ferry over a host-terminated TLS session (review §3.1
@@ -1023,7 +1026,7 @@ static PROXY_VEIL_FRONT_EXT: Mutex<Option<ProxyHandle>> = Mutex::new(None);
 /// single local gRPC connection and ferries it to the relay duplex. One relay fd
 /// serves one session (one `NWConnection` = one tunnel); the host re-invokes on
 /// reconnect. Returns 0 on success, -1 on failure.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "coordinator"))]
 #[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
 pub extern "C" fn veil_proxy_start_veil_front_external(
@@ -1104,7 +1107,7 @@ pub extern "C" fn veil_proxy_start_veil_front_external(
 
 /// Accept exactly one local gRPC connection and ferry it over the host-provided
 /// relay duplex, then clear the slot. See [`veil_proxy_start_veil_front_external`].
-#[cfg(unix)]
+#[cfg(all(unix, feature = "coordinator"))]
 async fn veil_front_external_loop(
     listener: TcpListener,
     relay: tokio::net::UnixStream,
