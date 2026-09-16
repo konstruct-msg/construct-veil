@@ -29,10 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // named — same reason main.rs does it.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let certified = rcgen::generate_simple_self_signed(vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-    ])?;
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;
     let cert_der = certified.cert.der().clone();
     let key_der = PrivateKeyDer::try_from(certified.key_pair.serialize_der())?;
 
@@ -69,7 +67,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(_) => {
                     println!("--- connection from {peer}");
                     println!("protocol : {:?}", conn.protocol_version());
-                    println!("alpn     : {:?}", conn.alpn_protocol().map(String::from_utf8_lossy));
+                    println!(
+                        "alpn     : {:?}",
+                        conn.alpn_protocol().map(String::from_utf8_lossy)
+                    );
                     println!("label    : {EXPORTER_LABEL:?}");
                     println!("rust     : {}", hex::encode(exporter));
                 }
