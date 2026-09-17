@@ -161,6 +161,19 @@ pub extern "C" fn veil_proxy_stop() -> i32 {
         stopped = true;
     }
 
+    // Also stop the host-terminated (external) veil-front ferry. Without this the
+    // EXT slot lingers as `Some` after a stop, so the next
+    // `veil_proxy_start_veil_front_external` used to see it occupied and return
+    // -1 (the native-TLS flap on reconnect). Its start now supersedes a stale
+    // session too, but stopping here keeps the port from lingering meanwhile.
+    #[cfg(all(unix, feature = "coordinator"))]
+    if let Ok(mut guard) = PROXY_VEIL_FRONT_EXT.lock()
+        && let Some(handle) = guard.take()
+    {
+        let _ = handle.shutdown_tx.send(());
+        stopped = true;
+    }
+
     if stopped { 0 } else { -1 }
 }
 
@@ -1005,8 +1018,21 @@ pub struct VeilStartResult {
 // Gated on `coordinator` (not just `unix`): this path uses `crate::veil`, which
 // only exists with that feature. iOS builds enable it; `ffi-tls`-only builds omit
 // the symbol (the host-terminated-TLS path needs the coordinator machinery anyway).
+//
+// Its own handle type (not the shared `ProxyHandle`) carries a `generation`: a
+// restart supersedes the previous session, and the old loop's teardown must only
+// clear the slot when it still owns it — otherwise a slow-exiting old loop would
+// wipe the handle a fresh start just installed. See
+// [`veil_proxy_start_veil_front_external`].
 #[cfg(all(unix, feature = "coordinator"))]
-static PROXY_VEIL_FRONT_EXT: Mutex<Option<ProxyHandle>> = Mutex::new(None);
+struct VeilFrontExtHandle {
+    generation: u64,
+    shutdown_tx: oneshot::Sender<()>,
+}
+#[cfg(all(unix, feature = "coordinator"))]
+static PROXY_VEIL_FRONT_EXT: Mutex<Option<VeilFrontExtHandle>> = Mutex::new(None);
+#[cfg(all(unix, feature = "coordinator"))]
+static VEIL_FRONT_EXT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Start a veil-front ferry over a host-terminated TLS session (review §3.1
 /// variant A). The platform (Swift Network.framework) owns the TLS to the relay
@@ -1071,17 +1097,25 @@ pub extern "C" fn veil_proxy_start_veil_front_external(
 
     let rt = get_runtime();
     let result: Result<u16, ()> = rt.block_on(async move {
-        {
-            let guard = PROXY_VEIL_FRONT_EXT.lock().map_err(|_| ())?;
-            if guard.is_some() {
-                return Err(()); // already running
-            }
+        use std::sync::atomic::Ordering;
+
+        // Supersede any prior session instead of failing with -1. The host
+        // re-invokes on every reconnect (one relay duplex = one tunnel), and a
+        // previous session may still be lingering — e.g. `veil_proxy_stop` was
+        // not called, or its loop is mid-teardown. Take the old handle and fire
+        // its shutdown; the generation guard below stops that old loop from
+        // clearing the slot we are about to fill.
+        let generation = VEIL_FRONT_EXT_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(old) = PROXY_VEIL_FRONT_EXT.lock().map_err(|_| ())?.take() {
+            let _ = old.shutdown_tx.send(());
         }
+
         let relay = tokio::net::UnixStream::from_std(std_relay).map_err(|_| ())?;
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|_| ())?;
         let port = listener.local_addr().map_err(|_| ())?.port();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         rt.spawn(veil_front_external_loop(
+            generation,
             listener,
             relay,
             exporter,
@@ -1090,7 +1124,10 @@ pub extern "C" fn veil_proxy_start_veil_front_external(
             shutdown_rx,
         ));
         let mut guard = PROXY_VEIL_FRONT_EXT.lock().map_err(|_| ())?;
-        *guard = Some(ProxyHandle { port, shutdown_tx });
+        *guard = Some(VeilFrontExtHandle {
+            generation,
+            shutdown_tx,
+        });
         Ok(port)
     });
 
@@ -1105,10 +1142,17 @@ pub extern "C" fn veil_proxy_start_veil_front_external(
     }
 }
 
-/// Accept exactly one local gRPC connection and ferry it over the host-provided
-/// relay duplex, then clear the slot. See [`veil_proxy_start_veil_front_external`].
+/// Ferry a single local gRPC connection over the host-provided relay duplex.
+///
+/// One relay duplex authenticates once (`EXPORTER_LABEL`) and carries exactly one
+/// tunnel — one local gRPC connection ↔ one backend h2 session — so this serves a
+/// single ferry and the host re-invokes on reconnect. The accept runs in a loop
+/// only to ride out transient `accept()` errors without tearing the session down
+/// before the host's real, long-lived connection lands; a shutdown ends it at
+/// once. See [`veil_proxy_start_veil_front_external`].
 #[cfg(all(unix, feature = "coordinator"))]
 async fn veil_front_external_loop(
+    generation: u64,
     listener: TcpListener,
     relay: tokio::net::UnixStream,
     exporter: [u8; construct_veil_protocol::EXPORTER_LEN],
@@ -1116,9 +1160,17 @@ async fn veil_front_external_loop(
     auth_v3: crate::veil::obfuscator::VeilFrontAuthV3,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
-    let accepted = tokio::select! {
-        _ = &mut shutdown_rx => None,
-        result = listener.accept() => result.ok().map(|(local, _)| local),
+    // Accept the first real connection (relay is moved into the ferry once, so
+    // the accept retry lives in its own loop that yields an Option rather than
+    // looping over the move).
+    let accepted: Option<tokio::net::TcpStream> = loop {
+        tokio::select! {
+            _ = &mut shutdown_rx => break None,
+            result = listener.accept() => match result {
+                Ok((local, _)) => break Some(local),
+                Err(_) => continue, // transient; keep the listener bound
+            },
+        }
     };
     if let Some(local) = accepted {
         let _ = crate::veil::veil_front_adapter::run_veil_front_ferry_external(
@@ -1130,7 +1182,13 @@ async fn veil_front_external_loop(
         )
         .await;
     }
-    if let Ok(mut guard) = PROXY_VEIL_FRONT_EXT.lock() {
+
+    // Clear the slot only if it is still ours. A newer start (higher generation)
+    // may have superseded this session and installed its own handle; wiping that
+    // would orphan the live tunnel while leaving its port refusing connections.
+    if let Ok(mut guard) = PROXY_VEIL_FRONT_EXT.lock()
+        && guard.as_ref().is_some_and(|h| h.generation == generation)
+    {
         *guard = None;
     }
 }
