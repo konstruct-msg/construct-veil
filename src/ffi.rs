@@ -1193,6 +1193,95 @@ async fn veil_front_external_loop(
     }
 }
 
+/// Ferry ONE host-terminated veil-front connection over an already-accepted local
+/// socket (review §3.1 variant A, persistent-listener form).
+///
+/// Unlike [`veil_proxy_start_veil_front_external`], this owns no listener and no
+/// slot: the host (Swift) binds the stable local gRPC listener, accepts each
+/// connection, dials a fresh native `NWConnection` per accept, and calls this once
+/// per (local connection, relay session) pair. That makes the local port outlive
+/// any single gRPC connection — the one-shot listener forced a fresh port + proxy
+/// restart on every reconnect, which is the startup flap.
+///
+/// - `local_fd`: the accepted local gRPC TCP socket. We adopt and close it.
+/// - `relay_fd`: one end of a socketpair carrying the **decrypted** relay duplex
+///   for a fresh `NWConnection`; the host pumps the other end. We adopt and close it.
+/// - `exporter_ptr`/`exporter_len`: the 32-byte TLS exporter for THAT NWConnection.
+/// - `capability_v2_b64` + `veil_sk_hex`: AUTH v3 material; empty `veil_sk_hex`
+///   falls back to AUTH v2 with `ticket_b64`.
+///
+/// Both fds are adopted unconditionally (closed by us on every path); the caller
+/// must not touch them after the call. Spawns the ferry and returns immediately —
+/// 0 if it was started, -1 on bad arguments. The ferry ends when either side
+/// closes; the host observes that as EOF on its socketpair end.
+#[cfg(all(unix, feature = "coordinator"))]
+#[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
+pub extern "C" fn veil_front_ferry_fd(
+    local_fd: i32,
+    relay_fd: i32,
+    exporter_ptr: *const u8,
+    exporter_len: usize,
+    capability_v2_b64: *const c_char,
+    veil_sk_hex: *const c_char,
+    ticket_b64: *const c_char,
+) -> i32 {
+    use construct_veil_protocol::EXPORTER_LEN;
+    use std::os::fd::FromRawFd;
+
+    // Adopt both fds first so every return path closes them (unconditional owner).
+    let std_local = unsafe { std::net::TcpStream::from_raw_fd(local_fd) };
+    let std_relay = unsafe { std::os::unix::net::UnixStream::from_raw_fd(relay_fd) };
+
+    if exporter_ptr.is_null() || exporter_len != EXPORTER_LEN {
+        return -1;
+    }
+    let mut exporter = [0u8; EXPORTER_LEN];
+    unsafe { std::ptr::copy_nonoverlapping(exporter_ptr, exporter.as_mut_ptr(), EXPORTER_LEN) };
+
+    let cstr = |p: *const c_char| -> String {
+        unsafe {
+            p.as_ref()
+                .and_then(|p| CStr::from_ptr(p).to_str().ok())
+                .unwrap_or("")
+                .to_owned()
+        }
+    };
+    let auth_v3 = crate::veil::obfuscator::VeilFrontAuthV3 {
+        capability_v2_b64: cstr(capability_v2_b64),
+        veil_sk_hex: cstr(veil_sk_hex),
+    };
+    let ticket_b64 = cstr(ticket_b64);
+
+    if std_local.set_nonblocking(true).is_err() || std_relay.set_nonblocking(true).is_err() {
+        return -1;
+    }
+
+    let rt = get_runtime();
+    let result: Result<(), ()> = rt.block_on(async move {
+        // `from_std` registers with the reactor, so it must run inside the runtime.
+        let local = tokio::net::TcpStream::from_std(std_local).map_err(|_| ())?;
+        let relay = tokio::net::UnixStream::from_std(std_relay).map_err(|_| ())?;
+        rt.spawn(async move {
+            let _ = crate::veil::veil_front_adapter::run_veil_front_ferry_external(
+                local,
+                relay,
+                &exporter,
+                &ticket_b64,
+                &auth_v3,
+            )
+            .await;
+            // `local` and `relay` drop here → both fds are closed.
+        });
+        Ok(())
+    });
+
+    match result {
+        Ok(()) => 0,
+        Err(()) => -1,
+    }
+}
+
 /// Start an VEIL session using the FSM-based coordinator.
 ///
 /// Sequential probing (top_k_probes=1) for Phase 1 backward compatibility.
