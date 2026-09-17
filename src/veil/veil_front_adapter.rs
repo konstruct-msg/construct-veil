@@ -308,9 +308,31 @@ where
         let mut rbuf = [0u8; 8192];
 
         loop {
-            // 1. Check if there's a frame ready to send (payload or chaff).
+            // 1. Service the local stream FIRST, every iteration. A busy chaff
+            //    schedule must never starve the client's real payload. This was
+            //    the host-terminated (native-TLS) up-stall: during the 3s front
+            //    window `next_frame()` returns chaff on every call, and the old
+            //    `continue` after a chaff write looped on chaff without ever
+            //    reaching this read — so on a fast (socketpair) transport the
+            //    gRPC preface was never read or forwarded, and the relay saw
+            //    up_data_frames=0 with only chaff. The short timeout still lets
+            //    chaff fill idle gaps. (rustls escaped it only because its
+            //    network-paced writes left room for the read.)
+            match tokio::time::timeout(Duration::from_millis(20), local_rd.read(&mut rbuf)).await {
+                Ok(Ok(0)) => break, // EOF
+                Ok(Ok(n)) => {
+                    strategy
+                        .payload_queue
+                        .push(Frame::data(Bytes::copy_from_slice(&rbuf[..n])));
+                }
+                Ok(Err(e)) => return Err(ObfuscatorError::Io(e)),
+                Err(_) => { /* idle — fall through to emit a frame */ }
+            }
+
+            // 2. Emit one frame: payload takes priority (see WriteStrategy), chaff
+            //    fills idle time. One frame per iteration keeps payload and chaff
+            //    interleaved rather than letting either starve the other.
             if let Some(frame) = strategy.next_frame() {
-                let frame_type = frame.frame_type;
                 let mut out = BytesMut::with_capacity(frame.payload.len() + 16);
                 up_codec
                     .encode(frame, &mut out)
@@ -320,31 +342,7 @@ where
                     .await
                     .map_err(ObfuscatorError::Io)?;
                 relay_wr.flush().await.map_err(ObfuscatorError::Io)?;
-
-                // If we just sent chaff, continue the loop to check for more.
-                if frame_type == FRAME_TYPE_CHAFF {
-                    continue;
-                }
-                // If we sent payload, try to read more from local.
             }
-
-            // 2. Read from local (non-blocking-ish: use a short timeout to allow
-            //    chaff injection when the local stream is idle).
-            let read_fut = local_rd.read(&mut rbuf);
-            let n = match tokio::time::timeout(Duration::from_millis(20), read_fut).await {
-                Ok(Ok(0)) => break, // EOF
-                Ok(Ok(n)) => n,     // n > 0 guaranteed by the arm above
-                Ok(Err(e)) => return Err(ObfuscatorError::Io(e)),
-                Err(_) => {
-                    // Timeout — local is idle, let chaff scheduler inject.
-                    continue;
-                }
-            };
-
-            // Push payload into the strategy's queue.
-            strategy
-                .payload_queue
-                .push(Frame::data(Bytes::copy_from_slice(&rbuf[..n])));
         }
 
         relay_wr.shutdown().await.map_err(ObfuscatorError::Io)?;
