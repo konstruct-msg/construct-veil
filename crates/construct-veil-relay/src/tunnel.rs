@@ -70,6 +70,18 @@ fn initial_chaff(rng: &mut impl Rng) -> Bytes {
 /// `leftover` contains any buffered bytes that arrived in the same read as the
 /// AUTH frame (after it was consumed) — these are the start of the framed DATA
 /// stream and are fed into the decoder before reading more from the socket.
+/// Tag a tunnel-half error with its direction while preserving the `ErrorKind`,
+/// so the aggregated `tunnel forwarding error` log says which leg failed. The two
+/// legs terminate different TLS sessions — client→backend reads the relay's TLS
+/// **server** session with the client, backend→client reads the relay's TLS
+/// **client** session with the backend — but rustls surfaces the same text for
+/// both (e.g. "cannot decrypt peer's message"), so without the tag a decrypt
+/// failure is unattributable. Kind is preserved so the disconnect classification
+/// below still fires.
+fn tag_direction(e: std::io::Error, dir: &str) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("{dir}: {e}"))
+}
+
 pub async fn forward_tunnel<S, B>(
     client_stream: S,
     leftover: BytesMut,
@@ -125,15 +137,22 @@ where
     client_wr.flush().await?;
     debug!("emitted initial CHAFF for first-response alignment");
 
-    // client → backend: de-frame DATA, drop CHAFF.
-    let up = deframe_client_to_backend(client_rd, leftover, backend_wr, up_bytes.clone());
+    // client → backend: de-frame DATA, drop CHAFF. Clone the counters out before
+    // the `async move` so the originals survive for the summary log below.
+    let up_c = up_bytes.clone();
+    let up = async move {
+        deframe_client_to_backend(client_rd, leftover, backend_wr, up_c)
+            .await
+            .map_err(|e| tag_direction(e, "client→backend"))
+    };
     // backend → client: wrap raw bytes in DATA frames.
-    let down = frame_backend_to_client(
-        backend_rd,
-        client_wr,
-        down_bytes.clone(),
-        chaff_bytes.clone(),
-    );
+    let down_c = down_bytes.clone();
+    let chaff_c = chaff_bytes.clone();
+    let down = async move {
+        frame_backend_to_client(backend_rd, client_wr, down_c, chaff_c)
+            .await
+            .map_err(|e| tag_direction(e, "backend→client"))
+    };
 
     let result = tokio::try_join!(up, down);
     progress.abort();
