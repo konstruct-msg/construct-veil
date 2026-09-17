@@ -102,9 +102,18 @@ where
     let up_bytes = Arc::new(AtomicU64::new(0)); // client → backend (requests)
     let down_bytes = Arc::new(AtomicU64::new(0)); // backend → client (responses)
     let chaff_bytes = Arc::new(AtomicU64::new(0)); // relay-injected chaff toward client
+    // Client-side frame receipt, split by type. TEMPORARY — attributes a stalled
+    // up direction: with the host-terminated (native-TLS) path, `up_bytes` stays 0
+    // when the client's gRPC never reaches us. These say whether *anything* arrives
+    // from the client after AUTH — up_chaff>0 with up_data=0 means the client shuttle
+    // is alive but the gRPC request never became DATA frames (local read / listener);
+    // both 0 means the client→relay shuttle is silent past AUTH (Swift up-pump).
+    let up_data_frames = Arc::new(AtomicU64::new(0)); // client DATA frames received
+    let up_chaff_frames = Arc::new(AtomicU64::new(0)); // client CHAFF frames received
     let start = Instant::now();
     let progress = {
         let (u, d, c) = (up_bytes.clone(), down_bytes.clone(), chaff_bytes.clone());
+        let (uf, ucf) = (up_data_frames.clone(), up_chaff_frames.clone());
         tokio::spawn(async move {
             let (mut lu, mut ld, mut lc) = (0u64, 0u64, 0u64);
             loop {
@@ -116,9 +125,12 @@ where
                 );
                 // chaff_d>0 while down_d=0 → down loop alive, backend silent (D1).
                 // chaff_d=0 while up still flows → down loop blocked on client write (D2).
+                // up_data_frames/up_chaff_frames localise a stalled up (native path).
                 info!(
                     peer = %peer, up = cu, down = cd, chaff = cc,
                     up_d = cu - lu, down_d = cd - ld, chaff_d = cc - lc,
+                    up_data_frames = uf.load(Ordering::Relaxed),
+                    up_chaff_frames = ucf.load(Ordering::Relaxed),
                     "tunnel progress (up=client→backend, down=backend→client)"
                 );
                 (lu, ld, lc) = (cu, cd, cc);
@@ -140,8 +152,10 @@ where
     // client → backend: de-frame DATA, drop CHAFF. Clone the counters out before
     // the `async move` so the originals survive for the summary log below.
     let up_c = up_bytes.clone();
+    let up_df = up_data_frames.clone();
+    let up_cf = up_chaff_frames.clone();
     let up = async move {
-        deframe_client_to_backend(client_rd, leftover, backend_wr, up_c)
+        deframe_client_to_backend(client_rd, leftover, backend_wr, up_c, up_df, up_cf)
             .await
             .map_err(|e| tag_direction(e, "client→backend"))
     };
@@ -190,6 +204,8 @@ async fn deframe_client_to_backend<R, W>(
     leftover: BytesMut,
     mut backend_wr: W,
     bytes: Arc<AtomicU64>,
+    data_frames: Arc<AtomicU64>,
+    chaff_frames: Arc<AtomicU64>,
 ) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin,
@@ -206,9 +222,14 @@ where
                 FRAME_TYPE_DATA => {
                     backend_wr.write_all(&frame.payload).await?;
                     bytes.fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
+                    data_frames.fetch_add(1, Ordering::Relaxed);
                     wrote_payload = true;
                 }
-                FRAME_TYPE_CHAFF => { /* cover traffic — discard */ }
+                FRAME_TYPE_CHAFF => {
+                    // cover traffic — discard, but count: proves the client→relay
+                    // shuttle is alive even when no DATA (gRPC) arrives.
+                    chaff_frames.fetch_add(1, Ordering::Relaxed);
+                }
                 other => {
                     // AUTH (already consumed) or unknown mid-stream frame.
                     // Drop it rather than corrupt the backend stream.
