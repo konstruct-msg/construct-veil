@@ -12,7 +12,7 @@
 //! a fresh local listener: it re-dials + re-auths and ferries the gRPC client's
 //! h2c bytes as `DATA` frames (sketch §7), dropping any `CHAFF` from the relay.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -24,7 +24,7 @@ use crate::veil::fsm::MethodId;
 use crate::veil::obfuscator::{
     Obfuscator, ObfuscatorError, ObfuscatorHandle, ProbeRequest, VeilFrontAuthV3,
 };
-use crate::veil::veil_front::WriteStrategy;
+use crate::veil::veil_front::{VeilFrontSession, WriteStrategy};
 use construct_veil_protocol::{
     AuthRecordV2, AuthRecordV3, Capability, CapabilityV2, EXPORTER_LABEL, EXPORTER_LEN,
     FRAME_TYPE_CHAFF, FRAME_TYPE_DATA, Frame, LENGTH_BUCKETS, VeilFrontCodec,
@@ -292,53 +292,42 @@ where
     let (relay_rd, relay_wr) = tokio::io::split(relay);
     let (local_rd, local_wr) = tokio::io::split(local);
 
-    // Use a WriteStrategy for the up-stream: payload + chaff with priority.
-    let strategy = WriteStrategy::new();
+    // The framing + chaff/payload policy is the sans-IO [`VeilFrontSession`]; the
+    // two halves share no mutable state, so up and down run concurrently below.
+    // This driver only moves bytes between the sockets and the session and supplies
+    // the clock. Length bucketing lives in the codec inside the session (encoder
+    // pads to the next `LENGTH_BUCKETS` boundary; the relay decoder discards the
+    // pad). The payload-beats-chaff invariant — whose violation was the on-device
+    // native-TLS up-stall (chaff busy-loop starved the gRPC read) — is now owned by
+    // `VeilFrontUp` and unit-tested in `veil_front::session`.
+    let (up_session, down_session) = VeilFrontSession::new();
 
-    // local h2c → payload queue + chaff scheduler → DATA/CHAFF frames → relay
-    //
-    // Length bucketing is handled by the codec (encoder pads payloads up to the
-    // next `LENGTH_BUCKETS` boundary with zero bytes; decoder on the relay side
-    // honours `pad_len` and discards them).
+    // local h2c → DATA/CHAFF frames → relay (up).
     let up = async move {
-        let mut strategy = strategy;
+        let mut up_session = up_session;
         let mut local_rd = local_rd;
         let mut relay_wr = relay_wr;
-        let mut up_codec = VeilFrontCodec::default().with_buckets(LENGTH_BUCKETS);
         let mut rbuf = [0u8; 8192];
 
         loop {
-            // 1. Service the local stream FIRST, every iteration. A busy chaff
-            //    schedule must never starve the client's real payload. This was
-            //    the host-terminated (native-TLS) up-stall: during the 3s front
-            //    window `next_frame()` returns chaff on every call, and the old
-            //    `continue` after a chaff write looped on chaff without ever
-            //    reaching this read — so on a fast (socketpair) transport the
-            //    gRPC preface was never read or forwarded, and the relay saw
-            //    up_data_frames=0 with only chaff. The short timeout still lets
-            //    chaff fill idle gaps. (rustls escaped it only because its
-            //    network-paced writes left room for the read.)
+            // Service the local stream FIRST every iteration — a busy chaff
+            // schedule must never starve real payload. The short timeout still lets
+            // chaff fill idle gaps.
             match tokio::time::timeout(Duration::from_millis(20), local_rd.read(&mut rbuf)).await {
                 Ok(Ok(0)) => break, // EOF
-                Ok(Ok(n)) => {
-                    strategy
-                        .payload_queue
-                        .push(Frame::data(Bytes::copy_from_slice(&rbuf[..n])));
-                }
+                Ok(Ok(n)) => up_session.queue_local(&rbuf[..n]),
                 Ok(Err(e)) => return Err(ObfuscatorError::Io(e)),
                 Err(_) => { /* idle — fall through to emit a frame */ }
             }
 
-            // 2. Emit one frame: payload takes priority (see WriteStrategy), chaff
-            //    fills idle time. One frame per iteration keeps payload and chaff
-            //    interleaved rather than letting either starve the other.
-            if let Some(frame) = strategy.next_frame() {
-                let mut out = BytesMut::with_capacity(frame.payload.len() + 16);
-                up_codec
-                    .encode(frame, &mut out)
-                    .map_err(ObfuscatorError::Io)?;
+            // Emit one frame per iteration (payload priority, else idle chaff),
+            // keeping payload and chaff interleaved rather than starving either.
+            if let Some(wire) = up_session
+                .next_wire(Instant::now())
+                .map_err(ObfuscatorError::Io)?
+            {
                 relay_wr
-                    .write_all(&out)
+                    .write_all(&wire)
                     .await
                     .map_err(ObfuscatorError::Io)?;
                 relay_wr.flush().await.map_err(ObfuscatorError::Io)?;
@@ -346,38 +335,33 @@ where
         }
 
         relay_wr.shutdown().await.map_err(ObfuscatorError::Io)?;
-        Ok(strategy)
+        Ok(up_session.into_strategy())
     };
 
-    // relay DATA frames → local; drop CHAFF
+    // relay DATA frames → local; drop CHAFF (down).
     let down = async {
+        let mut down_session = down_session;
         let mut relay_rd = relay_rd;
         let mut local_wr = local_wr;
-        let mut codec = VeilFrontCodec::default();
-        let mut buf = BytesMut::with_capacity(4096);
+        let mut rbuf = [0u8; 8192];
 
         loop {
-            // Drain any complete frames already in the buffer.
-            while let Some(frame) = codec.decode(&mut buf).map_err(ObfuscatorError::Io)? {
-                match frame.frame_type {
-                    FRAME_TYPE_DATA => {
-                        local_wr
-                            .write_all(&frame.payload)
-                            .await
-                            .map_err(ObfuscatorError::Io)?;
-                    }
-                    FRAME_TYPE_CHAFF => { /* cover traffic — discard */ }
-                    _ => { /* AUTH/unknown mid-stream — ignore */ }
-                }
+            // Drain any complete DATA payloads already buffered.
+            while let Some(payload) = down_session.next_payload().map_err(ObfuscatorError::Io)? {
+                local_wr
+                    .write_all(&payload)
+                    .await
+                    .map_err(ObfuscatorError::Io)?;
             }
 
             let n = relay_rd
-                .read_buf(&mut buf)
+                .read(&mut rbuf)
                 .await
                 .map_err(ObfuscatorError::Io)?;
             if n == 0 {
                 break;
             }
+            down_session.feed(&rbuf[..n]);
         }
         local_wr.shutdown().await.map_err(ObfuscatorError::Io)
     };
