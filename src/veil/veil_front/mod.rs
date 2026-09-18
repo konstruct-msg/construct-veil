@@ -9,7 +9,9 @@ pub mod padding_mode0 {
     //! Mode 0 — FRONT-style front-loaded chaff scheduler.
     pub use super::padding::mode0_front::*;
 }
+pub mod session;
 
 pub use construct_veil_protocol::LENGTH_BUCKETS;
 pub use padding::mode0_front::{FrontChaffScheduler, PayloadQueue, WriteStrategy};
 pub use padding::{ChaffScheduler, PaddingMode, bucket_size};
+pub use session::{VeilFrontDown, VeilFrontSession, VeilFrontUp};

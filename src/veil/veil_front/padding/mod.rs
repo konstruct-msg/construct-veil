@@ -17,6 +17,8 @@
 
 pub mod mode0_front;
 
+use std::time::Instant;
+
 use bytes::Bytes;
 use construct_veil_protocol::{FRAME_TYPE_CHAFF, Frame, LENGTH_BUCKETS, pick_bucket};
 
@@ -68,18 +70,21 @@ pub fn bucket_size(size: usize) -> usize {
 /// It is informed about payload writes (so it can yield to them) and
 /// produces chaff frames when the connection is idle.
 pub trait ChaffScheduler: Send + 'static {
-    /// Record that a payload frame was just sent.
-    /// The scheduler should defer chaff to avoid HOL blocking.
-    fn on_payload_sent(&mut self, payload_len: usize);
+    /// Record that a payload frame was just sent, at wall-clock instant `now`.
+    /// The scheduler should defer chaff to avoid HOL blocking. `now` is injected
+    /// by the caller (sans-IO): the scheduler reads no clock of its own, so its
+    /// timing is deterministic under test.
+    fn on_payload_sent(&mut self, now: Instant, payload_len: usize);
 
-    /// Poll for the next frame to send.
+    /// Poll for the next frame to send, as of wall-clock instant `now`.
     ///
     /// - Returns `Some(chaff_frame)` if the scheduler wants to inject chaff now.
     /// - Returns `None` if the scheduler is waiting (for a payload, or for time).
     ///
     /// The caller MUST check for pending payload frames first.
-    /// Chaff is only sent when there is no payload to send.
-    fn poll_chaff(&mut self) -> Option<Frame>;
+    /// Chaff is only sent when there is no payload to send. `now` is injected by
+    /// the caller (sans-IO) rather than read from the system clock.
+    fn poll_chaff(&mut self, now: Instant) -> Option<Frame>;
 
     /// Whether the scheduler has any pending chaff.
     fn has_pending(&self) -> bool;

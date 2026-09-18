@@ -110,10 +110,10 @@ impl FrontChaffScheduler {
     /// Returns `false` if:
     /// - We're in cooldown after a recent payload write (HOL blocking guard)
     /// - The front window has closed and there's no more chaff in queue
-    fn should_inject_chaff(&self) -> bool {
+    fn should_inject_chaff(&self, now: Instant) -> bool {
         // Check cooldown after payload.
         if let Some(last_payload) = self.last_payload_at {
-            let elapsed = last_payload.elapsed();
+            let elapsed = now.saturating_duration_since(last_payload);
             if elapsed < PAYLOAD_COOLDOWN {
                 return false; // Still in cooldown — don't block payload.
             }
@@ -177,25 +177,25 @@ fn sample_chaff_size(rng: &mut ChaCha8Rng) -> usize {
 }
 
 impl ChaffScheduler for FrontChaffScheduler {
-    fn on_payload_sent(&mut self, payload_len: usize) {
+    fn on_payload_sent(&mut self, now: Instant, payload_len: usize) {
         self.payload_bytes += payload_len as u64;
-        self.last_payload_at = Some(Instant::now());
+        self.last_payload_at = Some(now);
     }
 
-    fn poll_chaff(&mut self) -> Option<Frame> {
+    fn poll_chaff(&mut self, now: Instant) -> Option<Frame> {
         // Initialize connection start on first poll.
         if self.connection_start.is_none() {
-            self.connection_start = Some(Instant::now());
+            self.connection_start = Some(now);
         }
 
         // Check if the front window has closed.
-        let elapsed = self.connection_start.unwrap().elapsed();
+        let elapsed = now.saturating_duration_since(self.connection_start.unwrap());
         if elapsed >= FRONT_WINDOW {
             self.front_window_closed = true;
         }
 
         // Decide whether to inject.
-        if !self.should_inject_chaff() {
+        if !self.should_inject_chaff(now) {
             return None;
         }
 
@@ -345,17 +345,19 @@ impl WriteStrategy {
     /// Returns `Some(frame)` if there's something to send (payload or chaff).
     /// Returns `None` if there's nothing to send right now.
     ///
-    /// **Payload always takes priority over chaff.**
-    pub fn next_frame(&mut self) -> Option<Frame> {
+    /// **Payload always takes priority over chaff.** `now` is the injected clock
+    /// (sans-IO): the strategy reads no system clock, so payload/chaff timing is
+    /// deterministic under test. Callers pass `Instant::now()` in production.
+    pub fn next_frame(&mut self, now: Instant) -> Option<Frame> {
         // Payload first.
         if let Some(frame) = self.payload_queue.pop() {
             let len = frame.payload.len();
-            self.chaff_scheduler.on_payload_sent(len);
+            self.chaff_scheduler.on_payload_sent(now, len);
             return Some(frame);
         }
 
         // Chaff when idle.
-        self.chaff_scheduler.poll_chaff()
+        self.chaff_scheduler.poll_chaff(now)
     }
 
     /// Whether there's anything to send right now.
@@ -384,24 +386,29 @@ mod tests {
 
     #[test]
     fn payload_causes_cooldown() {
+        let now = Instant::now();
         let mut scheduler = FrontChaffScheduler::new();
-        scheduler.connection_start = Some(Instant::now());
+        scheduler.connection_start = Some(now);
 
         // Before cooldown — should allow chaff.
-        assert!(scheduler.should_inject_chaff());
+        assert!(scheduler.should_inject_chaff(now));
 
         // Simulate payload sent.
-        scheduler.on_payload_sent(100);
+        scheduler.on_payload_sent(now, 100);
 
-        // Immediately after — cooldown should block chaff.
-        assert!(!scheduler.should_inject_chaff());
+        // Immediately after (same instant) — cooldown should block chaff.
+        assert!(!scheduler.should_inject_chaff(now));
+
+        // Once the cooldown has elapsed, chaff is allowed again.
+        assert!(scheduler.should_inject_chaff(now + PAYLOAD_COOLDOWN));
     }
 
     #[test]
     fn payload_tracking() {
+        let now = Instant::now();
         let mut scheduler = FrontChaffScheduler::new();
-        scheduler.on_payload_sent(500);
-        scheduler.on_payload_sent(300);
+        scheduler.on_payload_sent(now, 500);
+        scheduler.on_payload_sent(now, 300);
 
         assert_eq!(scheduler.payload_bytes_sent(), 800);
         assert_eq!(scheduler.chaff_bytes_sent(), 0);
@@ -409,11 +416,12 @@ mod tests {
 
     #[test]
     fn chaff_queue_drains() {
+        let now = Instant::now();
         let mut scheduler = FrontChaffScheduler::new();
-        scheduler.connection_start = Some(Instant::now());
+        scheduler.connection_start = Some(now);
 
         let mut count = 0;
-        while let Some(_frame) = scheduler.poll_chaff() {
+        while let Some(_frame) = scheduler.poll_chaff(now) {
             count += 1;
             // Prevent infinite loop by simulating front window close after enough chaff.
             if count > MAX_CHAFF_QUEUE + 100 {
@@ -437,17 +445,20 @@ mod tests {
         ));
 
         // next_frame should return the payload, not chaff.
-        let frame = strategy.next_frame().expect("should have a frame");
+        let frame = strategy
+            .next_frame(Instant::now())
+            .expect("should have a frame");
         assert_eq!(frame.frame_type, construct_veil_protocol::FRAME_TYPE_DATA);
     }
 
     #[test]
     fn write_strategy_chaff_when_idle() {
+        let now = Instant::now();
         let mut strategy = WriteStrategy::new();
-        strategy.chaff_scheduler.connection_start = Some(Instant::now());
+        strategy.chaff_scheduler.connection_start = Some(now);
 
         // No payload in queue — should return chaff.
-        let frame = strategy.next_frame().expect("should have chaff");
+        let frame = strategy.next_frame(now).expect("should have chaff");
         assert_eq!(frame.frame_type, FRAME_TYPE_CHAFF);
     }
 
