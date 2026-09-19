@@ -32,7 +32,8 @@ IP/порт, SNI, длительность и число коннектов. **�
 ## Пайплайн (4 ступени)
 
 1. **capture/** — `tcpdump -B` помечает pcap по классам; `baseline_browser.py`
-   гонит Playwright по реальному origin. Захват уже отлажен на relay.
+   гонит Playwright по реальному origin. **Вантаж — клиентский** (точка цензора;
+   relay-захват занижает тайминг/периодичность). Подробно: `RUNBOOK.md`.
 2. **extract/** — `pcap_to_records.py`: tshark → per-session CSV записей
    (`ts, dir, tls_record_len, content_type`). Единственный проводной парсер.
 3. **features/** — `build_features.py`: CSV → вектор признаков на сессию +
@@ -95,13 +96,5 @@ venv — локальный, в `.gitignore`; в репозиторий идёт
 
 ## Как гонять
 
-```bash
-./selftest.sh                     # регрессия самого стенда (без сети)
-# реальный прогон:
-capture/capture.sh divany veil-active 120        # ×N, поднимая VEIL
-capture/capture.sh divany cover-real 120         # ×N, параллельно baseline_browser.py
-extract/pcap_to_records.py samples/*.pcap ...    # -> per-visit records CSV
-features/build_features.py samples/*.csv -o feat.csv
-classify/l2_classifier.py feat.csv --positive veil --negative cover-real
-classify/l3_correlation.py samples/pair-*.csv
-```
+`./selftest.sh` — регрессия самого стенда (без сети). Реальный прогон
+(вантаж, хореография, число сессий, порты) — по шагам в **`RUNBOOK.md`**.
