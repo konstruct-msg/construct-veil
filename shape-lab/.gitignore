@@ -1,0 +1,7 @@
+.venv/
+report/*.json
+report/*.png
+report/*.html
+samples/*.pcap
+samples/*.csv
+__pycache__/
