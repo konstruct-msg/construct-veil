@@ -44,6 +44,18 @@ pub fn build_connector(
     profile: TlsProfile,
     alpn_override: Option<Vec<Vec<u8>>>,
 ) -> Result<(TlsConnector, ServerName<'static>), String> {
+    let config = client_config(spki_hex, profile, alpn_override)?;
+    let server_name = resolve_server_name(sni, relay_addr)?;
+    Ok((TlsConnector::from(Arc::new(config)), server_name))
+}
+
+/// The client config [`build_connector`] dials with: the profile's provider and groups,
+/// the SPKI pin, ALPN, and the record-size cap.
+fn client_config(
+    spki_hex: &str,
+    profile: TlsProfile,
+    alpn_override: Option<Vec<Vec<u8>>>,
+) -> Result<ClientConfig, String> {
     let provider = profile.crypto_provider();
     let verifier = PinnedSpkiVerifier::new(spki_hex)?;
 
@@ -66,9 +78,7 @@ pub fn build_connector(
     config.max_fragment_size = Some(
         construct_veil_protocol::LENGTH_BUCKETS[construct_veil_protocol::LENGTH_BUCKETS.len() - 1],
     );
-
-    let server_name = resolve_server_name(sni, relay_addr)?;
-    Ok((TlsConnector::from(Arc::new(config)), server_name))
+    Ok(config)
 }
 
 // ── Pinned SPKI verifier ──────────────────────────────────────────────────────
@@ -207,7 +217,7 @@ mod live_probe {
     #[test]
     #[ignore]
     fn dial_live_relay() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -247,5 +257,89 @@ mod live_probe {
                 Err(e) => panic!("HANDSHAKE ERR: {e}  (kind={:?})", e.kind()),
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod key_exchange {
+    use super::*;
+    use crate::tls_fingerprint::TlsProfile;
+    use rustls::NamedGroup::{X25519, X25519MLKEM768};
+
+    /// A server on aws-lc-rs offering `groups`, with a throwaway self-signed cert.
+    fn server(groups: &[rustls::NamedGroup]) -> Arc<rustls::ServerConfig> {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        provider.kx_groups.retain(|g| groups.contains(&g.name()));
+        Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.cert.der().clone()], key)
+                .unwrap(),
+        )
+    }
+
+    /// Full in-memory handshake: our client with `profile` against `server`; the group
+    /// the server picked.
+    fn negotiated(profile: TlsProfile, server: Arc<rustls::ServerConfig>) -> rustls::NamedGroup {
+        let config = client_config("", profile, None).unwrap();
+        let mut client =
+            rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap())
+                .unwrap();
+        let mut srv = rustls::ServerConnection::new(server).unwrap();
+        for _ in 0..10 {
+            let mut buf = Vec::new();
+            client.write_tls(&mut buf).unwrap();
+            srv.read_tls(&mut &buf[..]).unwrap();
+            srv.process_new_packets().unwrap();
+            let mut buf = Vec::new();
+            srv.write_tls(&mut buf).unwrap();
+            client.read_tls(&mut &buf[..]).unwrap();
+            client.process_new_packets().unwrap();
+            if !client.is_handshaking() && !srv.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!srv.is_handshaking(), "handshake did not complete");
+        srv.negotiated_key_exchange_group().unwrap().name()
+    }
+
+    /// Every profile offers the hybrid first, and a server that has it picks it.
+    /// Mutation: drop X25519MLKEM768 from a profile's groups (what the `ring` profiles
+    /// were until 2026-10-03) — that profile negotiates X25519 and this fails.
+    #[test]
+    fn every_profile_negotiates_the_hybrid() {
+        for profile in [
+            TlsProfile::Chrome131,
+            TlsProfile::Firefox128,
+            TlsProfile::Rustls,
+        ] {
+            assert_eq!(
+                negotiated(profile, server(&[X25519MLKEM768, X25519])),
+                X25519MLKEM768,
+                "{profile:?}"
+            );
+        }
+    }
+
+    /// A front still on a classical relay keeps working: the hello carries an X25519
+    /// share too, so the server picks it without a retry.
+    #[test]
+    fn a_classical_front_still_connects() {
+        for profile in [
+            TlsProfile::Chrome131,
+            TlsProfile::Firefox128,
+            TlsProfile::Rustls,
+        ] {
+            assert_eq!(
+                negotiated(profile, server(&[X25519])),
+                X25519,
+                "{profile:?}"
+            );
+        }
     }
 }
