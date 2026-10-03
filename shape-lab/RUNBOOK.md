@@ -3,6 +3,13 @@
 Отвечает на два вопроса: **откуда** снимать (вантаж) и **как** гонять серию.
 Дизайн и критерии приёмки — в `README.md`.
 
+> **Координат фронтов тут нет и быть не должно.** `construct-veil` — публичный
+> репозиторий. Реальные IP/домены/ключи берутся ЛОКАЛЬНО: relay-алиасы — из
+> неотслеживаемого `capture/hosts.local.sh` (шаблон — `.example`), клиентские
+> захваты — аргументом `<RELAY-IP>`, origin браузера — аргументом `<SITE_HOST>`.
+> Источник значений — приватный `veil-ops`. Так сожгли прошлый фронт: имя
+> пролежало в открытом репозитории ([[decisions/no-bundled-veil-fronts]]).
+
 ## 1. Выбор вантажа (важнее, чем кажется)
 
 Цензор (ТСПУ) сидит на пути **рядом с клиентом, внутри страны**. Relay —
@@ -40,17 +47,18 @@ Mac-клиенте меряет rustls-путь (другая паковка TLS
 Браузер без тикета Construct → relay уводит на honest-front cover → на проводе
 это настоящий трафик сайта того же origin.
 ```bash
+# <RELAY-IP> и <SITE_HOST> — из veil-ops, НЕ коммитить.
 # терминал 1 — клиентский захват (пример для desktop/Playwright на Mac, en0):
-capture/capture_local.sh cover-real 60 <redacted-ip> en0 443
+capture/capture_local.sh cover-real 60 <RELAY-IP> en0 443
 # терминал 2 — сразу же реальный визит браузера на тот же origin:
-.venv/bin/python capture/baseline_browser.py https://<redacted-host> --visits 1 --dwell 40
+.venv/bin/python capture/baseline_browser.py https://<SITE_HOST> --visits 1 --dwell 40
 # повторить ~25 раз (можно --visits 1 в цикле с паузами)
 ```
 
 ### 3b. veil-idle / veil-active
 ```bash
-capture/capture_local.sh veil-idle   60 <redacted-ip> en0 443   # VEIL поднят, не пишем
-capture/capture_local.sh veil-active 60 <redacted-ip> en0 443   # активная переписка
+capture/capture_local.sh veil-idle   60 <RELAY-IP> en0 443   # VEIL поднят, не пишем
+capture/capture_local.sh veil-active 60 <RELAY-IP> en0 443   # активная переписка
 ```
 Для iOS: `rvictl -s <UDID>` → iface `rvi0`; в конце `rvictl -x <UDID>`.
 
@@ -73,8 +81,8 @@ p велик (>0.05) → неотличимо при данном N (это це
 Два устройства переписываются друг с другом через relay; один relay-захват
 видит обе сессии. Метки — `pair-<id>-A` и `pair-<id>-B`. Нужно ≥6–8 пар.
 ```bash
-# на relay (<redacted> :443 напрямую; <redacted> — port 8443 за nginx):
-capture/capture.sh <redacted> pair-01-A 120     # запускать под каждую сессию/устройство
+# на relay (алиас из hosts.local.sh; :443 напрямую или :8443 за nginx SNI-demux):
+capture/capture.sh front1 pair-01-A 120     # запускать под каждую сессию/устройство
 # затем расставить метки A/B по устройствам и:
 .venv/bin/python extract/pcap_to_records.py samples/pair-*.pcap --server-port 443 ...
 .venv/bin/python classify/l3_correlation.py samples/pair-*.csv
@@ -82,14 +90,14 @@ capture/capture.sh <redacted> pair-01-A 120     # запускать под ка
 **Вердикт L3:** matching advantage над случайным ≈ 0 → связать нельзя (цель).
 
 ## 5. Порты и хосты (памятка)
-- **<redacted>** `<redacted-ip>` `~/.ssh/<redacted-key>` — relay напрямую на **:443**.
-- **<redacted>** `<redacted-ip>` `~/.ssh/<redacted-key>` — nginx :443 → relay **:8443**
-  (relay-захват на <redacted> снимай с `--server-port 8443`; см. память деплоя).
+- **Координаты — только в `capture/hosts.local.sh`** (не в git), значения из `veil-ops`.
+- Два типа фронта: relay напрямую на **:443**; relay за nginx SNI-demux на **:8443**
+  (relay-захват за nginx снимай с `--server-port 8443`).
 - Клиентский захват всегда `port 443` (клиент видит внешний порт origin).
 
 ## 6. Типичные ошибки
 - смешать вантажи (veil клиентский, cover relay) → меряешь путь, не Construct;
 - N<25 → GBM недостоверен (permutation p скачет);
-- забыть `--server-port 8443` на <redacted> relay → направления перепутаны;
+- забыть `--server-port 8443` на relay за nginx → направления перепутаны;
 - считать высокий AUC на synthetic победой — это тест СТЕНДА (`selftest.sh`),
   не VEIL.

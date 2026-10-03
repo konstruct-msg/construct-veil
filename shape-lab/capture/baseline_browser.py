@@ -6,7 +6,11 @@
 Запускать НА КЛИЕНТЕ параллельно с capture.sh <host> cover-real <secs>.
 Один прогон = один визит; повторить N раз (разные времена) для N сессий.
 
-  ./baseline_browser.py https://<redacted-host> --visits 1 --dwell 20
+  ./baseline_browser.py https://<SITE_HOST> --visits 1 --dwell 20
+
+<SITE_HOST> — имя сайта текущего фронта (из veil-ops), передаётся аргументом.
+В репозиторий не вписывать: construct-veil публичный, имя фронта в нём = сожжённый
+фронт (decisions/no-bundled-veil-fronts).
 """
 import argparse, asyncio, random, sys
 
