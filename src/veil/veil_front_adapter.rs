@@ -311,13 +311,25 @@ where
 
         loop {
             // Service the local stream FIRST every iteration — a busy chaff
-            // schedule must never starve real payload. The short timeout still lets
-            // chaff fill idle gaps.
-            match tokio::time::timeout(Duration::from_millis(20), local_rd.read(&mut rbuf)).await {
-                Ok(Ok(0)) => break, // EOF
-                Ok(Ok(n)) => up_session.queue_local(&rbuf[..n]),
-                Ok(Err(e)) => return Err(ObfuscatorError::Io(e)),
-                Err(_) => { /* idle — fall through to emit a frame */ }
+            // schedule must never starve real payload. While chaff is still owed the
+            // short timeout lets it fill idle gaps; once the front-loaded chaff is done
+            // nothing is due until local bytes arrive, so wait for them with no timer.
+            // Until 2026-10-03 the 20 ms tick ran for the life of the tunnel: ~100
+            // wake-ups a second on an idle Android client (two tunnels), ~1.9 s of CPU a
+            // minute with the screen off.
+            let read = local_rd.read(&mut rbuf);
+            let read = if up_session.waits_for_local(Instant::now()) {
+                Some(read.await)
+            } else {
+                tokio::time::timeout(Duration::from_millis(20), read)
+                    .await
+                    .ok()
+            };
+            match read {
+                Some(Ok(0)) => break, // EOF
+                Some(Ok(n)) => up_session.queue_local(&rbuf[..n]),
+                Some(Err(e)) => return Err(ObfuscatorError::Io(e)),
+                None => { /* idle — fall through to emit a frame */ }
             }
 
             // Emit one frame per iteration (payload priority, else idle chaff),

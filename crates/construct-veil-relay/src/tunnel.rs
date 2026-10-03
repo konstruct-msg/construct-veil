@@ -39,6 +39,19 @@ const COPY_BUF: usize = 8192;
 /// Matches the Mode 0 bucket set from the client's WriteStrategy.
 const CHAFF_BUCKETS: &[usize] = &[32, 64, 128, 256, 512];
 
+/// How long after a tunnel opens the relay fills idle gaps toward the client with CHAFF:
+/// the client's own Mode 0 window (`FRONT_WINDOW` in `mode0_front.rs`), so both directions
+/// are front-loaded and then quiet. Sketch §8 makes this the mobile default; constant cover
+/// traffic is Mode 2, "not a mobile default".
+///
+/// Until 2026-10-03 the relay sent a CHAFF frame every [`IDLE_CHAFF_TICK`] for the whole life
+/// of the tunnel. An idle Android client on VEIL received ~44 MB an hour, ~35 packets a
+/// second — a radio that never slept and a CPU that decrypted and discarded all of it.
+pub(crate) const IDLE_CHAFF_WINDOW: Duration = Duration::from_secs(3);
+
+/// Inside [`IDLE_CHAFF_WINDOW`], an idle gap this long gets a CHAFF frame.
+pub(crate) const IDLE_CHAFF_TICK: Duration = Duration::from_millis(20);
+
 /// Initial CHAFF payload sizes for first-response alignment (§6.6).
 /// After auth validation, the relay sends one of these to match the cover
 /// app's first-response length distribution.
@@ -149,7 +162,7 @@ where
     let down_c = down_bytes.clone();
     let chaff_c = chaff_bytes.clone();
     let down = async move {
-        frame_backend_to_client(backend_rd, client_wr, down_c, chaff_c)
+        frame_backend_to_client(backend_rd, client_wr, down_c, chaff_c, IDLE_CHAFF_WINDOW)
             .await
             .map_err(|e| tag_direction(e, "backend→client"))
     };
@@ -240,12 +253,14 @@ where
 }
 
 /// Wrap raw backend bytes in DATA frames toward the client, with symmetric
-/// CHAFF injection during idle periods (sketch §8).
+/// CHAFF injection during idle periods of the first `chaff_window` (sketch §8, Mode 0).
+/// After it, an idle backend means an idle tunnel: the read waits with no timer.
 async fn frame_backend_to_client<R, W>(
     mut backend_rd: R,
     mut client_wr: W,
     bytes: Arc<AtomicU64>,
     chaff_bytes: Arc<AtomicU64>,
+    chaff_window: Duration,
 ) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin,
@@ -253,22 +268,28 @@ where
 {
     let mut codec = VeilFrontCodec::default().with_buckets(LENGTH_BUCKETS);
     let mut rbuf = [0u8; COPY_BUF];
+    let opened = Instant::now();
 
     loop {
-        // Read from backend with a short timeout — if idle, inject CHAFF.
+        // Inside the window, read with a short timeout — if idle, inject CHAFF.
         let read_fut = backend_rd.read(&mut rbuf);
-        let n = match tokio::time::timeout(std::time::Duration::from_millis(20), read_fut).await {
-            Ok(Ok(0)) => {
+        let read = if opened.elapsed() < chaff_window {
+            tokio::time::timeout(IDLE_CHAFF_TICK, read_fut).await.ok()
+        } else {
+            Some(read_fut.await)
+        };
+        let n = match read {
+            Some(Ok(0)) => {
                 // Backend closed.
                 client_wr.shutdown().await?;
                 return Ok(());
             }
-            Ok(Ok(n)) => {
+            Some(Ok(n)) => {
                 bytes.fetch_add(n as u64, Ordering::Relaxed);
                 n
             }
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
+            Some(Err(e)) => return Err(e),
+            None => {
                 // Backend idle — inject a CHAFF frame (symmetric padding).
                 let chaff = random_chaff(&mut rand::thread_rng());
                 let mut out = BytesMut::with_capacity(2 + 9 + chaff.len());
@@ -292,6 +313,53 @@ where
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    /// CHAFF fills idle gaps only inside the window; after it an idle backend sends
+    /// nothing, and backend bytes still flow. Mutation: chaff for the life of the
+    /// tunnel (ignore the window) — the count keeps growing; this reddens.
+    #[tokio::test]
+    async fn idle_chaff_stops_after_the_window() {
+        let (mut backend_tx, backend_rd) = tokio::io::duplex(1 << 16);
+        let (client_wr, mut client_rd) = tokio::io::duplex(1 << 22);
+        let bytes = Arc::new(AtomicU64::new(0));
+        let chaff = Arc::new(AtomicU64::new(0));
+        let ferry = tokio::spawn(frame_backend_to_client(
+            backend_rd,
+            client_wr,
+            bytes.clone(),
+            chaff.clone(),
+            Duration::from_millis(100),
+        ));
+        let drain = tokio::spawn(async move {
+            let mut wire = Vec::new();
+            client_rd.read_to_end(&mut wire).await.unwrap();
+            wire
+        });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after_window = chaff.load(Ordering::Relaxed);
+        assert!(after_window > 0, "chaff fills the window");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            chaff.load(Ordering::Relaxed),
+            after_window,
+            "no chaff after the window"
+        );
+
+        backend_tx.write_all(b"hello").await.unwrap();
+        drop(backend_tx);
+        ferry.await.unwrap().unwrap();
+        let wire = drain.await.unwrap();
+        let mut codec = VeilFrontCodec::default();
+        let mut buf = BytesMut::from(&wire[..]);
+        let mut data = Vec::new();
+        while let Some(frame) = codec.decode(&mut buf).unwrap() {
+            if frame.frame_type == FRAME_TYPE_DATA {
+                data.extend_from_slice(&frame.payload);
+            }
+        }
+        assert_eq!(data, b"hello");
+    }
 
     /// End-to-end: DATA frames are de-framed to the backend, CHAFF is dropped,
     /// and the backend's reply comes back wrapped in DATA frames.
