@@ -27,7 +27,7 @@ use tokio_rustls::TlsAcceptor;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Both ring (via rustls) and aws-lc-rs (via rcgen) are in the tree, so the provider has to be
     // named — same reason main.rs does it.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let certified =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])?;

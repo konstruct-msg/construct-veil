@@ -23,7 +23,9 @@ path = "src/bin/make_config_link.rs"
 construct-veil-protocol = { path = "../construct-veil-protocol" }
 
 # TLS
-rustls = { version = "0.23", features = ["ring", "std"] }
+# aws-lc-rs: the hybrid X25519MLKEM768 key exchange (`prefer-post-quantum` puts it first);
+# ring has no ML-KEM. See tls::crypto_provider.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
 rustls-pki-types = "1"
 webpki-roots = "0.26"
