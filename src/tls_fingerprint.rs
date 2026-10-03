@@ -33,7 +33,7 @@
 //!
 //! Even with the limitations above, a `Chrome131` profile:
 //! - Sends Chrome's exact cipher suite ordering (9 of Chrome's 15 ciphers)
-//! - Uses Chrome's key share group preference (x25519 → P-256 → P-384)
+//! - Uses Chrome's key share group preference (X25519MLKEM768 → x25519 → P-256 → P-384)
 //! - Advertises `h2,http/1.1` ALPN as Chrome does
 //! - Removes the distinctive default rustls cipher ordering
 //!
@@ -41,7 +41,7 @@
 //! the default rustls negotiation. It does **not** defeat strict allowlists
 //! that require an exact Chrome/Firefox JA3/JA4 match.
 
-use rustls::crypto::{CryptoProvider, ring as rng};
+use rustls::crypto::{CryptoProvider, aws_lc_rs as rng};
 use std::sync::Arc;
 
 // ── Profile enum ──────────────────────────────────────────────────────────────
@@ -57,21 +57,21 @@ use std::sync::Arc;
 pub enum TlsProfile {
     /// rustls defaults — recognizable TLS fingerprint. Use only in tests.
     ///
-    /// JA3 ciphers: 4867-4866-4865-52393-52392-49199-49200-49195-49196
+    /// JA3 ciphers: 4866-4865-4867-49196-49195-52393-49200-49199-52392
     Rustls,
 
     /// Chrome 131 cipher suite ordering + key groups. **Default for production.**
     ///
     /// JA3 ciphers: 4865-4866-4867-49195-49199-49196-49200-52393-52392
     /// (Chrome additionally sends 49171,49172,156,157,47,53 — CBC and RSA
-    /// key-exchange suites not available in the rustls ring provider.)
+    /// key-exchange suites not available in the rustls provider.)
     #[default]
     Chrome131,
 
     /// Firefox 128 cipher suite ordering + key groups.
     ///
     /// JA3 ciphers: 4865-4867-4866-49195-49199-52393-52392-49196-49200
-    /// (Firefox additionally sends 49171,49172,47,53 — not in ring provider.)
+    /// (Firefox additionally sends 49171,49172,47,53 — not in the rustls provider.)
     Firefox128,
 }
 
@@ -104,36 +104,36 @@ impl TlsProfile {
     /// Format: `SSLVersion,Ciphers,Extensions,EllipticCurves,EllipticCurvePointFormats`
     ///
     /// All GREASE values are pre-stripped. The ciphers and extensions reflect
-    /// only what the rustls ring provider actually sends — see module-level
+    /// only what the rustls aws-lc-rs provider actually sends — see module-level
     /// docs for what is missing vs. a real browser.
     pub fn ja3_string(self) -> String {
-        // Extensions sent by rustls ring (approximate, actual order may vary):
+        // Extensions sent by rustls (approximate, actual order may vary):
         //   server_name(0), extended_master_secret(23), supported_groups(10),
         //   ec_point_formats(11), signature_algorithms(13), supported_versions(43),
         //   key_share(51), psk_key_exchange_modes(45)
         //   + ALPN(16) when configured
         //
         // SSLVersion=771 (TLS 1.2 record layer, even when TLS 1.3 is negotiated).
-        // Supported groups: x25519(29), secp256r1(23), secp384r1(24).
+        // Supported groups: X25519MLKEM768(4588), x25519(29), secp256r1(23), secp384r1(24).
         // EC point formats: uncompressed(0).
         match self {
             TlsProfile::Rustls => {
-                // Default ring provider cipher order (TLS 1.3 first, then 1.2):
-                // CHACHA20(4867), AES256(4866), AES128(4865),
-                // ECDHE-ECDSA-CHACHA20(52393), ECDHE-RSA-CHACHA20(52392),
-                // ECDHE-RSA-AES128(49199), ECDHE-RSA-AES256(49200),
-                // ECDHE-ECDSA-AES128(49195), ECDHE-ECDSA-AES256(49196)
+                // Default aws-lc-rs provider cipher order (TLS 1.3 first, then 1.2):
+                // AES256(4866), AES128(4865), CHACHA20(4867),
+                // ECDHE-ECDSA-AES256(49196), ECDHE-ECDSA-AES128(49195),
+                // ECDHE-ECDSA-CHACHA20(52393), ECDHE-RSA-AES256(49200),
+                // ECDHE-RSA-AES128(49199), ECDHE-RSA-CHACHA20(52392)
                 // No ALPN → no ext 16.
-                "771,4867-4866-4865-52393-52392-49199-49200-49195-49196,\
-                 0-23-10-11-13-43-51-45,29-23-24,0"
+                "771,4866-4865-4867-49196-49195-52393-49200-49199-52392,\
+                 0-23-10-11-13-43-51-45,4588-29-23-24,0"
                     .to_owned()
             }
             TlsProfile::Chrome131 => {
-                // Chrome 131 cipher order (ring-available subset, no GREASE/CBC/RSA)
+                // Chrome 131 cipher order (rustls-available subset, no GREASE/CBC/RSA)
                 // AES128(4865), AES256(4866), CHACHA20(4867), then TLS 1.2 ECDSA→RSA
                 // + ALPN(16) added since we configure h2/http1.1
                 "771,4865-4866-4867-49195-49199-49196-49200-52393-52392,\
-                 0-23-10-11-16-13-43-51-45,29-23-24,0"
+                 0-23-10-11-16-13-43-51-45,4588-29-23-24,0"
                     .to_owned()
             }
             TlsProfile::Firefox128 => {
@@ -141,7 +141,7 @@ impl TlsProfile {
                 // AES128(4865), CHACHA20(4867), AES256(4866), then TLS 1.2
                 // + ALPN(16) configured
                 "771,4865-4867-4866-49195-49199-52393-52392-49196-49200,\
-                 0-23-10-11-16-13-43-51-45,29-23-24,0"
+                 0-23-10-11-16-13-43-51-45,4588-29-23-24,0"
                     .to_owned()
             }
         }
@@ -185,7 +185,7 @@ impl TlsProfile {
 /// Chrome 131 TLS configuration:
 /// - TLS 1.3 order: AES-128 → AES-256 → CHACHA20
 /// - TLS 1.2 order: ECDSA variants before RSA (Chrome prefers ECDSA server certs)
-/// - Key groups: x25519 → P-256 → P-384
+/// - Key groups: X25519MLKEM768 → x25519 → P-256 → P-384
 fn chrome_131_provider() -> CryptoProvider {
     use rng::cipher_suite as cs;
     use rng::kx_group as kx;
@@ -204,15 +204,19 @@ fn chrome_131_provider() -> CryptoProvider {
         cs::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
         cs::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
     ];
-    // Chrome 131 key exchange groups: x25519 (preferred), P-256, P-384
-    provider.kx_groups = vec![kx::X25519, kx::SECP256R1, kx::SECP384R1];
+    // Chrome 131 key exchange groups: the hybrid X25519MLKEM768 first (Chrome sends it
+    // by default since 131), then x25519, P-256, P-384. Until 2026-10-03 this list had no
+    // hybrid — the provider was `ring`, which has no ML-KEM — so the "Chrome" hello was
+    // missing the one group every current Chrome offers, and the tunnel's key exchange
+    // was classical.
+    provider.kx_groups = vec![kx::X25519MLKEM768, kx::X25519, kx::SECP256R1, kx::SECP384R1];
     provider
 }
 
 /// Firefox 128 TLS configuration:
 /// - TLS 1.3 order: AES-128 → CHACHA20 → AES-256 (CHACHA20 preferred over AES-256)
 /// - TLS 1.2 order: ECDSA+RSA interleaved, CHACHA20 after AES-128
-/// - Key groups: x25519 → P-256 → P-384
+/// - Key groups: X25519MLKEM768 → x25519 → P-256 → P-384
 fn firefox_128_provider() -> CryptoProvider {
     use rng::cipher_suite as cs;
     use rng::kx_group as kx;
@@ -231,8 +235,9 @@ fn firefox_128_provider() -> CryptoProvider {
         cs::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
         cs::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
     ];
-    // Firefox 128 key groups: x25519 → P-256 → P-384
-    provider.kx_groups = vec![kx::X25519, kx::SECP256R1, kx::SECP384R1];
+    // Firefox key groups: X25519MLKEM768 → x25519 → P-256 → P-384. Firefox sends the
+    // hybrid by default since 132; the profile keeps its 128 cipher order and name.
+    provider.kx_groups = vec![kx::X25519MLKEM768, kx::X25519, kx::SECP256R1, kx::SECP384R1];
     provider
 }
 
@@ -303,7 +308,7 @@ mod tests {
 
     #[test]
     fn chrome_provider_builds() {
-        use rustls::crypto::ring::cipher_suite as cs;
+        use rustls::crypto::aws_lc_rs::cipher_suite as cs;
         let p = TlsProfile::Chrome131.crypto_provider();
         // Chrome 131 order: AES-128-GCM-SHA256 must be first, AES-256 second, CHACHA20 third
         assert_eq!(
@@ -322,7 +327,7 @@ mod tests {
 
     #[test]
     fn firefox_provider_builds() {
-        use rustls::crypto::ring::cipher_suite as cs;
+        use rustls::crypto::aws_lc_rs::cipher_suite as cs;
         let p = TlsProfile::Firefox128.crypto_provider();
         // Firefox 128 TLS 1.3: AES-128 first, CHACHA20 before AES-256
         assert_eq!(

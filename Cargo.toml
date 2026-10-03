@@ -108,6 +108,8 @@ optional = true
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+# Self-signed certs for the in-memory key-exchange tests (tls_pinned.rs).
+rcgen = "0.13"
 criterion = { version = "0.5", features = ["async_tokio"] }
 # Used only by the ignored live veil-front gRPC round-trip diagnostic test.
 h2 = "0.4"
@@ -161,7 +163,10 @@ optional = true
 
 [dependencies.rustls]
 version = "0.23"
-features = ["ring"]
+# aws_lc_rs + prefer-post-quantum: the hybrid X25519MLKEM768 key exchange the TLS
+# profiles offer first (tls_fingerprint.rs). ring has no ML-KEM; it stays enabled for
+# callers that name it.
+features = ["ring", "aws_lc_rs", "prefer-post-quantum"]
 optional = true
 
 [dependencies.tokio-rustls]
