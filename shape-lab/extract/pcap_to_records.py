@@ -58,7 +58,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("pcap")
     ap.add_argument("--server-port", type=int, default=443,
-                    help="порт relay/сайта (divany=443, nearsky relay=8443 если снимаем за nginx)")
+                    help="внешний порт relay/сайта: 443 для relay напрямую, 8443 если relay за nginx SNI-demux")
     ap.add_argument("--tag", help="метка класса, префикс session (напр. veil-active)")
     ap.add_argument("-o", "--out")
     a = ap.parse_args()

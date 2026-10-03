@@ -1,4 +1,5 @@
 .venv/
+capture/hosts.local.sh
 report/*.json
 report/*.png
 report/*.html

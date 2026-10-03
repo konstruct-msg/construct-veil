@@ -8,8 +8,11 @@
 # Для iOS-УСТРОЙСТВА (золотой стандарт, настоящая iOS-форма) — сперва подними
 # виртуальный интерфейс и передай его как iface:
 #     rvictl -s <UDID>            # создаст rvi0 ; UDID: idevice_id -l или Xcode
-#     capture_local.sh veil-active 120 195.133.44.113 rvi0
+#     capture_local.sh veil-active 120 <RELAY-IP> rvi0
 #     rvictl -x <UDID>            # снять после серии
+#
+# <RELAY-IP> — координата фронта из veil-ops, передаётся АРГУМЕНТОМ, в репозиторий
+# не попадает (construct-veil публичный).
 set -euo pipefail
 LABEL="${1:?label}"; SECS="${2:?seconds}"; IP="${3:?relay-ip}"
 IFACE="${4:-en0}"; PORT="${5:-443}"
