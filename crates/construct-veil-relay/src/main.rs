@@ -290,11 +290,13 @@ const STATS_WINDOW: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // rustls 0.23 requires explicit provider selection when multiple crypto
-    // backends are compiled in (ring from rustls + aws-lc-rs from rcgen).
-    rustls::crypto::ring::default_provider()
+    // rustls 0.23 requires explicit provider selection when more than one crypto
+    // backend is compiled in. aws-lc-rs: the hybrid X25519MLKEM768 key exchange, which
+    // ring lacks (see `tls::crypto_provider`). The relay's own server configs name it
+    // explicitly; this default covers the rest (e.g. chained client connections).
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
-        .expect("Failed to install ring CryptoProvider");
+        .expect("Failed to install aws-lc-rs CryptoProvider");
 
     tracing_subscriber::fmt()
         .with_env_filter(
