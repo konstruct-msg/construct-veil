@@ -172,6 +172,7 @@ where
         client_wr,
         down_bytes.clone(),
         chaff_bytes.clone(),
+        crate::tunnel::IDLE_CHAFF_WINDOW,
     );
 
     let result = tokio::try_join!(up, down);
@@ -242,13 +243,15 @@ where
 }
 
 /// Decode upstream DATA frames (drop CHAFF) and re-frame each payload as a
-/// fresh DATA frame toward the client, injecting independent idle CHAFF
-/// (mirrors `tunnel.rs`'s symmetric padding, same buckets).
+/// fresh DATA frame toward the client, injecting independent idle CHAFF during the
+/// first `chaff_window` (mirrors `tunnel.rs`'s symmetric padding, same buckets and the
+/// same front-loaded window — see `tunnel::IDLE_CHAFF_WINDOW`).
 async fn ferry_upstream_to_client<R, W>(
     mut upstream_rd: R,
     mut client_wr: W,
     bytes: Arc<AtomicU64>,
     chaff_bytes: Arc<AtomicU64>,
+    chaff_window: Duration,
 ) -> Result<(), std::io::Error>
 where
     R: AsyncRead + Unpin,
@@ -258,9 +261,16 @@ where
     let mut encode_codec = VeilFrontCodec::default().with_buckets(LENGTH_BUCKETS);
     let mut buf = BytesMut::with_capacity(4096);
 
+    let opened = std::time::Instant::now();
     loop {
         let read_fut = upstream_rd.read_buf(&mut buf);
-        match tokio::time::timeout(Duration::from_millis(20), read_fut).await {
+        // After the window an idle upstream is an idle tunnel: wait with no timer.
+        let read = if opened.elapsed() < chaff_window {
+            tokio::time::timeout(crate::tunnel::IDLE_CHAFF_TICK, read_fut).await
+        } else {
+            Ok(read_fut.await)
+        };
+        match read {
             Ok(Ok(0)) => {
                 client_wr.shutdown().await?;
                 return Ok(());

@@ -128,6 +128,18 @@ impl FrontChaffScheduler {
         true
     }
 
+    /// Whether this scheduler is finished: the front window is over and the queued
+    /// chaff is sent, so it will never produce another frame. Mode 0 is front-loaded —
+    /// once done it stays done — and a driver may then wait for payload alone, with no
+    /// timer. Before the first poll the window has not started, so it is not done.
+    pub fn is_done(&self, now: Instant) -> bool {
+        let window_over = self.front_window_closed
+            || self
+                .connection_start
+                .is_some_and(|start| now.saturating_duration_since(start) >= FRONT_WINDOW);
+        window_over && self.queue_index >= self.chaff_queue.len()
+    }
+
     /// Get the next chaff frame from the queue.
     fn next_chaff_frame(&mut self) -> Option<Frame> {
         if self.queue_index >= self.chaff_queue.len() {
@@ -363,6 +375,12 @@ impl WriteStrategy {
     /// Whether there's anything to send right now.
     pub fn has_pending(&self) -> bool {
         self.payload_queue.has_pending() || self.chaff_scheduler.has_pending()
+    }
+
+    /// Whether nothing can be due until new payload arrives: no payload queued and
+    /// the chaff scheduler finished ([`FrontChaffScheduler::is_done`]).
+    pub fn waits_for_payload(&self, now: Instant) -> bool {
+        !self.payload_queue.has_pending() && self.chaff_scheduler.is_done(now)
     }
 }
 

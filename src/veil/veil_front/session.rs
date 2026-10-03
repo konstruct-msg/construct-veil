@@ -79,6 +79,13 @@ impl VeilFrontUp {
         self.strategy.has_pending()
     }
 
+    /// Whether nothing can be due until more local bytes are queued: no payload
+    /// waiting and the front-loaded chaff finished. A driver then waits on the local
+    /// read alone, with no timer — an idle tunnel must not wake the device.
+    pub fn waits_for_local(&self, now: Instant) -> bool {
+        self.strategy.waits_for_payload(now)
+    }
+
     /// Consume the up half, returning the [`WriteStrategy`] for overhead metrics.
     pub fn into_strategy(self) -> WriteStrategy {
         self.strategy
@@ -154,6 +161,35 @@ mod tests {
             Some(&b"hello"[..]),
             "queued payload must be the first frame, not chaff"
         );
+    }
+
+    /// An idle up half asks to be woken only while chaff is still owed: during the
+    /// front window and until its queued chaff is sent. Then nothing is due until
+    /// local bytes arrive, and queued payload makes it due again. Mutation: keep
+    /// asking for the tick after the chaff is done (the 20 ms wake-up for the life of
+    /// the tunnel) — this reddens.
+    #[test]
+    fn up_waits_for_local_only_once_chaff_is_done() {
+        let (mut up, _down) = VeilFrontSession::new();
+        let t0 = Instant::now();
+        assert!(!up.waits_for_local(t0), "the front window has not run yet");
+        assert!(
+            up.next_wire(t0).unwrap().is_some(),
+            "chaff is due at the start"
+        );
+        assert!(!up.waits_for_local(t0), "chaff is owed inside the window");
+
+        let later = t0 + std::time::Duration::from_secs(4);
+        while up.next_wire(later).unwrap().is_some() {}
+        assert!(
+            up.waits_for_local(later),
+            "chaff done: nothing due until local bytes"
+        );
+
+        up.queue_local(b"payload");
+        assert!(!up.waits_for_local(later), "queued payload is due");
+        assert!(up.next_wire(later).unwrap().is_some());
+        assert!(up.waits_for_local(later));
     }
 
     /// With nothing queued, the up half emits chaff during the front window, and
