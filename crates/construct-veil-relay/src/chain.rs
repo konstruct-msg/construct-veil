@@ -176,8 +176,8 @@ where
     );
 
     let result = tokio::try_join!(up, down);
+    debug!(peer = %peer, "chain tunnel closed");
     info!(
-        peer = %peer,
         up = up_bytes.load(Ordering::Relaxed),
         down = down_bytes.load(Ordering::Relaxed),
         chaff = chaff_bytes.load(Ordering::Relaxed),
