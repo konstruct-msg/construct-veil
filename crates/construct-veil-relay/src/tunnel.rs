@@ -110,8 +110,8 @@ where
 
     // ── Diagnostics: per-direction byte counters + a periodic progress log, so a
     // stall is localised to a direction (request not sent / no response / low
-    // throughput) instead of guessed at. TEMPORARY — lower to debug or remove once
-    // veil-front throughput is understood.
+    // throughput) instead of guessed at. Debug only: at info it wrote every VEIL
+    // user's address every 3 s into a log nobody expires.
     let up_bytes = Arc::new(AtomicU64::new(0)); // client → backend (requests)
     let down_bytes = Arc::new(AtomicU64::new(0)); // backend → client (responses)
     let chaff_bytes = Arc::new(AtomicU64::new(0)); // relay-injected chaff toward client
@@ -129,7 +129,7 @@ where
                 );
                 // chaff_d>0 while down_d=0 → down loop alive, backend silent (D1).
                 // chaff_d=0 while up still flows → down loop blocked on client write (D2).
-                info!(
+                debug!(
                     peer = %peer, up = cu, down = cd, chaff = cc,
                     up_d = cu - lu, down_d = cd - ld, chaff_d = cc - lc,
                     "tunnel progress (up=client→backend, down=backend→client)"
@@ -169,8 +169,8 @@ where
 
     let result = tokio::try_join!(up, down);
     progress.abort();
+    debug!(peer = %peer, "tunnel closed");
     info!(
-        peer = %peer,
         up = up_bytes.load(Ordering::Relaxed),
         down = down_bytes.load(Ordering::Relaxed),
         chaff = chaff_bytes.load(Ordering::Relaxed),
