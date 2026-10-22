@@ -1,6 +1,6 @@
 //! Obfuscator trait — interface each obfuscation method must implement.
 //!
-//! Adding a new method (e.g. Masque) requires:
+//! Adding a method requires:
 //! 1. Implement `Obfuscator` for the new type.
 //! 2. Add a variant to `MethodId`.
 //! 3. Register with `VeilCoordinator::register()`.
@@ -55,7 +55,7 @@ pub enum ObfuscatorError {
     #[error("TLS error: {0}")]
     Tls(String),
 
-    /// Protocol handshake failed (obfs4 or WebSocket upgrade).
+    /// Protocol handshake failed (e.g. the relay rejected AUTH).
     #[error("handshake failed: {0}")]
     Handshake(String),
 
@@ -70,10 +70,6 @@ pub enum ObfuscatorError {
     /// TLS alert 40 / handshake_failure — method blocked by DPI.
     #[error("fingerprint blocked (DPI)")]
     FingerprintBlocked,
-
-    /// Non-101 response on WebSocket upgrade — transparent proxy interception.
-    #[error("webtunnel decoy response (transparent proxy)")]
-    WebTunnelDecoyResponse,
 
     /// Certificate expired, pin mismatch, or verification failed.
     #[error("certificate problem: {0}")]
@@ -139,16 +135,10 @@ pub struct VeilFrontAuthV3 {
 pub struct ProbeRequest {
     /// Relay address (e.g. "relay.example.com:443").
     pub relay_addr: String,
-    /// Bridge/cert bundle string (e.g. "cert=<base64> iat-mode=0").
-    pub bundle: String,
-    /// TLS SNI hostname (for TLS-wrapped modes). Empty = no SNI.
+    /// TLS SNI hostname. Empty = no SNI.
     pub tls_sni: String,
-    /// SPKI hex pin (for TLS pinning). Empty = no pinning.
+    /// SPKI hex pin of the front (required).
     pub spki_hex: String,
-    /// WebTunnel: HTTP Host header. May differ from `tls_sni` for CDN fronting.
-    pub host_header: String,
-    /// WebTunnel: WebSocket base path.
-    pub wt_base_path: String,
     /// VeilFront: base64-encoded 65-byte ticket blob (AUTH v2, bearer capability).
     /// Empty string = no ticket (probe will fail, as expected without auth) unless
     /// `auth_v3` is configured instead.

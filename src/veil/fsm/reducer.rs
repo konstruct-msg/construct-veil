@@ -26,7 +26,6 @@ pub fn reduce(
             VeilState::Idle,
             VeilEvent::Start {
                 relay,
-                bundle,
                 ref fingerprint,
                 allowed_methods,
             },
@@ -63,7 +62,6 @@ pub fn reduce(
             let effects = vec![VeilEffect::StartProbes {
                 methods: candidates,
                 relay,
-                bundle,
             }];
 
             (new_state, effects)
@@ -208,8 +206,7 @@ pub fn reduce(
             VeilEvent::TransportFailure { kind },
         ) => {
             match kind {
-                TransportFailureKind::FingerprintBlocked
-                | TransportFailureKind::WebTunnelDecoyResponse => {
+                TransportFailureKind::FingerprintBlocked => {
                     // Immediate rotation.
                     let new_state = VeilState::Degraded {
                         method: *method,
@@ -357,7 +354,6 @@ mod tests {
             VeilState::Idle,
             VeilEvent::Start {
                 relay: "relay:443".into(),
-                bundle: String::new(),
                 fingerprint: NetworkFingerprint::default(),
                 allowed_methods: MethodSet::none(),
             },
@@ -387,7 +383,6 @@ mod tests {
             VeilState::Idle,
             VeilEvent::Start {
                 relay: "relay:443".into(),
-                bundle: String::new(),
                 fingerprint: NetworkFingerprint::default(),
                 allowed_methods: MethodSet::all(),
             },
@@ -438,7 +433,6 @@ mod tests {
             state,
             VeilEvent::Start {
                 relay: "relay:443".into(),
-                bundle: "cert=abc".into(),
                 fingerprint: NetworkFingerprint::default(),
                 allowed_methods: MethodSet::all(),
             },
@@ -457,13 +451,8 @@ mod tests {
 
         assert_eq!(effects.len(), 1);
         match &effects[0] {
-            VeilEffect::StartProbes {
-                methods,
-                relay,
-                bundle,
-            } => {
+            VeilEffect::StartProbes { methods, relay } => {
                 assert_eq!(relay, "relay:443");
-                assert_eq!(bundle, "cert=abc");
                 assert_eq!(methods.len(), 2);
             }
             _ => panic!("expected StartProbes effect"),

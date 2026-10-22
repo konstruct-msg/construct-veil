@@ -51,8 +51,8 @@ use std::sync::Arc;
 /// Controls cipher suite ordering, key exchange groups, and ALPN to mimic
 /// a specific browser's ClientHello as closely as possible with pure rustls.
 ///
-/// Pass to [`crate::transport::ClientConfig::with_tls_profile`] before calling
-/// [`crate::transport::Obfs4Stream::connect_tls`].
+/// The veil-front adapter builds its connector from one of these
+/// (`tls_pinned::build_connector`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TlsProfile {
     /// rustls defaults — recognizable TLS fingerprint. Use only in tests.
@@ -78,7 +78,7 @@ pub enum TlsProfile {
 impl TlsProfile {
     /// Build a custom [`CryptoProvider`] reflecting this profile's cipher /
     /// key-group ordering.
-    pub(crate) fn crypto_provider(self) -> Arc<CryptoProvider> {
+    pub fn crypto_provider(self) -> Arc<CryptoProvider> {
         match self {
             TlsProfile::Rustls => Arc::new(rng::default_provider()),
             TlsProfile::Chrome131 => Arc::new(chrome_131_provider()),
@@ -90,7 +90,7 @@ impl TlsProfile {
     ///
     /// Empty = no ALPN extension. Chrome and Firefox both advertise
     /// `["h2", "http/1.1"]`.
-    pub(crate) fn alpn(self) -> Vec<Vec<u8>> {
+    pub fn alpn(self) -> Vec<Vec<u8>> {
         match self {
             TlsProfile::Rustls => vec![],
             TlsProfile::Chrome131 | TlsProfile::Firefox128 => {

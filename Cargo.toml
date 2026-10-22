@@ -20,47 +20,21 @@ license = "MPL-2.0"
 version.workspace = true
 edition.workspace = true
 description = "VEIL — (Variable Encoded Interface Layer) — traffic obfuscation transport for Construct messenger"
-keywords = ["web-tunnel", "pluggable-transport", "censorship-resistance", "tor"]
+keywords = ["pluggable-transport", "censorship-resistance", "tls"]
 
 [lib]
 name = "construct_veil"
 path = "src/lib.rs"
 crate-type = ["staticlib", "rlib"]
 
-# Integration test binary (against Go reference server)
-[[example]]
-name = "interop_server"
-path = "examples/interop_server.rs"
-
-[[example]]
-name = "interop_client"
-path = "examples/interop_client.rs"
-
-[[example]]
-name = "grpc_obfs4_client"
-path = "examples/grpc_obfs4_client.rs"
-required-features = ["tonic-transport"]
-
 [dependencies]
 # Shared veil-front protocol types (tickets, auth, framing)
 construct-veil-protocol = { path = "crates/construct-veil-protocol" }
 
 # Crypto
-curve25519-elligator2 = { version = "0.1.0-alpha.2", features = ["elligator2", "rand_core"] }
 sha2 = "0.10"
-hmac = "0.12"
-hkdf = "0.12"
-siphasher = "1"
-subtle = "2.5"
-zeroize = { version = "1.7", features = ["derive"] }
 rand_chacha = "0.3"
-rand = { version = "0.8", features = ["small_rng"] }
-# Pinned explicitly so the IAT RNG algorithm is platform-independent.
-# `rand::SmallRng` aliases to Xoshiro256PlusPlus on 64-bit targets but
-# Xoshiro128PlusPlus on 32-bit (e.g. Android armv7) — same seed → different
-# wire timing → cross-platform-fingerprinting risk + build failure on armv7.
-rand_xoshiro = "0.6"
-crypto_secretbox = "0.1"
+rand = "0.8"
 base64 = "0.22"
 hex = "0.4"
 ed25519-dalek = "2"
@@ -68,19 +42,9 @@ ed25519-dalek = "2"
 # Async I/O
 tokio = { version = "1", features = ["io-util", "net", "rt", "rt-multi-thread", "macros", "sync", "time"] }
 bytes = "1.6"
-pin-project-lite = "0.2"
 
 # Error handling
 thiserror = "1"
-tonic = { version = "0.14.5", optional = true }
-
-[dependencies.prometheus]
-version = "0.14"
-optional = true
-
-[dependencies.once_cell]
-version = "1"
-optional = true
 
 [dependencies.tracing]
 version = "0.1"
@@ -110,7 +74,6 @@ optional = true
 tokio = { version = "1", features = ["full", "test-util"] }
 # Self-signed certs for the in-memory key-exchange tests (tls_pinned.rs).
 rcgen = "0.13"
-criterion = { version = "0.5", features = ["async_tokio"] }
 # Used only by the ignored live veil-front gRPC round-trip diagnostic test.
 h2 = "0.4"
 http = "1"
@@ -121,45 +84,15 @@ default = []
 # probing, per-network scoring, and persistent state.
 coordinator = [
   "dep:sqlx", "dep:async-trait", "dep:tokio-util", "dep:bitflags", "dep:tracing",
-  "tls", "webtunnel",
+  "utls",
 ]
-# Enable C FFI proxy (veil_proxy_start/stop/is_running) — required for iOS
-ffi = []
-# Enable TLS wrapping (outer TLS before obfs4) — required for DPI evasion.
-# Uses rustls with a custom SPKI-pinning verifier for full SNI and cert control.
+# C FFI for the iOS and Android apps (veil_start, veil_front_ferry_fd, …).
+ffi = ["coordinator"]
+# rustls with a custom SPKI-pinning verifier for full SNI and cert control.
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pki-types", "dep:x509-cert"]
 # uTLS browser fingerprint mimicry (Chrome 131, Firefox 128, Safari 18 profiles).
 # Implies tls. Adds md-5 for JA3 hash computation.
 utls = ["tls", "dep:md-5"]
-# ffi + tls combined (used by iOS build)
-ffi-tls = ["ffi", "tls"]
-# WebTunnel transport — WebSocket (RFC 6455) over TLS.
-# Disguises traffic as wss:// connections; stronger DPI resistance than obfs4.
-# Requires tls. The relay server must support WebSocket proxy mode.
-webtunnel = ["tls"]
-# ffi + webtunnel combined (used by iOS build for WebTunnel transport)
-ffi-webtunnel = ["ffi", "webtunnel"]
-# Enable Prometheus metrics + HTTP /metrics endpoint (for relay nodes)
-metrics = ["dep:prometheus", "dep:once_cell", "dep:tracing"]
-# Implies webtunnel. Adds sha1 for Sec-WebSocket-Accept computation (RFC 6455 §4.2.2).
-server = ["webtunnel", "dep:sha1"]
-# Enable tonic/hyper transport wrappers (optional — pulls in heavy deps)
-# Includes tower::Service<Uri> connector + full tonic::transport::Channel API.
-tonic-transport = ["dep:hyper", "dep:http", "dep:tower", "dep:tonic"]
-
-[dependencies.hyper]
-version = "1"
-features = ["client", "server"]
-optional = true
-
-[dependencies.http]
-version = "1"
-optional = true
-
-[dependencies.tower]
-version = "0.5"
-features = ["util"]
-optional = true
 
 [dependencies.rustls]
 version = "0.23"
@@ -187,14 +120,6 @@ optional = true
 version = "0.10"
 optional = true
 
-[dependencies.sha1]
-version = "0.10"
-optional = true
-
 [profile.release]
-opt-level = 3
-lto = true
-
-[profile.bench]
 opt-level = 3
 lto = true

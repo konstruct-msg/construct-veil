@@ -15,14 +15,9 @@
 //!
 //! ```ignore
 //! let mut coordinator = VeilCoordinator::new(VeilConfig::default(), scores);
-//! coordinator.register(Box::new(Obfs4Obfuscator::new()));
-//! coordinator.register(Box::new(WebTunnelObfuscator::new()));
-//! #[cfg(feature = "utls")]
 //! coordinator.register(Box::new(VeilFrontObfuscator::new()));
 //!
-//! let result = coordinator.start_session(
-//!     relay, bundle, fingerprint, MethodSet::all(),
-//! ).await?;
+//! let result = coordinator.start_session(relay, fingerprint, MethodSet::all()).await?;
 //! // result.port is the local TCP port for gRPC
 //! ```
 
@@ -37,21 +32,13 @@ pub mod obfuscator;
 pub mod scoring;
 pub mod veil_front; // Padding modes shared between client and relay
 
-#[cfg(feature = "tls")]
-pub mod obfs4_adapter;
 #[cfg(feature = "utls")]
 pub mod veil_front_adapter;
-#[cfg(feature = "webtunnel")]
-pub mod webtunnel_adapter;
 
 pub use coordinator::*;
 pub use fsm::*;
 pub use obfuscator::*;
 pub use scoring::*;
 
-#[cfg(feature = "tls")]
-pub use obfs4_adapter::Obfs4Obfuscator;
 #[cfg(feature = "utls")]
 pub use veil_front_adapter::VeilFrontObfuscator;
-#[cfg(feature = "webtunnel")]
-pub use webtunnel_adapter::WebTunnelObfuscator;

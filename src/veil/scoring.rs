@@ -211,11 +211,8 @@ impl PersistentScores {
                     .unwrap_or_default()
                     .as_secs() as i64;
 
-                let is_hard_block = matches!(
-                    reason,
-                    crate::veil::fsm::ProbeFailureReason::FingerprintBlocked
-                        | crate::veil::fsm::ProbeFailureReason::WebTunnelDecoyResponse
-                );
+                let is_hard_block =
+                    reason == crate::veil::fsm::ProbeFailureReason::FingerprintBlocked;
 
                 if is_hard_block {
                     sqlx::query(

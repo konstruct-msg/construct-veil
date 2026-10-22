@@ -1,116 +1,46 @@
 //! # construct-veil
 //!
-//! VEIL — (Variable Encoded Interface Layer) obfs4 pluggable transport for Construct Messenger.
+//! VEIL — (Variable Encoded Interface Layer) client transport for Construct Messenger.
 //!
-//! obfs4 makes traffic indistinguishable from random noise, providing
-//! resistance against Deep Packet Inspection (DPI) systems.
+//! The only obfuscation transport is **veil-front**: a standard TLS 1.3
+//! connection to an honest HTTPS front whose relay
+//! (`crates/construct-veil-relay`) serves the real site to everyone except a
+//! client presenting a valid capability in its first application data. The
+//! wire format (tickets, AUTH records, framing) lives in
+//! `crates/construct-veil-protocol`.
 //!
-//! ## Status
+//! obfs4 and WebTunnel were retired on 2026-06-12 (`decisions/veil-front-only-retire-obfs4`)
+//! and their code removed on 2026-10-22.
 //!
-//! Library is complete and tested. Server integration is pending.
+//! ## Layout
 //!
-//! **TODO(server-integration):** See `gateway/src/main.rs` in construct-server for the full
-//! integration plan. Key points:
-//! - Use `Obfs4Listener::bind(addr, ServerConfig::generate())` for the server side.
-//! - `ServerConfig::bridge_line()` produces the string to distribute to censored clients.
-//! - `ClientConfig::from_bridge_line("cert=... iat-mode=0")` is the client-side parser.
-//! - Feature flag `tonic-transport` must be enabled for use with hyper/tonic servers.
-//! - IAT modes: `IatMode::None` (default), `IatMode::Enabled` (10ms jitter), `IatMode::Paranoid`
-//!   (random chunk sizing + 10ms jitter). Paranoid is recommended for China/Iran threat model.
-//!
-//! ## DPI Resistance
-//!
-//! Estimated resistance (private server, no public bridge IP leaks):
-//! - Russia (TSPU/ТСПУ): **Low risk** — probabilistic blocking unlikely to fire on private IPs
-//! - Iran (DPI): **Low-medium** — obfs4 entropy defeats most deployed filters
-//! - China (GFW): **Medium** — ML classifiers are the main threat; IAT Paranoid mode helps
-//!
-//! Full analysis: CONSTRUCT_ICE_DPI_ANALYSIS.md in session files.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! [App] ↔ [Obfs4Stream (AsyncRead+AsyncWrite)] ~~~ obfuscated TCP ~~~ [Obfs4Listener] ↔ [App]
-//! ```
-//!
-//! ## Usage
-//!
-//! ### Client
-//! ```rust,no_run
-//! use construct_veil::{ClientConfig, Obfs4Stream};
-//!
-//! # async fn example() -> Result<(), construct_veil::Error> {
-//! let config = ClientConfig::from_bridge_cert("base64_bridge_cert_here")?;
-//! let mut stream = Obfs4Stream::connect("relay.example.com:443", config).await?;
-//! // stream implements AsyncRead + AsyncWrite — pass to tonic/hyper
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ### Server
-//! ```rust,no_run
-//! use construct_veil::{ServerConfig, Obfs4Listener};
-//!
-//! # async fn example() -> Result<(), construct_veil::Error> {
-//! let config = ServerConfig::generate();
-//! let listener = Obfs4Listener::bind("0.0.0.0:443", config).await?;
-//! while let Ok((stream, addr)) = listener.accept().await {
-//!     // stream implements AsyncRead + AsyncWrite
-//!     tokio::spawn(async move { /* handle(stream) */ });
-//! }
-//! # Ok(())
-//! # }
-//! ```
+//! - [`veil`] (feature `coordinator`) — the FSM that chooses and probes a method,
+//!   per-network scoring, and the veil-front adapter (feature `utls`).
+//! - `ffi` (feature `ffi`) — the C ABI the iOS and Android apps call
+//!   (`veil_start`, `veil_front_ferry_fd`, …).
+//! - [`tls_fingerprint`] (feature `tls`) — browser-shaped ClientHello profiles.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs, clippy::all)]
 
 #[cfg(any(feature = "ffi", feature = "coordinator"))]
 pub(crate) mod accept;
-pub mod crypto;
-pub mod framing;
-pub mod handshake;
-pub mod iat;
-pub mod replay_filter;
-pub mod traffic_mode;
-pub mod transport;
 
 #[cfg(feature = "ffi")]
 #[allow(unsafe_code)]
 pub mod ffi;
 
-#[cfg(feature = "tls")]
+// Its only user is the veil-front adapter.
+#[cfg(feature = "coordinator")]
 pub(crate) mod tls_pinned;
 
 #[cfg(feature = "tls")]
 pub mod tls_fingerprint;
 
-#[cfg(feature = "metrics")]
-pub mod metrics;
-
-/// ICE Coordinator — FSM-based obfuscator selection with happy-eyeballs probing,
+/// VEIL Coordinator — FSM-based obfuscator selection with happy-eyeballs probing,
 /// per-network scoring, and persistent state.
 #[cfg(feature = "coordinator")]
 pub mod veil;
 
-mod error;
-
-pub use error::Error;
-pub use framing::PaddingStrategy;
-pub use iat::IatMode;
-pub use traffic_mode::{MimicryProfile, TrafficMode};
-pub use transport::{ClientConfig, Obfs4Listener, Obfs4Stream, ServerConfig};
-
 #[cfg(feature = "tls")]
 pub use tls_fingerprint::TlsProfile;
-
-#[cfg(feature = "server")]
-pub use transport::webtunnel::WebTunnelServerStream;
-#[cfg(feature = "webtunnel")]
-pub use transport::webtunnel::WebTunnelStream;
-
-#[cfg(feature = "tonic-transport")]
-pub use transport::tonic_compat::{HyperObfs4Io, Obfs4Channel};
-
-/// Result type for this crate.
-pub type Result<T> = std::result::Result<T, Error>;

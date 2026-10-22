@@ -11,11 +11,15 @@ use std::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum MethodId {
-    /// obfs4 — TLS/obfuscated TCP to relay bridge.
+    // Obfs4 and WebTunnel have no adapter since 2026-10-22 (decision
+    // veil-front-only-retire-obfs4). The ids stay: the discriminants are stored in
+    // the scores database and the bitmask ABI of `VeilStartRequest::allowed_methods`,
+    // and the reducer's tests race them as stand-in methods.
+    /// obfs4 — retired, no adapter.
     Obfs4 = 0,
-    /// WebTunnel — HTTP/2 + WebSocket Upgrade on :443.
+    /// WebTunnel — retired, no adapter.
     WebTunnel = 1,
-    /// Masque — HTTP/3 DATAGRAM (future).
+    /// Masque — HTTP/3 DATAGRAM (never built).
     Masque = 2,
     /// VeilFront — honest-front HTTPS relay with session-bound ticket auth.
     /// Client opens standard TLS 1.3, sends auth record in first application data.
@@ -112,8 +116,6 @@ pub enum ScoreOutcome {
 pub enum ProbeFailureReason {
     /// TLS handshake_failure / alert 40 — method blocked by DPI.
     FingerprintBlocked,
-    /// Non-101 on WebSocket upgrade — WebTunnel choked by transparent proxy.
-    WebTunnelDecoyResponse,
     /// Certificate expired or verification failed.
     TlsCertProblem,
     /// Connection refused / timeout — network issue.
@@ -129,8 +131,6 @@ pub enum ProbeFailureReason {
 pub enum TransportFailureKind {
     /// TLS handshake_failure / alert 40. Method blocked by DPI.
     FingerprintBlocked,
-    /// HTTP non-101 on WebSocket upgrade. WebTunnel choked by transparent proxy.
-    WebTunnelDecoyResponse,
     /// Cert expired / verify failed.
     TlsCertProblem,
     /// Stream timeout — traffic not flowing.
@@ -205,7 +205,6 @@ pub enum VeilEvent {
     /// Caller requests ICE to start.
     Start {
         relay: String,
-        bundle: String,
         fingerprint: NetworkFingerprint,
         allowed_methods: MethodSet,
     },
@@ -245,7 +244,6 @@ pub enum VeilEffect {
     StartProbes {
         methods: Vec<MethodId>,
         relay: String,
-        bundle: String,
     },
 
     /// Cancel all probes except the winner.
