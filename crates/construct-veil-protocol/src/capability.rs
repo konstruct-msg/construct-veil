@@ -72,6 +72,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::auth::{AUTHCODE_LEN, AuthRecord};
 use crate::ticket::{AUTH_KEY_LEN, AuthKey, TICKET_ID_LEN, Ticket};
@@ -107,6 +108,45 @@ pub const CAP_SIG_LEN: usize = 64;
 /// Domain-separation prefix for the capability signing message.
 pub const CAP_DOMAIN: &[u8] = b"veil-cap-v1";
 
+/// Longest scope a capability can carry: its length is one byte on the wire.
+pub const MAX_SCOPE_LEN: usize = u8::MAX as usize;
+
+/// Why a capability could not be issued.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CapabilityError {
+    /// The scope does not fit the one-byte length field.
+    #[error("capability scope is {0} bytes; at most {MAX_SCOPE_LEN} fit the wire format")]
+    ScopeTooLong(usize),
+}
+
+/// Whether a capability scoped to `capability_scope` is accepted by a relay
+/// whose scope is `relay_scope`. An empty scope on either side is a wildcard.
+///
+/// Lives here, called from `verify`, so a relay cannot forget it: until
+/// 2026-10-22 each relay call site compared scopes itself before `verify`.
+pub fn scope_matches(capability_scope: &str, relay_scope: &str) -> bool {
+    capability_scope.is_empty() || relay_scope.is_empty() || capability_scope == relay_scope
+}
+
+fn check_scope_len(scope: &str) -> Result<(), CapabilityError> {
+    if scope.len() > MAX_SCOPE_LEN {
+        Err(CapabilityError::ScopeTooLong(scope.len()))
+    } else {
+        Ok(())
+    }
+}
+
+/// `encode` on a capability whose scope was changed after signing: a corrupt
+/// blob (the length byte wraps while the whole scope is written) must never be
+/// produced. Until 2026-10-22 this was a `debug_assert!`, i.e. silent in release.
+fn assert_encodable_scope(scope: &[u8]) {
+    assert!(
+        scope.len() <= MAX_SCOPE_LEN,
+        "capability scope is {} bytes; at most {MAX_SCOPE_LEN} fit the wire format",
+        scope.len()
+    );
+}
+
 /// Fixed-size portion of an encoded capability (everything except scope + sig).
 const CAP_FIXED_LEN: usize = TICKET_ID_LEN + AUTH_KEY_LEN + 8 + 8 + 1 + 1; // 66
 
@@ -130,9 +170,12 @@ pub struct Capability {
 }
 
 impl Capability {
-    /// Build the canonical, domain-separated message that the issuer signs.
-    fn signing_message(ticket: &Ticket, scope: &str) -> Vec<u8> {
-        let mut m = Vec::with_capacity(CAP_DOMAIN.len() + CAP_FIXED_LEN + scope.len());
+    /// Build the canonical, domain-separated message that the issuer signs. It
+    /// contains the bearer `auth_key`, so it is wiped when dropped.
+    fn signing_message(ticket: &Ticket, scope: &str) -> Zeroizing<Vec<u8>> {
+        let mut m = Zeroizing::new(Vec::with_capacity(
+            CAP_DOMAIN.len() + CAP_FIXED_LEN + scope.len(),
+        ));
         m.extend_from_slice(CAP_DOMAIN);
         m.extend_from_slice(&ticket.ticket_id);
         m.extend_from_slice(ticket.auth_key.as_bytes());
@@ -145,11 +188,20 @@ impl Capability {
 
     /// Issue (sign) a capability with the issuer's Ed25519 seed (32-byte secret key).
     /// Used by the backend / the make-config-link tool.
-    pub fn sign(ticket: Ticket, scope: String, issuer_seed: &[u8; 32]) -> Self {
+    ///
+    /// Fails if `scope` is longer than [`MAX_SCOPE_LEN`]: until 2026-10-22 such a
+    /// capability was signed over the full scope but encoded with a wrapped
+    /// length byte — a valid signature on a blob nobody could decode.
+    pub fn sign(
+        ticket: Ticket,
+        scope: String,
+        issuer_seed: &[u8; 32],
+    ) -> Result<Self, CapabilityError> {
+        check_scope_len(&scope)?;
         let sk = SigningKey::from_bytes(issuer_seed);
         let msg = Self::signing_message(&ticket, &scope);
         let sig = sk.sign(&msg).to_bytes();
-        Self { ticket, scope, sig }
+        Ok(Self { ticket, scope, sig })
     }
 
     /// Verify the issuer signature against the issuer's Ed25519 public key (32 bytes).
@@ -170,9 +222,12 @@ impl Capability {
     }
 
     /// Encode the capability blob (no frame header).
+    ///
+    /// # Panics
+    /// If `scope` was set longer than [`MAX_SCOPE_LEN`] after signing.
     pub fn encode(&self) -> Bytes {
         let scope = self.scope.as_bytes();
-        debug_assert!(scope.len() <= u8::MAX as usize, "scope too long");
+        assert_encodable_scope(scope);
         let mut buf = BytesMut::with_capacity(CAP_FIXED_LEN + scope.len() + CAP_SIG_LEN);
         buf.put_slice(&self.ticket.ticket_id);
         buf.put_slice(self.ticket.auth_key.as_bytes());
@@ -192,8 +247,8 @@ impl Capability {
         }
         let mut ticket_id = [0u8; TICKET_ID_LEN];
         data.copy_to_slice(&mut ticket_id);
-        let mut auth_key = [0u8; AUTH_KEY_LEN];
-        data.copy_to_slice(&mut auth_key);
+        let mut auth_key = Zeroizing::new([0u8; AUTH_KEY_LEN]);
+        data.copy_to_slice(auth_key.as_mut());
         let not_before = data.get_u64_le();
         let not_after = data.get_u64_le();
         let suite_id = data.get_u8();
@@ -212,7 +267,7 @@ impl Capability {
         Some(Self {
             ticket: Ticket {
                 ticket_id,
-                auth_key: AuthKey::new(auth_key),
+                auth_key: AuthKey::new(*auth_key),
                 not_before,
                 not_after,
                 suite_id,
@@ -246,7 +301,7 @@ pub struct AuthRecordV2 {
 
 impl AuthRecordV2 {
     /// Build an AUTH v2 record from a capability and the 32-byte TLS exporter.
-    pub fn from_capability(capability: &Capability, exporter: &[u8]) -> Self {
+    pub fn from_capability(capability: &Capability, exporter: &[u8; 32]) -> Self {
         let authcode = AuthRecord::from_ticket(&capability.ticket, exporter).authcode;
         Self {
             capability: capability.clone(),
@@ -254,13 +309,28 @@ impl AuthRecordV2 {
         }
     }
 
-    /// Full validation: issuer signature valid, within validity window at `now_secs`,
-    /// and the authcode matches the exporter (constant-time). Relay-side entry point.
-    pub fn verify(&self, issuer_pubkey: &[u8; 32], exporter: &[u8], now_secs: u64) -> bool {
-        if !self.capability.verify_signature(issuer_pubkey) {
+    /// Full validation, relay-side entry point: within the validity window at
+    /// `now_secs`, a known suite, scope accepted by `relay_scope` (see
+    /// [`scope_matches`]), issuer signature valid, and the authcode matches the
+    /// exporter (constant-time).
+    ///
+    /// The free checks run before the Ed25519 verification, so a prober replaying
+    /// an expired or foreign-scope capability costs the relay no signature check.
+    pub fn verify(
+        &self,
+        issuer_pubkey: &[u8; 32],
+        relay_scope: &str,
+        exporter: &[u8; 32],
+        now_secs: u64,
+    ) -> bool {
+        let cap = &self.capability;
+        if !cap.is_valid_at(now_secs)
+            || cap.ticket.suite_id != crate::SUITE_CLASSIC_V1
+            || !scope_matches(&cap.scope, relay_scope)
+        {
             return false;
         }
-        if !self.capability.is_valid_at(now_secs) {
+        if !cap.verify_signature(issuer_pubkey) {
             return false;
         }
         let expected = AuthRecord::from_ticket(&self.capability.ticket, exporter).authcode;
@@ -352,6 +422,8 @@ impl CapabilityV2 {
 
     /// Issue (sign) a key-bound capability with the issuer's Ed25519 seed.
     /// Used by the backend issuer / relay-admission tooling.
+    ///
+    /// Fails if `scope` is longer than [`MAX_SCOPE_LEN`] (see [`Capability::sign`]).
     #[allow(clippy::too_many_arguments)]
     pub fn sign(
         ticket_id: [u8; TICKET_ID_LEN],
@@ -362,13 +434,14 @@ impl CapabilityV2 {
         suite_id: u8,
         scope: String,
         issuer_seed: &[u8; 32],
-    ) -> Self {
+    ) -> Result<Self, CapabilityError> {
+        check_scope_len(&scope)?;
         let sk = SigningKey::from_bytes(issuer_seed);
         let msg = Self::signing_message(
             &ticket_id, &veil_pk, role, not_before, not_after, suite_id, &scope,
         );
         let sig = sk.sign(&msg).to_bytes();
-        Self {
+        Ok(Self {
             ticket_id,
             veil_pk,
             role,
@@ -377,7 +450,7 @@ impl CapabilityV2 {
             suite_id,
             scope,
             sig,
-        }
+        })
     }
 
     /// Verify the issuer signature against the issuer's Ed25519 public key (32 bytes).
@@ -406,9 +479,12 @@ impl CapabilityV2 {
     }
 
     /// Encode the capability blob (no frame header).
+    ///
+    /// # Panics
+    /// If `scope` was set longer than [`MAX_SCOPE_LEN`] after signing.
     pub fn encode(&self) -> Bytes {
         let scope = self.scope.as_bytes();
-        debug_assert!(scope.len() <= u8::MAX as usize, "scope too long");
+        assert_encodable_scope(scope);
         let mut buf = BytesMut::with_capacity(CAP_V2_FIXED_LEN + scope.len() + CAP_SIG_LEN);
         buf.put_slice(&self.ticket_id);
         buf.put_slice(&self.veil_pk);
@@ -480,7 +556,7 @@ pub struct AuthRecordV3 {
 }
 
 impl AuthRecordV3 {
-    fn signing_message(capability: &CapabilityV2, exporter: &[u8]) -> Vec<u8> {
+    fn signing_message(capability: &CapabilityV2, exporter: &[u8; 32]) -> Vec<u8> {
         let mut m =
             Vec::with_capacity(AUTH_V3_SIG_DOMAIN.len() + exporter.len() + TICKET_ID_LEN + 8);
         m.extend_from_slice(AUTH_V3_SIG_DOMAIN);
@@ -492,13 +568,12 @@ impl AuthRecordV3 {
 
     /// Build an AUTH v3 record from a capability and the holder's `veil_sk`.
     ///
-    /// `exporter` must be exactly 32 bytes (the TLS exporter for this session).
+    /// `exporter` is the TLS exporter for this session.
     pub fn from_capability(
         capability: &CapabilityV2,
         veil_sk: &SigningKey,
-        exporter: &[u8],
+        exporter: &[u8; 32],
     ) -> Self {
-        assert_eq!(exporter.len(), 32, "exporter must be 32 bytes");
         let msg = Self::signing_message(capability, exporter);
         let client_sig = veil_sk.sign(&msg).to_bytes();
         Self {
@@ -515,20 +590,27 @@ impl AuthRecordV3 {
     /// listener passes `ROLE_USER`, its upstream-facing (chaining) listener
     /// passes `ROLE_RELAY` — a capability issued for one role is rejected on the
     /// other's listener even though the signature itself is otherwise valid.
+    ///
+    /// Also checks a known suite and that the capability's scope is accepted by
+    /// `relay_scope` (see [`scope_matches`]). The free checks run before either
+    /// Ed25519 verification.
     pub fn verify(
         &self,
         issuer_pubkey: &[u8; 32],
+        relay_scope: &str,
         expected_role: u8,
-        exporter: &[u8],
+        exporter: &[u8; 32],
         now_secs: u64,
     ) -> bool {
-        if !self.capability.verify_signature(issuer_pubkey) {
+        let cap = &self.capability;
+        if cap.role != expected_role
+            || !cap.is_valid_at(now_secs)
+            || cap.suite_id != crate::SUITE_CLASSIC_V1
+            || !scope_matches(&cap.scope, relay_scope)
+        {
             return false;
         }
-        if self.capability.role != expected_role {
-            return false;
-        }
-        if !self.capability.is_valid_at(now_secs) {
+        if !cap.verify_signature(issuer_pubkey) {
             return false;
         }
         let vk = match VerifyingKey::from_bytes(&self.capability.veil_pk) {
@@ -594,6 +676,7 @@ mod v2_tests {
             "ru-relay".into(),
             issuer_seed,
         )
+        .unwrap()
     }
 
     fn exporter() -> [u8; 32] {
@@ -641,7 +724,7 @@ mod v2_tests {
         let (veil_sk, veil_pk) = holder_keypair();
         let cap = make_cap(&seed, veil_pk, ROLE_USER);
         let rec = AuthRecordV3::from_capability(&cap, &veil_sk, &exporter());
-        assert!(rec.verify(&issuer_pk, ROLE_USER, &exporter(), NOW));
+        assert!(rec.verify(&issuer_pk, "", ROLE_USER, &exporter(), NOW));
     }
 
     #[test]
@@ -651,8 +734,8 @@ mod v2_tests {
         let (veil_sk, veil_pk) = holder_keypair();
         let cap = make_cap(&seed, veil_pk, ROLE_RELAY);
         let rec = AuthRecordV3::from_capability(&cap, &veil_sk, &exporter());
-        assert!(!rec.verify(&issuer_pk, ROLE_USER, &exporter(), NOW));
-        assert!(rec.verify(&issuer_pk, ROLE_RELAY, &exporter(), NOW));
+        assert!(!rec.verify(&issuer_pk, "", ROLE_USER, &exporter(), NOW));
+        assert!(rec.verify(&issuer_pk, "", ROLE_RELAY, &exporter(), NOW));
     }
 
     #[test]
@@ -663,7 +746,7 @@ mod v2_tests {
         let rec = AuthRecordV3::from_capability(&cap, &veil_sk, &exporter());
         let mut other = exporter();
         other[0] ^= 0x01;
-        assert!(!rec.verify(&issuer_pk, ROLE_USER, &other, NOW));
+        assert!(!rec.verify(&issuer_pk, "", ROLE_USER, &other, NOW));
     }
 
     #[test]
@@ -673,7 +756,7 @@ mod v2_tests {
         let cap = make_cap(&seed, veil_pk, ROLE_USER);
         let rec = AuthRecordV3::from_capability(&cap, &veil_sk, &exporter());
         let after_expiry = cap.not_after + 1;
-        assert!(!rec.verify(&issuer_pk, ROLE_USER, &exporter(), after_expiry));
+        assert!(!rec.verify(&issuer_pk, "", ROLE_USER, &exporter(), after_expiry));
     }
 
     #[test]
@@ -691,7 +774,7 @@ mod v2_tests {
             sig: [0u8; CAP_SIG_LEN],
         };
         let rec = AuthRecordV3::from_capability(&forged, &veil_sk, &exporter());
-        assert!(!rec.verify(&issuer_pk, ROLE_USER, &exporter(), NOW));
+        assert!(!rec.verify(&issuer_pk, "", ROLE_USER, &exporter(), NOW));
     }
 
     #[test]
@@ -702,7 +785,7 @@ mod v2_tests {
         let sk_b = SigningKey::from_bytes(&[4u8; 32]);
         let cap = make_cap(&seed, veil_pk_a, ROLE_USER);
         let rec = AuthRecordV3::from_capability(&cap, &sk_b, &exporter());
-        assert!(!rec.verify(&issuer_pk, ROLE_USER, &exporter(), NOW));
+        assert!(!rec.verify(&issuer_pk, "", ROLE_USER, &exporter(), NOW));
     }
 
     #[test]
@@ -742,7 +825,8 @@ mod v2_tests {
             },
             "ru-relay".into(),
             &seed,
-        );
+        )
+        .unwrap();
         // Reinterpret the bearer cap's signature on a v2 message with the same
         // ticket_id/not_before/not_after/suite/scope — must not validate.
         let mut forged_v2 = CapabilityV2 {
@@ -793,14 +877,14 @@ mod tests {
     #[test]
     fn sign_then_verify_signature() {
         let (seed, pk) = issuer_keypair();
-        let cap = Capability::sign(make_ticket(), "default".into(), &seed);
+        let cap = Capability::sign(make_ticket(), "default".into(), &seed).unwrap();
         assert!(cap.verify_signature(&pk));
     }
 
     #[test]
     fn wrong_pubkey_rejected() {
         let (seed, _) = issuer_keypair();
-        let cap = Capability::sign(make_ticket(), "default".into(), &seed);
+        let cap = Capability::sign(make_ticket(), "default".into(), &seed).unwrap();
         let other_pk = SigningKey::from_bytes(&[9u8; 32])
             .verifying_key()
             .to_bytes();
@@ -810,7 +894,7 @@ mod tests {
     #[test]
     fn tampered_field_breaks_signature() {
         let (seed, pk) = issuer_keypair();
-        let mut cap = Capability::sign(make_ticket(), "default".into(), &seed);
+        let mut cap = Capability::sign(make_ticket(), "default".into(), &seed).unwrap();
         cap.ticket.not_after += 1; // extend validity → must invalidate sig
         assert!(!cap.verify_signature(&pk));
     }
@@ -818,7 +902,7 @@ mod tests {
     #[test]
     fn tampered_scope_breaks_signature() {
         let (seed, pk) = issuer_keypair();
-        let mut cap = Capability::sign(make_ticket(), "default".into(), &seed);
+        let mut cap = Capability::sign(make_ticket(), "default".into(), &seed).unwrap();
         cap.scope = "other".into();
         assert!(!cap.verify_signature(&pk));
     }
@@ -826,7 +910,7 @@ mod tests {
     #[test]
     fn capability_encode_decode_roundtrip() {
         let (seed, _) = issuer_keypair();
-        let cap = Capability::sign(make_ticket(), "ru-relay".into(), &seed);
+        let cap = Capability::sign(make_ticket(), "ru-relay".into(), &seed).unwrap();
         let blob = cap.encode();
         let decoded = Capability::decode_slice(&blob).expect("decode");
         assert_eq!(decoded.ticket.ticket_id, cap.ticket.ticket_id);
@@ -842,28 +926,28 @@ mod tests {
     #[test]
     fn auth_v2_verify_success() {
         let (seed, pk) = issuer_keypair();
-        let cap = Capability::sign(make_ticket(), "default".into(), &seed);
+        let cap = Capability::sign(make_ticket(), "default".into(), &seed).unwrap();
         let rec = AuthRecordV2::from_capability(&cap, &exporter());
-        assert!(rec.verify(&pk, &exporter(), NOW));
+        assert!(rec.verify(&pk, "", &exporter(), NOW));
     }
 
     #[test]
     fn auth_v2_rejects_wrong_exporter() {
         let (seed, pk) = issuer_keypair();
-        let cap = Capability::sign(make_ticket(), "default".into(), &seed);
+        let cap = Capability::sign(make_ticket(), "default".into(), &seed).unwrap();
         let rec = AuthRecordV2::from_capability(&cap, &exporter());
         let mut other = exporter();
         other[0] ^= 0x01;
-        assert!(!rec.verify(&pk, &other, NOW));
+        assert!(!rec.verify(&pk, "", &other, NOW));
     }
 
     #[test]
     fn auth_v2_rejects_expired() {
         let (seed, pk) = issuer_keypair();
-        let cap = Capability::sign(make_ticket(), "default".into(), &seed);
+        let cap = Capability::sign(make_ticket(), "default".into(), &seed).unwrap();
         let rec = AuthRecordV2::from_capability(&cap, &exporter());
         let after_expiry = cap.ticket.not_after + 1;
-        assert!(!rec.verify(&pk, &exporter(), after_expiry));
+        assert!(!rec.verify(&pk, "", &exporter(), after_expiry));
     }
 
     #[test]
@@ -876,13 +960,13 @@ mod tests {
             sig: [0u8; CAP_SIG_LEN],
         };
         let rec = AuthRecordV2::from_capability(&forged, &exporter());
-        assert!(!rec.verify(&pk, &exporter(), NOW));
+        assert!(!rec.verify(&pk, "", &exporter(), NOW));
     }
 
     #[test]
     fn auth_v2_payload_roundtrip() {
         let (seed, _) = issuer_keypair();
-        let cap = Capability::sign(make_ticket(), "default".into(), &seed);
+        let cap = Capability::sign(make_ticket(), "default".into(), &seed).unwrap();
         let rec = AuthRecordV2::from_capability(&cap, &exporter());
         let payload = rec.encode_payload();
         let decoded = AuthRecordV2::decode_payload(&payload).expect("decode");
@@ -897,7 +981,7 @@ mod tests {
         assert!(AuthRecordV2::decode_payload(&[0u8; 10]).is_none());
         // A bare capability with no authcode trailer.
         let (seed, _) = issuer_keypair();
-        let cap = Capability::sign(make_ticket(), "default".into(), &seed);
+        let cap = Capability::sign(make_ticket(), "default".into(), &seed).unwrap();
         assert!(AuthRecordV2::decode_payload(&cap.encode()).is_none());
     }
 }
@@ -925,7 +1009,8 @@ mod golden {
             },
             "ru".into(),
             &[7u8; 32],
-        );
+        )
+        .unwrap();
         assert_eq!(hex::encode(cap.encode()), GOLDEN_BLOB_HEX);
     }
 
@@ -946,7 +1031,8 @@ mod golden {
             1,
             "ru".into(),
             &[7u8; 32],
-        );
+        )
+        .unwrap();
         assert_eq!(hex::encode(cap.encode()), GOLDEN_BLOB_V2_HEX);
     }
 }

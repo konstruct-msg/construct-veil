@@ -26,6 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::BytesMut;
 use construct_veil_protocol::{
     AuthRecordV2, AuthRecordV3, EXPORTER_LABEL, ROLE_RELAY, ROLE_USER, VeilFrontCodec,
+    scope_matches,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -314,14 +315,13 @@ fn try_decode_auth(
                 return Some(GateDecision::Site);
             };
 
-            // Scope gate: empty cap scope or empty relay scope = wildcard.
-            let scope_ok = rec.capability.scope.is_empty()
-                || relay_scope.is_empty()
-                || rec.capability.scope == relay_scope;
+            // For the log line only; `verify` enforces it.
+            let scope_ok = scope_matches(&rec.capability.scope, relay_scope);
 
-            // Offline validation: issuer signature + validity window + exporter-bound
-            // authcode (constant-time). No ticket store, no network.
-            if scope_ok && rec.verify(issuer_pubkey, exporter, now_unix()) {
+            // Offline validation: validity window, suite, scope (empty on either side
+            // = wildcard), issuer signature, exporter-bound authcode (constant-time).
+            // No ticket store, no network.
+            if rec.verify(issuer_pubkey, relay_scope, exporter, now_unix()) {
                 debug!(
                     ticket_id = ?hex::encode(rec.capability.ticket.ticket_id),
                     "capability (v2) valid, routing to tunnel"
@@ -355,21 +355,24 @@ fn try_decode_auth(
                 return Some(GateDecision::Site);
             };
 
-            // Scope gate: empty cap scope or empty relay scope = wildcard.
-            let scope_ok = rec.capability.scope.is_empty()
-                || relay_scope.is_empty()
-                || rec.capability.scope == relay_scope;
+            // For the log line only; `verify` enforces it.
+            let scope_ok = scope_matches(&rec.capability.scope, relay_scope);
 
             // Accept ROLE_USER (end clients) and ROLE_RELAY (chain domestic→clean hop).
             // A dedicated upstream-facing listener was sketched in
             // decisions/veil-relay-topology.md §3 but not shipped; until then both
             // roles share this gate. Role is still *checked* (cannot forge USER as
-            // RELAY or vice versa) — only the listener split is deferred.
-            // Offline: issuer sig + role + window + client_sig over exporter.
-            let now = now_unix();
-            let user_ok = rec.verify(issuer_pubkey, ROLE_USER, exporter, now);
-            let relay_ok = rec.verify(issuer_pubkey, ROLE_RELAY, exporter, now);
-            if scope_ok && (user_ok || relay_ok) {
+            // RELAY or vice versa — it is inside the issuer signature) — only the
+            // listener split is deferred.
+            // Offline: role + window + suite + scope + issuer sig + client_sig over
+            // the exporter. One verification for the role the capability claims
+            // (it used to run once per accepted role, i.e. twice on every failure).
+            let role = rec.capability.role;
+            let role_ok = role == ROLE_USER || role == ROLE_RELAY;
+            let valid =
+                role_ok && rec.verify(issuer_pubkey, relay_scope, role, exporter, now_unix());
+            let (user_ok, relay_ok) = (valid && role == ROLE_USER, valid && role == ROLE_RELAY);
+            if valid {
                 debug!(
                     ticket_id = ?hex::encode(rec.capability.ticket_id),
                     role = if relay_ok { "relay" } else { "user" },
@@ -467,7 +470,7 @@ mod tests {
             not_after: u64::MAX,
             suite_id: 1,
         };
-        let cap = Capability::sign(ticket, scope.to_string(), &SEED);
+        let cap = Capability::sign(ticket, scope.to_string(), &SEED).unwrap();
         let rec = AuthRecordV2::from_capability(&cap, &EXPORTER);
         let mut buf = BytesMut::new();
         VeilFrontCodec::default()
@@ -489,7 +492,8 @@ mod tests {
             1,
             scope.to_string(),
             &SEED,
-        );
+        )
+        .unwrap();
         let rec = AuthRecordV3::from_capability(&cap, &veil_sk, &EXPORTER);
         let mut buf = BytesMut::new();
         VeilFrontCodec::default()

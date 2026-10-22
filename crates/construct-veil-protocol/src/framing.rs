@@ -35,7 +35,7 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-use crate::varint::{decode_varint, encode_varint};
+use crate::varint::{Varint, decode_varint_checked, encode_varint};
 use crate::{
     FRAME_TYPE_AUTH, FRAME_TYPE_AUTH_V2, FRAME_TYPE_AUTH_V3, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA,
     WIRE_VER,
@@ -247,6 +247,28 @@ impl Encoder<Frame> for VeilFrontCodec {
 
 // ── Decoder ────────────────────────────────────────────────────────────────
 
+fn malformed(what: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("malformed frame header: {what}"),
+    )
+}
+
+/// A length field from the wire as `usize`, if it is within `max`.
+///
+/// Compared as `u64` before converting: until 2026-10-22 the check was
+/// `len as usize > max`, which on a 32-bit target (armv7 Android) truncates
+/// `2^32 + 5` to 5, passes, and desynchronises the stream.
+fn bounded_len(len: u64, max: usize, what: &str) -> Result<usize, std::io::Error> {
+    match usize::try_from(len) {
+        Ok(n) if n <= max => Ok(n),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame {what} too large: {len} bytes (max {max})"),
+        )),
+    }
+}
+
 impl Decoder for VeilFrontCodec {
     type Item = Frame;
     type Error = std::io::Error;
@@ -275,20 +297,12 @@ impl Decoder for VeilFrontCodec {
 
         // Decode payload_len varint.
         let mut payload_len_buf = &src[2..];
-        let (payload_len, vb_payload) = match decode_varint(&mut payload_len_buf) {
-            Some(v) => v,
-            None => return Ok(None),
+        let (payload_len, vb_payload) = match decode_varint_checked(&mut payload_len_buf) {
+            Varint::Value(v, n) => (v, n),
+            Varint::Incomplete => return Ok(None),
+            Varint::Malformed => return Err(malformed("payload_len")),
         };
-
-        if payload_len as usize > self.max_payload {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "frame payload too large: {} bytes (max {})",
-                    payload_len, self.max_payload
-                ),
-            ));
-        }
+        let payload_len = bounded_len(payload_len, self.max_payload, "payload")?;
 
         // Decode pad_len varint (always present in WIRE_VER 3).
         let pre_pad_off = 2 + vb_payload;
@@ -296,23 +310,20 @@ impl Decoder for VeilFrontCodec {
             return Ok(None);
         }
         let mut pad_len_buf = &src[pre_pad_off..];
-        let (pad_len, vb_pad) = match decode_varint(&mut pad_len_buf) {
-            Some(v) => v,
-            None => return Ok(None),
+        let (pad_len, vb_pad) = match decode_varint_checked(&mut pad_len_buf) {
+            Varint::Value(v, n) => (v, n),
+            Varint::Incomplete => return Ok(None),
+            Varint::Malformed => return Err(malformed("pad_len")),
         };
+        let pad_len = bounded_len(pad_len, self.max_payload, "pad")?;
 
-        if pad_len as usize > self.max_payload {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "frame pad too large: {} bytes (max {})",
-                    pad_len, self.max_payload
-                ),
-            ));
-        }
-
+        // Both lengths are <= max_payload, so this cannot overflow for any sane
+        // max_payload; checked anyway so a huge configured cap cannot wrap it.
+        let total_len = (2 + vb_payload + vb_pad)
+            .checked_add(payload_len)
+            .and_then(|n| n.checked_add(pad_len))
+            .ok_or_else(|| malformed("frame length"))?;
         let header_len = 2 + vb_payload + vb_pad;
-        let total_len = header_len + payload_len as usize + pad_len as usize;
 
         if src.len() < total_len {
             return Ok(None);
@@ -322,8 +333,8 @@ impl Decoder for VeilFrontCodec {
         src.advance(header_len);
 
         // Extract payload, then drop the trailing pad bytes.
-        let payload = src.split_to(payload_len as usize).freeze();
-        src.advance(pad_len as usize);
+        let payload = src.split_to(payload_len).freeze();
+        src.advance(pad_len);
 
         Ok(Some(Frame {
             frame_type,

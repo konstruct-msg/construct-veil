@@ -1110,7 +1110,7 @@ mod tests {
             not_after: 1_000_000 + 6 * 3600,
             suite_id: 0x01,
         };
-        let cap = Capability::sign(ticket, "test".into(), &[7u8; 32]);
+        let cap = Capability::sign(ticket, "test".into(), &[7u8; 32]).unwrap();
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, cap.encode())
     }
 
@@ -1160,7 +1160,8 @@ mod tests {
             0x01,
             "test".into(),
             &[7u8; 32],
-        );
+        )
+        .unwrap();
         VeilFrontAuthV3 {
             capability_v2_b64: base64::Engine::encode(
                 &base64::engine::general_purpose::STANDARD,
@@ -1215,6 +1216,6 @@ mod tests {
         let decoded = AuthRecordV3::decode_payload(&payload).expect("decode");
 
         let pubkey = construct_veil_protocol::issuer_public_key(&[7u8; 32]);
-        assert!(decoded.verify(&pubkey, ROLE_USER, &exporter, 1_000_000 + 60));
+        assert!(decoded.verify(&pubkey, "", ROLE_USER, &exporter, 1_000_000 + 60));
     }
 }
