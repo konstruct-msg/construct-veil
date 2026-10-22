@@ -113,6 +113,32 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     handshake_timeout_secs: u64,
 
+    /// Seconds a peer may stay silent after the TLS handshake before the first
+    /// application byte. A web server drops such a connection (nginx
+    /// `client_header_timeout`, 60 s by default); until 2026-10-22 the relay held
+    /// it — task, socket and per-IP slot — forever, which is both a resource leak
+    /// and a behaviour no web server has.
+    #[arg(long, default_value_t = 60)]
+    first_byte_timeout_secs: u64,
+
+    /// Seconds allowed to open the backend (or chain upstream) connection after a
+    /// tunnel authenticates — TCP connect plus TLS handshake (plus AUTH, in chain
+    /// mode). Without it a blackholed backend holds the client's tunnel open.
+    #[arg(long, default_value_t = 10)]
+    dial_timeout_secs: u64,
+
+    /// ALPN protocols the server offers, comma-separated (e.g. `h2,http/1.1`).
+    /// Empty (the default) sends no ALPN extension — the behaviour so far. A
+    /// browser that offers h2 then talks HTTP/1.1 to the cover site.
+    ///
+    /// A real web server on the same name would answer `h2`; the absence is
+    /// visible to an active prober. Enable only after checking that the cover
+    /// site at `--site` accepts cleartext HTTP/2 with prior knowledge: browsers
+    /// will then send h2 frames through the site branch, and a cover that only
+    /// speaks HTTP/1.1 breaks for every visitor.
+    #[arg(long, default_value = "", value_delimiter = ',')]
+    alpn: Vec<String>,
+
     /// Generate a new Ed25519 `veil_sk`/`veil_pk` keypair for chain relay mode
     /// and exit, printing the pubkey (hex) to stdout. The private seed is
     /// written to `--chain-veil-sk-file` (created with 0600 perms) and never
@@ -140,8 +166,8 @@ struct Args {
     #[arg(long)]
     chain_capability_file: Option<String>,
 
-    /// Chain relay mode: path to this relay's `veil_sk` seed file (32 raw
-    /// bytes or hex — see `--generate-relay-keypair`). Never logged.
+    /// Chain relay mode: path to this relay's `veil_sk` seed file (64 hex chars,
+    /// as `--generate-relay-keypair` writes it). Never logged.
     #[arg(long)]
     chain_veil_sk_file: Option<String>,
 }
@@ -193,6 +219,7 @@ impl Admission {
 
     /// Reserve a slot for `ip`, or `None` if that peer is already at its cap.
     fn admit_ip(self: &Arc<Self>, ip: IpAddr) -> Option<IpGuard> {
+        let ip = per_ip_bucket(ip);
         let mut map = lock(&self.per_ip);
         let count = map.entry(ip).or_insert(0);
         if *count >= self.max_per_ip {
@@ -205,6 +232,58 @@ impl Admission {
             ip,
         })
     }
+}
+
+/// The key the per-IP cap counts under.
+///
+/// IPv4: the address. IPv6: its /64 — the smallest block a network hands one
+/// subscriber, and the one a single host can pick addresses from freely. Until
+/// 2026-10-22 the full v6 address was the key, so one peer with a /64 had
+/// unlimited "distinct" sources and the per-IP cap meant nothing. IPv4-mapped v6
+/// addresses count as their v4 address.
+fn per_ip_bucket(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let mut seg = v6.segments();
+                seg[4..].fill(0);
+                IpAddr::V6(std::net::Ipv6Addr::from(seg))
+            }
+        },
+    }
+}
+
+/// TCP keepalive on an accepted socket: a peer that vanished without a FIN (NAT
+/// timeout, airplane mode, a dropped mobile link) is detected in about two
+/// minutes and its tunnel, backend connection and per-IP slot are released.
+/// Until 2026-10-22 none was set; after the 3 s idle-chaff window an idle tunnel
+/// sends nothing, so such a tunnel waited on its read forever.
+fn set_keepalive(tcp: &tokio::net::TcpStream) -> std::io::Result<()> {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(15));
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    let keepalive = keepalive.with_retries(4);
+    socket2::SockRef::from(tcp).set_tcp_keepalive(&keepalive)
+}
+
+/// Create a file holding a secret: mode 0600 from the first byte, and never over
+/// an existing file. Until 2026-10-22 the relay seed was written with the
+/// process umask (usually world-readable) and chmod'ed after, and an existing
+/// seed was silently replaced — losing the identity the upstream had issued a
+/// capability for.
+fn write_secret_file(path: &str, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents)
 }
 
 /// Releases the per-IP slot when the connection task ends, by any path.
@@ -318,12 +397,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut seed = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
         let sk = SigningKey::from_bytes(&seed);
-        std::fs::write(sk_path, hex::encode(sk.to_bytes()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(sk_path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        write_secret_file(sk_path, hex::encode(sk.to_bytes()).as_bytes()).map_err(|e| {
+            format!("writing {sk_path}: {e} (an existing seed is never overwritten)")
+        })?;
         println!("veil_pk: {}", hex::encode(sk.verifying_key().to_bytes()));
         println!(
             "veil_sk written to {sk_path} (0600) — send the pubkey above to the upstream's admin for capability issuance, the seed never leaves this box"
@@ -385,6 +461,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let key_path = args.key.as_ref().ok_or("Production mode requires --key")?;
         RelayTls::from_pem_files(cert_path, key_path)?
     };
+
+    let mut relay_tls = relay_tls;
+    let alpn: Vec<Vec<u8>> = args
+        .alpn
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.as_bytes().to_vec())
+        .collect();
+    if !alpn.is_empty() {
+        relay_tls.set_alpn(alpn);
+    }
 
     // ── Issuer public key (capability verification) ─────────────────────────
     // The relay validates each presented capability's Ed25519 signature against
@@ -486,6 +574,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let admission = Admission::new(args.max_handshakes, args.max_conns_per_ip);
     let stats = Arc::new(ConnStats::default());
     let handshake_timeout = Duration::from_secs(args.handshake_timeout_secs.max(1));
+    let first_byte_timeout = Duration::from_secs(args.first_byte_timeout_secs.max(1));
+    let dial_timeout = Duration::from_secs(args.dial_timeout_secs.max(1));
     info!(
         max_handshakes = args.max_handshakes,
         max_conns_per_ip = args.max_conns_per_ip,
@@ -528,6 +618,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         tcp.set_nodelay(true).ok();
+        if let Err(e) = set_keepalive(&tcp) {
+            debug!(error = %e, "TCP keepalive not set");
+        }
 
         let acceptor = acceptor.clone();
         let dialer = backend_dialer.clone();
@@ -571,6 +664,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dialer,
                 &site,
                 chain_config,
+                Timeouts {
+                    first_byte: first_byte_timeout,
+                    dial: dial_timeout,
+                },
             )
             .await
             {
@@ -579,6 +676,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+}
+
+/// Per-connection time limits (see the `--*-timeout-secs` flags).
+#[derive(Clone, Copy)]
+struct Timeouts {
+    /// TLS done → first application byte.
+    first_byte: Duration,
+    /// Tunnel authenticated → backend / upstream connection open.
+    dial: Duration,
 }
 
 /// Handle a single incoming connection.
@@ -592,6 +698,7 @@ async fn handle_connection(
     backend_dialer: BackendDialer,
     site: &str,
     chain_config: Option<Arc<ChainConfig>>,
+    timeouts: Timeouts,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The TLS handshake is done by the caller, under a timeout and a handshake
     // permit — neither of which should cover the connection's whole lifetime.
@@ -599,9 +706,18 @@ async fn handle_connection(
     // Own-TLS path (Pattern A, relay on :443): the gate reads the exporter off
     // the rustls connection, then the Tunnel/Site decision is handed to the
     // shared `dispatch_gate_result` (same dispatch as the external path).
-    match gate_with_exporter(tls_stream, issuer_pubkey, relay_scope).await {
+    match gate_with_exporter(tls_stream, issuer_pubkey, relay_scope, timeouts.first_byte).await {
         Ok(result) => {
-            dispatch_gate_result(result, peer, backend, backend_dialer, site, chain_config).await?;
+            dispatch_gate_result(
+                result,
+                peer,
+                backend,
+                backend_dialer,
+                site,
+                chain_config,
+                timeouts.dial,
+            )
+            .await?;
         }
         Err(e) => {
             debug!(peer = %peer, error = %e, "gate error, treating as site traffic");
@@ -623,6 +739,7 @@ async fn dispatch_gate_result<S>(
     backend_dialer: BackendDialer,
     site: &str,
     chain_config: Option<Arc<ChainConfig>>,
+    dial_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
@@ -632,25 +749,18 @@ where
             if let Some(cfg) = chain_config {
                 // Chain relay mode — ferry through the upstream relay instead
                 // of a local backend (decisions/veil-relay-topology.md §3).
-                let upstream = chain::dial_upstream(&cfg).await?;
+                let upstream = chain::dial_upstream_within(&cfg, dial_timeout).await?;
                 chain::forward_chain(stream, leftover, upstream, peer).await?;
                 return Ok(());
             }
 
             // Valid auth — connect to the backend (plain h2c or TLS+ALPN-h2) and tunnel.
-            // `backend` is a host:port string, resolved here (per connection).
-            let backend = tokio::net::TcpStream::connect(backend).await?;
-            backend.set_nodelay(true)?;
-            match &backend_dialer {
-                BackendDialer::Plain => {
-                    tunnel::forward_tunnel(stream, leftover, backend, peer).await?;
+            match open_backend(backend, &backend_dialer, dial_timeout).await? {
+                BackendConn::Plain(conn) => {
+                    tunnel::forward_tunnel(stream, leftover, conn, peer).await?;
                 }
-                BackendDialer::Tls {
-                    connector,
-                    server_name,
-                } => {
-                    let tls_backend = connector.connect(server_name.clone(), backend).await?;
-                    tunnel::forward_tunnel(stream, leftover, tls_backend, peer).await?;
+                BackendConn::Tls(conn) => {
+                    tunnel::forward_tunnel(stream, leftover, *conn, peer).await?;
                 }
             }
         }
@@ -678,6 +788,39 @@ where
     Ok(())
 }
 
+/// An open backend connection, plain or TLS.
+enum BackendConn {
+    Plain(tokio::net::TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
+}
+
+/// Connect to the backend: TCP, then TLS for a TLS dialer, all within `limit`.
+/// `backend` is a host:port string, resolved here (per connection), so a
+/// recreated backend container with a new address is picked up.
+async fn open_backend(
+    backend: &str,
+    dialer: &BackendDialer,
+    limit: Duration,
+) -> std::io::Result<BackendConn> {
+    let open = async {
+        let tcp = tokio::net::TcpStream::connect(backend).await?;
+        tcp.set_nodelay(true)?;
+        Ok(match dialer {
+            BackendDialer::Plain => BackendConn::Plain(tcp),
+            BackendDialer::Tls {
+                connector,
+                server_name,
+            } => BackendConn::Tls(Box::new(connector.connect(server_name.clone(), tcp).await?)),
+        })
+    };
+    tokio::time::timeout(limit, open).await.unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "backend dial timed out",
+        ))
+    })
+}
+
 /// External-terminator entry (path A / ECH): an out-of-process TLS/ECH
 /// terminator hands up an already-*decrypted* client duplex plus the 32-byte
 /// TLS exporter it computed for that session. We run the same gate + dispatch
@@ -697,13 +840,31 @@ async fn handle_external_stream<S>(
     backend_dialer: BackendDialer,
     site: &str,
     chain_config: Option<Arc<ChainConfig>>,
+    timeouts: Timeouts,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    match gate_stream(stream, exporter, issuer_pubkey, relay_scope).await {
+    match gate_stream(
+        stream,
+        exporter,
+        issuer_pubkey,
+        relay_scope,
+        timeouts.first_byte,
+    )
+    .await
+    {
         Ok(result) => {
-            dispatch_gate_result(result, peer, backend, backend_dialer, site, chain_config).await?;
+            dispatch_gate_result(
+                result,
+                peer,
+                backend,
+                backend_dialer,
+                site,
+                chain_config,
+                timeouts.dial,
+            )
+            .await?;
         }
         Err(e) => {
             debug!(peer = %peer, error = %e, "gate error (external stream), routing as site");
@@ -711,4 +872,108 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    /// Mutation: key the map on the full address again — a peer rotating the low
+    /// 64 bits gets a fresh budget every time.
+    #[test]
+    fn an_ipv6_slash_64_shares_one_per_ip_budget() {
+        let admission = Admission::new(16, 2);
+        let host = |low: u16| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xaa, 0xbb, 0, 0, 0, low));
+        let a = admission.admit_ip(host(1)).expect("first");
+        let b = admission.admit_ip(host(2)).expect("second");
+        assert!(
+            admission.admit_ip(host(3)).is_none(),
+            "a third address in the same /64 got past the cap"
+        );
+        // Another /64 has its own budget.
+        let other = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0xaa, 0xbc, 0, 0, 0, 1));
+        assert!(admission.admit_ip(other).is_some());
+        drop((a, b));
+        assert!(
+            admission.admit_ip(host(3)).is_some(),
+            "slots were not released"
+        );
+    }
+
+    #[test]
+    fn ipv4_and_ipv4_mapped_count_as_the_same_peer() {
+        let v4 = Ipv4Addr::new(203, 0, 113, 7);
+        assert_eq!(per_ip_bucket(IpAddr::V4(v4)), IpAddr::V4(v4));
+        assert_eq!(
+            per_ip_bucket(IpAddr::V6(v4.to_ipv6_mapped())),
+            IpAddr::V4(v4)
+        );
+    }
+
+    fn temp_path(name: &str) -> String {
+        let mut p = std::env::temp_dir();
+        p.push(format!("veil-relay-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p.to_string_lossy().into_owned()
+    }
+
+    /// Mutation: `fs::write` + chmod (the old path) — the file is replaced, and
+    /// with a permissive umask briefly world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn secret_files_are_private_and_never_overwritten() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path("seed");
+        write_secret_file(&path, b"first").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(write_secret_file(&path, b"second").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Pins that `set_keepalive` really lands on the socket. A contract test:
+    /// removing the call from the accept loop is not observable from here.
+    #[tokio::test]
+    async fn keepalive_is_set_on_the_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap());
+        let ((accepted, _), _client) = tokio::try_join!(listener.accept(), client).unwrap();
+        set_keepalive(&accepted).unwrap();
+        assert!(socket2::SockRef::from(&accepted).keepalive().unwrap());
+    }
+
+    /// A backend that accepts TCP and never answers TLS: the dial gives up and the
+    /// tunnel is not held open. Mutation: `open_backend` without the timeout.
+    #[tokio::test]
+    async fn a_silent_tls_backend_times_out_the_dial() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_silent, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let roots = rustls::RootCertStore::empty();
+        let config = rustls::ClientConfig::builder_with_provider(tls::crypto_provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let dialer = BackendDialer::Tls {
+            connector: tokio_rustls::TlsConnector::from(Arc::new(config)),
+            server_name: rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            open_backend(&addr.to_string(), &dialer, Duration::from_millis(200)),
+        )
+        .await
+        .expect("backend dial hung past its own timeout");
+        match result {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            Ok(_) => panic!("a silent backend completed TLS"),
+        }
+    }
 }

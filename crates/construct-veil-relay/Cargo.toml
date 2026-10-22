@@ -38,6 +38,8 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 # Async I/O
 tokio = { version = "1", features = ["full"] }
+# TCP keepalive on accepted sockets (already in the tree via tokio).
+socket2 = { version = "0.6", features = ["all"] }
 tokio-util = { version = "0.7", features = ["codec", "io"] }
 tokio-rustls = "0.26"
 
