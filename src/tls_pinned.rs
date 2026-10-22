@@ -21,10 +21,10 @@
 //! an on-path attacker could terminate the TLS session with the front's own
 //! certificate ([[todo/207]]).
 //!
-//! [`build_connector_unpinned`] exists for the one caller that authenticates
-//! inside the TLS session (obfs4's ntor handshake, `veil_proxy_start_tls`) and
-//! for tests. It still verifies the handshake signature against the presented
-//! certificate; it only skips the pin.
+//! `build_connector_unpinned` exists only in tests. Its last production caller,
+//! the TLS-wrapped obfs4 proxy (which authenticated inside the session with ntor),
+//! was removed on 2026-10-22. It still verifies the handshake signature against
+//! the presented certificate; it only skips the pin.
 
 use std::{fmt, net::IpAddr, sync::Arc};
 
@@ -45,7 +45,7 @@ use crate::tls_fingerprint::TlsProfile;
 /// - `sni`: SNI to advertise. Empty → IP-based `ServerName` (no SNI extension).
 /// - `spki_hex`: hex SHA-256 of DER SubjectPublicKeyInfo (64 hex digits, either
 ///   case). Required: an empty or malformed pin is an error, never "no pinning"
-///   — see [`build_connector_unpinned`] for the explicit opt-out.
+///   — tests use `build_connector_unpinned` instead.
 /// - `relay_addr`: `"ip:port"` string — used to extract the IP when `sni` is empty.
 /// - `profile`: TLS fingerprint profile. Controls cipher suite ordering and ALPN
 ///   to mimic a specific browser ClientHello.
@@ -70,8 +70,8 @@ pub fn build_connector(
 /// handshake signature is still verified against it (so the peer at least holds
 /// the key of the certificate it shows).
 ///
-/// Only for callers that authenticate the peer inside the TLS session (obfs4
-/// ntor) or for tests against a server whose key is not known in advance.
+/// Tests only: a server whose key is not known in advance.
+#[cfg(test)]
 pub fn build_connector_unpinned(
     sni: &str,
     relay_addr: &str,

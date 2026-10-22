@@ -15,7 +15,6 @@ use std::{
 };
 
 use tokio::{
-    io::copy_bidirectional,
     net::{TcpListener, TcpStream},
     sync::{Mutex, mpsc, oneshot},
 };
@@ -110,7 +109,7 @@ impl VeilCoordinator {
             .insert(obfuscator.method_id(), Arc::from(obfuscator));
     }
 
-    /// Start an VEIL session with full TLS/WebTunnel parameters.
+    /// Start an VEIL session with full TLS parameters.
     ///
     /// This is the main entry point for the coordinator.
     /// For Phase 1 (top_k_probes=1), probes are executed sequentially.
@@ -119,13 +118,10 @@ impl VeilCoordinator {
     pub async fn start_session_with_params(
         &self,
         relay: String,
-        bundle: String,
         fingerprint: NetworkFingerprint,
         allowed_methods: MethodSet,
         tls_sni: String,
         spki_hex: String,
-        host_header: String,
-        wt_base_path: String,
         veil_front_ticket_b64: String,
         veil_front_auth_v3: VeilFrontAuthV3,
     ) -> Result<CoordinatorStartResult, CoordinatorError> {
@@ -195,7 +191,6 @@ impl VeilCoordinator {
             let event = match &state {
                 VeilState::Idle => VeilEvent::Start {
                     relay: relay.clone(),
-                    bundle: bundle.clone(),
                     fingerprint: fingerprint.clone(),
                     allowed_methods,
                 },
@@ -231,13 +226,10 @@ impl VeilCoordinator {
                     effect,
                     &fingerprint,
                     &relay,
-                    &bundle,
                     &mut state,
                     &scores_cache,
                     &tls_sni,
                     &spki_hex,
-                    &host_header,
-                    &wt_base_path,
                     &veil_front_ticket_b64,
                     &veil_front_auth_v3,
                     start_time,
@@ -285,25 +277,21 @@ impl VeilCoordinator {
         unreachable!("FSM should transition to Active, Idle, or Cooldown")
     }
 
-    /// Start an VEIL session with default TLS/WebTunnel parameters.
+    /// Start an VEIL session with default TLS parameters.
     ///
-    /// Delegates to [`start_session_with_params`] with empty TLS/WebTunnel params
+    /// Delegates to [`start_session_with_params`] with empty TLS params
     /// and no veil-front ticket (so veil-front is effectively excluded from the
     /// race — its probe will fail ticket parsing).
     pub async fn start_session(
         &self,
         relay: String,
-        bundle: String,
         fingerprint: NetworkFingerprint,
         allowed_methods: MethodSet,
     ) -> Result<CoordinatorStartResult, CoordinatorError> {
         self.start_session_with_params(
             relay,
-            bundle,
             fingerprint,
             allowed_methods,
-            String::new(),
-            String::new(),
             String::new(),
             String::new(),
             String::new(),
@@ -312,20 +300,17 @@ impl VeilCoordinator {
         .await
     }
 
-    /// Execute a single FSM effect (with full TLS/WebTunnel params).
+    /// Execute a single FSM effect (with full TLS params).
     #[allow(clippy::too_many_arguments)]
     async fn execute_effect_with_params(
         &self,
         effect: &VeilEffect,
         fingerprint: &NetworkFingerprint,
         relay: &str,
-        bundle: &str,
         state: &mut VeilState,
         scores_cache: &CachedScoreLookup,
         tls_sni: &str,
         spki_hex: &str,
-        host_header: &str,
-        wt_base_path: &str,
         veil_front_ticket_b64: &str,
         veil_front_auth_v3: &VeilFrontAuthV3,
         _start_time: Instant,
@@ -345,13 +330,10 @@ impl VeilCoordinator {
                         methods,
                         fingerprint,
                         relay,
-                        bundle,
                         state,
                         scores_cache,
                         tls_sni,
                         spki_hex,
-                        host_header,
-                        wt_base_path,
                         veil_front_ticket_b64,
                         veil_front_auth_v3,
                     )
@@ -362,13 +344,10 @@ impl VeilCoordinator {
                         methods,
                         fingerprint,
                         relay,
-                        bundle,
                         state,
                         scores_cache,
                         tls_sni,
                         spki_hex,
-                        host_header,
-                        wt_base_path,
                         veil_front_ticket_b64,
                         veil_front_auth_v3,
                     )
@@ -427,13 +406,10 @@ impl VeilCoordinator {
         methods: &[MethodId],
         fingerprint: &NetworkFingerprint,
         relay: &str,
-        bundle: &str,
         state: &mut VeilState,
         scores_cache: &CachedScoreLookup,
         tls_sni: &str,
         spki_hex: &str,
-        host_header: &str,
-        wt_base_path: &str,
         veil_front_ticket_b64: &str,
         veil_front_auth_v3: &VeilFrontAuthV3,
     ) -> Result<(), CoordinatorError> {
@@ -444,11 +420,8 @@ impl VeilCoordinator {
                 .execute_probe_with_params(
                     method,
                     relay,
-                    bundle,
                     tls_sni,
                     spki_hex,
-                    host_header,
-                    wt_base_path,
                     veil_front_ticket_b64,
                     veil_front_auth_v3,
                 )
@@ -462,7 +435,6 @@ impl VeilCoordinator {
                         latency_ms,
                         fingerprint,
                         relay,
-                        bundle,
                         tls_sni,
                         spki_hex,
                         veil_front_ticket_b64,
@@ -506,13 +478,10 @@ impl VeilCoordinator {
         methods: &[MethodId],
         fingerprint: &NetworkFingerprint,
         relay: &str,
-        bundle: &str,
         state: &mut VeilState,
         scores_cache: &CachedScoreLookup,
         tls_sni: &str,
         spki_hex: &str,
-        host_header: &str,
-        wt_base_path: &str,
         veil_front_ticket_b64: &str,
         veil_front_auth_v3: &VeilFrontAuthV3,
     ) -> Result<(), CoordinatorError> {
@@ -532,11 +501,8 @@ impl VeilCoordinator {
 
             let tx_clone = tx.clone();
             let relay_str = relay.to_owned();
-            let bundle_str = bundle.to_owned();
             let tls_sni_str = tls_sni.to_owned();
             let spki_hex_str = spki_hex.to_owned();
-            let host_header_str = host_header.to_owned();
-            let wt_base_path_str = wt_base_path.to_owned();
             let veil_front_ticket_b64_str = veil_front_ticket_b64.to_owned();
             let veil_front_auth_v3_owned = veil_front_auth_v3.clone();
             let probe_timeout = self.config.probe_timeout;
@@ -582,11 +548,8 @@ impl VeilCoordinator {
                 let probe_start = Instant::now();
                 let req = ProbeRequest {
                     relay_addr: relay_str,
-                    bundle: bundle_str,
                     tls_sni: tls_sni_str,
                     spki_hex: spki_hex_str,
-                    host_header: host_header_str,
-                    wt_base_path: wt_base_path_str,
                     veil_front_ticket_b64: veil_front_ticket_b64_str,
                     auth_v3: veil_front_auth_v3_owned,
                 };
@@ -737,7 +700,6 @@ impl VeilCoordinator {
             let proxy_params = ProxyParams {
                 method: winning_method,
                 relay_addr: relay.to_owned(),
-                bundle: bundle.to_owned(),
                 tls_sni: tls_sni.to_owned(),
                 spki_hex: spki_hex.to_owned(),
                 veil_front_ticket_b64: veil_front_ticket_b64.to_owned(),
@@ -775,7 +737,6 @@ impl VeilCoordinator {
         latency_ms: u32,
         fingerprint: &NetworkFingerprint,
         relay: &str,
-        bundle: &str,
         tls_sni: &str,
         spki_hex: &str,
         veil_front_ticket_b64: &str,
@@ -829,7 +790,6 @@ impl VeilCoordinator {
         let proxy_params = ProxyParams {
             method,
             relay_addr: relay.to_owned(),
-            bundle: bundle.to_owned(),
             tls_sni: tls_sni.to_owned(),
             spki_hex: spki_hex.to_owned(),
             veil_front_ticket_b64: veil_front_ticket_b64.to_owned(),
@@ -977,17 +937,14 @@ impl VeilCoordinator {
         }
     }
 
-    /// Execute a single probe with full TLS/WebTunnel parameters.
+    /// Execute a single probe with full TLS parameters.
     #[allow(clippy::too_many_arguments)]
     async fn execute_probe_with_params(
         &self,
         method: MethodId,
         relay: &str,
-        bundle: &str,
         tls_sni: &str,
         spki_hex: &str,
-        host_header: &str,
-        wt_base_path: &str,
         veil_front_ticket_b64: &str,
         veil_front_auth_v3: &VeilFrontAuthV3,
     ) -> Result<(), ProbeFailureReason> {
@@ -998,11 +955,8 @@ impl VeilCoordinator {
 
         let req = ProbeRequest {
             relay_addr: relay.to_owned(),
-            bundle: bundle.to_owned(),
             tls_sni: tls_sni.to_owned(),
             spki_hex: spki_hex.to_owned(),
-            host_header: host_header.to_owned(),
-            wt_base_path: wt_base_path.to_owned(),
             veil_front_ticket_b64: veil_front_ticket_b64.to_owned(),
             auth_v3: veil_front_auth_v3.clone(),
         };
@@ -1068,19 +1022,13 @@ struct ProxyParams {
     method: MethodId,
     /// Relay address (`host:port`).
     relay_addr: String,
-    /// obfs4 bridge / cert bundle. Empty for non-obfs4 methods.
-    bundle: String,
-    /// TLS SNI (TLS-wrapped methods). Read only by the veil-front (utls) path.
-    #[cfg_attr(not(feature = "utls"), allow(dead_code))]
+    /// TLS SNI. Empty = no SNI.
     tls_sni: String,
-    /// SPKI hex pin (TLS-wrapped methods). Read only by the veil-front (utls) path.
-    #[cfg_attr(not(feature = "utls"), allow(dead_code))]
+    /// SPKI hex pin of the front.
     spki_hex: String,
-    /// Base64-encoded veil-front ticket (AUTH v2). Empty for non-veil-front methods.
-    #[cfg_attr(not(feature = "utls"), allow(dead_code))]
+    /// Base64-encoded veil-front ticket (AUTH v2).
     veil_front_ticket_b64: String,
-    /// AUTH v3 (key-bound capability) params. Read only by the veil-front path.
-    #[cfg_attr(not(feature = "utls"), allow(dead_code))]
+    /// AUTH v3 (key-bound capability) params.
     veil_front_auth_v3: VeilFrontAuthV3,
 }
 
@@ -1148,42 +1096,9 @@ async fn handle_proxy_connection(local: TcpStream, params: ProxyParams) {
                 eprintln!("ice: coordinator: veil-front ferry failed: {e}");
             }
         }
-        // obfs4 (and any non-veil-front method) — obfs4 data plane.
-        _ => forward_obfs4(local, params).await,
-    }
-}
-
-/// obfs4 data plane: local → obfs4 handshake → relay.
-async fn forward_obfs4(mut local: TcpStream, params: ProxyParams) {
-    let config = match crate::ClientConfig::from_bridge_line(&params.bundle) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("ice: coordinator: invalid bundle: {e}");
-            return;
-        }
-    };
-
-    let connect = tokio::time::timeout(
-        Duration::from_secs(5),
-        TcpStream::connect(&params.relay_addr),
-    )
-    .await
-    .unwrap_or_else(|_| Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
-    match connect {
-        Ok(tcp) => {
-            let _ = tcp.set_nodelay(true);
-            match crate::Obfs4Stream::client_handshake_stream(tcp, config).await {
-                Ok(mut remote) => {
-                    let _ = copy_bidirectional(&mut local, &mut remote).await;
-                }
-                Err(e) => {
-                    eprintln!("ice: coordinator: obfs4 handshake failed: {e}");
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("ice: coordinator: relay connect failed: {e}");
-        }
+        // Only veil-front has a data plane; the FSM never activates another method
+        // because no other obfuscator is registered.
+        other => eprintln!("ice: coordinator: no data plane for {other}"),
     }
 }
 
@@ -1191,7 +1106,6 @@ async fn forward_obfs4(mut local: TcpStream, params: ProxyParams) {
 fn classify_obfuscator_error(e: &ObfuscatorError) -> ProbeFailureReason {
     match e {
         ObfuscatorError::FingerprintBlocked => ProbeFailureReason::FingerprintBlocked,
-        ObfuscatorError::WebTunnelDecoyResponse => ProbeFailureReason::WebTunnelDecoyResponse,
         ObfuscatorError::CertProblem(_) => ProbeFailureReason::TlsCertProblem,
         ObfuscatorError::Timeout => ProbeFailureReason::Timeout,
         ObfuscatorError::Cancelled => ProbeFailureReason::ConnectionFailed,
@@ -1273,12 +1187,7 @@ mod tests {
 
     async fn start(coord: &VeilCoordinator) -> Result<CoordinatorStartResult, CoordinatorError> {
         coord
-            .start_session(
-                "relay:443".into(),
-                String::new(),
-                fingerprint(),
-                MethodSet::all(),
-            )
+            .start_session("relay:443".into(), fingerprint(), MethodSet::all())
             .await
     }
 

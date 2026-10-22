@@ -6,62 +6,47 @@ Context for AI agents working in this repository.
 
 ## What is construct-veil?
 
-obfs4 pluggable transport implementation in Rust for Construct Messenger.
-Makes gRPC traffic indistinguishable from random noise — DPI resistance for Iran, China, Russia.
-Used by `construct-relay` (server-side) and `construct-core` FFI bindings (client-side).
+The anti-censorship transport of Construct Messenger: the **veil-front** client
+(coordinator, adapter, C FFI linked into construct-core), the wire protocol
+(`crates/construct-veil-protocol`) and the relay (`crates/construct-veil-relay`).
+obfs4 and WebTunnel were removed on 2026-10-22 (decision `veil-front-only-retire-obfs4`);
+do not bring them back without a new decision.
 
 ---
 
 ## Architecture
 
-```
-src/
-├── lib.rs              — Public surface: Obfs4Stream, Obfs4Listener
-├── crypto/             — ntor handshake crypto, KDF, Elligator2
-├── handshake/          — Client + server handshake state machines
-├── framing/            — Frame encoder/decoder (NaCl secretbox + SipHash OFB length obf)
-├── transport/          — AsyncRead/AsyncWrite transport wrappers
-├── iat.rs              — Inter-arrival timing jitter (IAT mode)
-├── replay_filter.rs    — Replay attack prevention
-├── tls_fingerprint.rs  — TLS fingerprint randomization
-├── tls_pinned.rs       — TLS pinning for client connections
-├── traffic_mode.rs     — Protocol polymorphism (PRNG seed re-keying)
-├── ffi.rs              — FFI bindings (used by construct-core UniFFI)
-└── metrics.rs          — Prometheus metrics (feature = "metrics")
-```
+See README.md, "Source layout". In short:
 
-### Protocol polymorphism
-
-Every connection is cryptographically distinct via PRNG seed re-keying:
-after handshake, both sides exchange a `PrngSeed` frame → re-derive IAT RNG + SipHash key.
-This defeats ML-based DPI classifiers that train on frame length distributions.
+```
+src/ffi.rs                 — C ABI the apps call (veil_start, veil_front_ferry_fd, …)
+src/veil/                  — coordinator FSM, scoring, veil-front adapter
+src/tls_pinned.rs          — SPKI-pinned rustls connector (pin is mandatory)
+crates/construct-veil-protocol — frames, tickets, capabilities, AUTH v2/v3
+crates/construct-veil-relay    — the relay binary
+```
 
 ---
 
 ## Build & Test
 
 ```bash
-cargo build                        # default build
-cargo build --features metrics     # with Prometheus metrics
-cargo test                         # unit tests
-cargo test --test '*'              # integration tests (echo, multi-round-trip, etc.)
-
-# Cross-compilation
-cargo build --release --target aarch64-unknown-linux-gnu   # for Raspberry Pi relays
+cargo test --workspace --all-features
+cargo clippy --workspace --all-features --all-targets -- -D warnings
+cargo check --features ffi --target aarch64-apple-ios
 ```
 
 ---
 
 ## Key conventions
 
-- `Obfs4Stream` and `Obfs4Listener` are the only public API — keep the surface small
-- All handshake vectors are cross-tested against the Go reference implementation
-- `ffi.rs` exposes `Obfs4Connect` / `Obfs4Accept` for construct-core UniFFI
-- Never disable the replay filter — it prevents connection replay attacks
+- `VeilStartRequest` / `VeilStartResult` are a C ABI the apps compile against: never
+  reorder or remove fields; retired fields stay and are ignored.
+- The SPKI pin is required on every client connection; there is no unpinned
+  production path.
+- Every fix carries a regression test that fails on the old code.
 
 ---
----
-
 ## Documentation
 
 All project documentation: `~/Code/construct-docs` (Obsidian vault).

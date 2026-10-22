@@ -40,24 +40,17 @@ jobs:
       - name: Clippy (default features)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Clippy (ffi-tls)
-        run: cargo clippy --all-targets --features ffi-tls -- -D warnings
+      - name: Clippy (tls only)
+        run: cargo clippy --all-targets --no-default-features --features tls -- -D warnings
 
-      - name: Clippy (tonic-transport)
-        run: cargo clippy --all-targets --features tonic-transport -- -D warnings
-
-      # The shipping feature sets: `coordinator`+`utls` is what iOS/Android link,
-      # `server`/`metrics` is the relay side, and the two sub-crates
-      # (construct-veil-protocol, construct-veil-relay) are what the deployed
-      # relay is built from. Until 2026-10-22 none of these were in CI.
+      # The shipping feature set: `ffi` (which brings `coordinator` + `utls`) is
+      # what iOS/Android link, and the two sub-crates (construct-veil-protocol,
+      # construct-veil-relay) are what the deployed relay is built from.
       - name: Clippy (workspace, all features)
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
       - name: Run tests (default)
         run: cargo test
-
-      - name: Run tests (tonic-transport)
-        run: cargo test --features tonic-transport
 
       - name: Run tests (workspace, all features)
         run: cargo test --workspace --all-features
@@ -107,16 +100,13 @@ jobs:
           key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: macos-cargo-
 
-      # Validate FFI+TLS compiles for host (macOS) and iOS targets.
+      # Validate the FFI compiles for host (macOS) and iOS targets.
       # cargo check validates the dependency graph without linking — fast.
-      - name: Check ffi-tls (macOS host)
-        run: cargo check --features ffi-tls
+      - name: Check ffi (macOS host)
+        run: cargo check --features ffi
 
-      - name: Check ffi-tls (iOS device)
-        run: cargo check --features ffi-tls --target aarch64-apple-ios
+      - name: Check ffi (iOS device)
+        run: cargo check --features ffi --target aarch64-apple-ios
 
-      - name: Check ffi-tls (iOS simulator)
-        run: cargo check --features ffi-tls --target aarch64-apple-ios-sim
-
-      - name: Check tonic-transport (macOS host)
-        run: cargo check --features tonic-transport
+      - name: Check ffi (iOS simulator)
+        run: cargo check --features ffi --target aarch64-apple-ios-sim

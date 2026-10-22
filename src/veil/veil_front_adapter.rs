@@ -4,7 +4,7 @@
 //! 1. TCP connect to relay
 //! 2. TLS 1.3 handshake (uTLS browser profile + SPKI pin)
 //! 3. Derive TLS exporter keying material
-//! 4. Parse ticket from bundle, build AuthRecord, send AUTH frame
+//! 4. Parse the ticket / capability, build the AUTH record, send the AUTH frame
 //! 5. Send the HTTP/2 client preface inside a DATA frame to drive the h2c backend
 //! 6. Read a framed DATA response back — its arrival proves the tunnel is live
 //!
@@ -789,11 +789,8 @@ mod tests {
             };
             let req = ProbeRequest {
                 relay_addr: relay.clone(),
-                bundle: String::new(),
-                tls_sni: sni.clone(),
+                tls_sni: sni,
                 spki_hex: spki,
-                host_header: sni,
-                wt_base_path: "/api/stream".into(),
                 veil_front_ticket_b64: ticket,
                 auth_v3: VeilFrontAuthV3::default(),
             };

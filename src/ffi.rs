@@ -1,48 +1,29 @@
-//! C FFI — local TCP proxy for iOS integration.
-//!
-//! # Architecture
-//!
-//! ## Plain obfs4 mode (legacy)
-//! ```text
-//! [Swift gRPC] -> 127.0.0.1:PORT (plain TCP)
-//!     -> [Rust proxy] -> Obfs4Stream -> relay:9443 (obfuscated)
-//!     -> [relay VPS] -> main server
-//! ```
-//!
-//! ## TLS-over-obfs4 mode (DPI evasion)
-//! ```text
-//! [Swift gRPC] -> 127.0.0.1:PORT (plain TCP)
-//!     -> [Rust proxy] -> TLS(SNI=veil.domain) -> obfs4 handshake -> relay:443
-//!     -> Traefik TCP passthrough -> gateway TLS termination
-//!     -> obfs4 listener -> gRPC -> main server
-//! ```
-//!
-//! # Usage (from Swift via bridging header)
+//! C FFI — the surface the iOS and Android apps call.
 //!
 //! ```c
-//! // Plain obfs4 (legacy)
-//! int32_t veil_proxy_start(const char *bridge_line, const char *relay_addr, uint16_t *port_out);
-//! // TLS-wrapped obfs4 for DPI evasion
-//! int32_t veil_proxy_start_tls(const char *bridge_line, const char *relay_addr,
-//!                             const char *tls_server_name, uint16_t *port_out);
-//! int32_t veil_proxy_stop(void);
-//! int32_t veil_proxy_is_running(void);
-//! uint16_t veil_proxy_port(void);
+//! int32_t  veil_start(VeilStartRequest req, VeilStartResult *out);
+//! size_t   veil_last_error(char *buf, size_t cap);
+//! int32_t  veil_stop(void);
+//! int32_t  veil_is_alive(void);
+//! uint16_t veil_port(void);
+//! // Host-terminated TLS (iOS NWConnection, Android Conscrypt): one ferry per
+//! // accepted local connection.
+//! int32_t  veil_front_ferry_fd(int32_t local_fd, int32_t relay_fd,
+//!                              const uint8_t *exporter, size_t exporter_len,
+//!                              const char *capability_v2_b64, const char *veil_sk_hex,
+//!                              const char *ticket_b64);
 //! ```
+//!
+//! The per-method `veil_proxy_*` functions (obfs4, TLS-wrapped obfs4, WebTunnel,
+//! the one-shot host-terminated listener) were removed on 2026-10-22; no shipped
+//! client called them. See `decisions/veil-front-only-retire-obfs4`.
 
 use std::{
     ffi::{CStr, c_char},
     sync::{Mutex, OnceLock},
 };
 
-use tokio::{
-    io::copy_bidirectional,
-    net::{TcpListener, TcpStream},
-    runtime::Runtime,
-    sync::oneshot,
-};
-
-use crate::transport::{ClientConfig, Obfs4Stream};
+use tokio::runtime::Runtime;
 
 fn get_runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
@@ -52,11 +33,6 @@ fn get_runtime() -> &'static Runtime {
             .build()
             .expect("veil: failed to create tokio runtime")
     })
-}
-
-struct ProxyHandle {
-    port: u16,
-    shutdown_tx: oneshot::Sender<()>,
 }
 
 /// Run an exported function's body; a panic becomes `fallback` instead of
@@ -78,992 +54,36 @@ fn ffi_guard<T>(fallback: T, body: impl FnOnce() -> T) -> T {
                 .or_else(|| payload.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "non-string panic payload".to_owned());
             eprintln!("veil: ffi call panicked: {what}");
-            #[cfg(feature = "coordinator")]
             crate::veil::diag::record(format!("internal error (panic): {what}"));
             fallback
         }
     }
 }
 
-/// Bind a local listener and install it in `slot`, all under the slot's lock,
-/// then hand the listener to `spawn`.
-///
-/// Until 2026-10-22 each start checked the slot, released the lock, awaited the
-/// bind, and re-locked to install: two concurrent starts both passed the check,
-/// the second overwrote the first, the first loop's shutdown sender was dropped
-/// so its loop exited, and the caller of the first start held a dead port. The
-/// bind is synchronous here (`std`), so the lock never spans an await.
-fn start_in_slot(
-    slot: &Mutex<Option<ProxyHandle>>,
-    spawn: impl FnOnce(TcpListener, oneshot::Receiver<()>),
-) -> Result<u16, ()> {
-    let rt = get_runtime();
-    let mut guard = slot.lock().map_err(|_| ())?;
-    if guard.is_some() {
-        return Err(()); // already running
-    }
-    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|_| ())?;
-    std_listener.set_nonblocking(true).map_err(|_| ())?;
-    let port = std_listener.local_addr().map_err(|_| ())?.port();
-    let _in_runtime = rt.enter(); // `from_std` registers with this runtime's reactor
-    let listener = TcpListener::from_std(std_listener).map_err(|_| ())?;
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    spawn(listener, shutdown_rx);
-    *guard = Some(ProxyHandle { port, shutdown_tx });
-    Ok(port)
-}
+// ── VEIL Coordinator FFI ──────────────────────────────────────────────────────
 
-/// `accept()` failed: wait as [`crate::accept::accept_retry_delay`] says, or
-/// report that the listener is gone (`false`).
-async fn should_keep_accepting(e: &std::io::Error) -> bool {
-    match crate::accept::accept_retry_delay(e) {
-        Some(delay) => {
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
-            true
-        }
-        None => false,
-    }
-}
-
-static PROXY: Mutex<Option<ProxyHandle>> = Mutex::new(None);
-
-#[unsafe(no_mangle)]
-/// Start the obfs4 proxy.
-///
-/// `bridge_line` — bridge parameters string (e.g. `"cert=<base64> iat-mode=0"`).
-/// `relay_addr`  — relay address in `"host:port"` format.
-/// `port_out`    — output parameter: local TCP port the proxy listens on.
-///
-/// Returns 0 on success, -1 on failure.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn veil_proxy_start(
-    bridge_line: *const c_char,
-    relay_addr: *const c_char,
-    port_out: *mut u16,
-) -> i32 {
-    ffi_guard(-1, || {
-        let bridge_line = unsafe {
-            match bridge_line
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-            {
-                Some(s) => s.to_owned(),
-                None => return -1,
-            }
-        };
-        let relay_addr = unsafe {
-            match relay_addr
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-            {
-                Some(s) => s.to_owned(),
-                None => return -1,
-            }
-        };
-
-        let config = match ClientConfig::from_bridge_line(&bridge_line) {
-            Ok(c) => c,
-            Err(_) => return -1,
-        };
-
-        let result: Result<u16, ()> = start_in_slot(&PROXY, |listener, shutdown_rx| {
-            get_runtime().spawn(proxy_loop(listener, relay_addr, config, shutdown_rx));
-        });
-
-        match result {
-            Ok(p) => {
-                if !port_out.is_null() {
-                    unsafe { *port_out = p };
-                }
-                0
-            }
-            Err(()) => -1,
-        }
-    })
-}
-
-#[unsafe(no_mangle)]
-/// Stop all running proxies (plain and TLS-wrapped). Returns 0 if at least one
-/// was stopped, -1 if neither was running.
-pub extern "C" fn veil_proxy_stop() -> i32 {
-    ffi_guard(-1, || {
-        let mut stopped = false;
-
-        if let Ok(mut guard) = PROXY.lock()
-            && let Some(handle) = guard.take()
-        {
-            let _ = handle.shutdown_tx.send(());
-            stopped = true;
-        }
-
-        // Also stop the TLS proxy if it is running — prevents stale handles that
-        // would cause veil_proxy_start_tls to return -1 on the next call.
-        #[cfg(feature = "tls")]
-        if let Ok(mut guard) = PROXY_TLS.lock()
-            && let Some(handle) = guard.take()
-        {
-            let _ = handle.shutdown_tx.send(());
-            stopped = true;
-        }
-
-        // Also stop the WebTunnel proxy — prevents stale handles that would cause
-        // veil_proxy_start_webtunnel to return -1 when rotating to a different relay.
-        #[cfg(feature = "webtunnel")]
-        if let Ok(mut guard) = PROXY_WEBTUNNEL.lock()
-            && let Some(handle) = guard.take()
-        {
-            let _ = handle.shutdown_tx.send(());
-            stopped = true;
-        }
-
-        // Also stop the host-terminated (external) veil-front ferry. Without this the
-        // EXT slot lingers as `Some` after a stop, so the next
-        // `veil_proxy_start_veil_front_external` used to see it occupied and return
-        // -1 (the native-TLS flap on reconnect). Its start now supersedes a stale
-        // session too, but stopping here keeps the port from lingering meanwhile.
-        #[cfg(all(unix, feature = "coordinator"))]
-        if let Ok(mut guard) = PROXY_VEIL_FRONT_EXT.lock()
-            && let Some(handle) = guard.take()
-        {
-            let _ = handle.shutdown_tx.send(());
-            stopped = true;
-        }
-
-        if stopped { 0 } else { -1 }
-    })
-}
-
-#[unsafe(no_mangle)]
-/// Returns 1 if the proxy is currently running (plain-obfs4, TLS-wrapped, or WebTunnel), 0 otherwise.
-pub extern "C" fn veil_proxy_is_running() -> i32 {
-    ffi_guard(0, || {
-        // Plain-obfs4 mode
-        if let Ok(guard) = PROXY.lock()
-            && guard.is_some()
-        {
-            return 1;
-        }
-        // TLS-wrapped mode (used on iOS for DPI evasion)
-        #[cfg(feature = "tls")]
-        if let Ok(guard) = PROXY_TLS.lock()
-            && guard.is_some()
-        {
-            return 1;
-        }
-        // WebTunnel mode (WebSocket-over-TLS, used for CDN fronting)
-        #[cfg(feature = "webtunnel")]
-        if let Ok(guard) = PROXY_WEBTUNNEL.lock()
-            && guard.is_some()
-        {
-            return 1;
-        }
-        // Host-terminated veil-front (native TLS). Until 2026-10-22 not consulted:
-        // after a successful external start this said 0, and so did `veil_is_alive`.
-        #[cfg(all(unix, feature = "coordinator"))]
-        if let Ok(guard) = PROXY_VEIL_FRONT_EXT.lock()
-            && guard.is_some()
-        {
-            return 1;
-        }
-        0
-    })
-}
-
-#[unsafe(no_mangle)]
-/// Returns the local TCP port the proxy is listening on, or 0 if not running.
-/// Prefers TLS-wrapped and WebTunnel modes (DPI-resistant) over plain-obfs4.
-pub extern "C" fn veil_proxy_port() -> u16 {
-    ffi_guard(0, || {
-        // TLS-wrapped mode (preferred — DPI-resistant, used on port 443)
-        #[cfg(feature = "tls")]
-        if let Ok(guard) = PROXY_TLS.lock()
-            && let Some(h) = guard.as_ref()
-        {
-            return h.port;
-        }
-        // WebTunnel mode (WebSocket-over-TLS CDN fronting)
-        #[cfg(feature = "webtunnel")]
-        if let Ok(guard) = PROXY_WEBTUNNEL.lock()
-            && let Some(h) = guard.as_ref()
-        {
-            return h.port;
-        }
-        // Plain-obfs4 mode (fallback relay, e.g. MSK relay on port 9443)
-        if let Ok(guard) = PROXY.lock()
-            && let Some(h) = guard.as_ref()
-        {
-            return h.port;
-        }
-        // Host-terminated veil-front (native TLS) — its port was only ever reported
-        // through `port_out`.
-        #[cfg(all(unix, feature = "coordinator"))]
-        if let Ok(guard) = PROXY_VEIL_FRONT_EXT.lock()
-            && let Some(h) = guard.as_ref()
-        {
-            return h.port;
-        }
-        0
-    })
-}
-
-#[unsafe(no_mangle)]
-/// Returns the port of the TLS-wrapped proxy specifically, or 0 if not running.
-/// Use this when both plain and TLS proxies are running simultaneously (dual-proxy
-/// happy-eyeballs mode) to get each port independently.
-#[cfg(feature = "tls")]
-pub extern "C" fn veil_proxy_port_tls() -> u16 {
-    ffi_guard(0, || {
-        if let Ok(guard) = PROXY_TLS.lock()
-            && let Some(h) = guard.as_ref()
-        {
-            return h.port;
-        }
-        0
-    })
-}
-
-#[unsafe(no_mangle)]
-/// Returns the port of the plain-obfs4 proxy specifically, or 0 if not running.
-/// In dual-proxy mode, this is the secondary relay (e.g. MSK TCP relay).
-pub extern "C" fn veil_proxy_port_plain() -> u16 {
-    ffi_guard(0, || {
-        if let Ok(guard) = PROXY.lock()
-            && let Some(h) = guard.as_ref()
-        {
-            return h.port;
-        }
-        0
-    })
-}
-
-async fn proxy_loop(
-    listener: TcpListener,
-    relay_addr: String,
-    config: ClientConfig,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) {
-    loop {
-        tokio::select! {
-            _ = &mut shutdown_rx => break,
-            result = listener.accept() => {
-                match result {
-                    Ok((local, _)) => {
-                        let addr = relay_addr.clone();
-                        let cfg  = config.clone();
-                        tokio::spawn(handle_connection(local, addr, cfg));
-                    }
-                    Err(e) => {
-                        if !should_keep_accepting(&e).await {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn handle_connection(mut local: TcpStream, relay_addr: String, config: ClientConfig) {
-    match tokio::net::TcpStream::connect(&relay_addr).await {
-        Ok(tcp) => {
-            let _ = tcp.set_nodelay(true);
-            match Obfs4Stream::client_handshake(tcp, config).await {
-                Ok(mut remote) => {
-                    let _ = copy_bidirectional(&mut local, &mut remote).await;
-                }
-                Err(e) => {
-                    eprintln!("veil: obfs4 handshake failed: {e}");
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("veil: relay connect failed: {e}");
-        }
-    }
-}
-
-// ── TLS-wrapped proxy ─────────────────────────────────────────────────────────
-//
-// `veil_proxy_start_tls` — backward-compat: TLS with SNI, no cert pinning.
-// `veil_proxy_start_tls_pinned` — full DPI evasion: fake/empty SNI + SPKI pin.
-//
-// Both use rustls via `crate::tls_pinned::build_connector`.
-//
-// Supported SNI modes (set from Swift via Constants.swift):
-//   sni = ""                         → no SNI extension (IP-based ServerName)
-//   sni = "storage.yandexcloud.net"  → fake SNI, REALITY-style
-//
-// The `tls` Cargo feature must be enabled for these symbols to be compiled.
-
-#[cfg(feature = "tls")]
-static PROXY_TLS: Mutex<Option<ProxyHandle>> = Mutex::new(None);
-
-#[cfg(feature = "tls")]
-#[unsafe(no_mangle)]
-/// Start the TLS-wrapped obfs4 proxy for DPI evasion.
-///
-/// Connections flow: local TCP → TLS to `relay_addr` (SNI=`tls_server_name`) → obfs4 → server.
-///
-/// `bridge_line`      — bridge parameters (e.g. `"cert=<base64> iat-mode=0"`).
-/// `relay_addr`       — relay address: `"veil.example.com:443"`.
-/// `tls_server_name`  — TLS SNI hostname: `"veil.example.com"`.
-/// `port_out`         — local TCP port the proxy listens on.
-///
-/// Returns 0 on success, -1 on failure. Stop with [`veil_proxy_stop`].
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn veil_proxy_start_tls(
-    bridge_line: *const c_char,
-    relay_addr: *const c_char,
-    tls_server_name: *const c_char,
-    port_out: *mut u16,
-) -> i32 {
-    ffi_guard(-1, || {
-        let bridge_line = unsafe {
-            match bridge_line
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-            {
-                Some(s) => s.to_owned(),
-                None => return -1,
-            }
-        };
-        let relay_addr = unsafe {
-            match relay_addr
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-            {
-                Some(s) => s.to_owned(),
-                None => return -1,
-            }
-        };
-        let tls_server_name = unsafe {
-            match tls_server_name
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-            {
-                Some(s) => s.to_owned(),
-                None => return -1,
-            }
-        };
-
-        let config = match ClientConfig::from_bridge_line(&bridge_line) {
-            Ok(c) => c,
-            Err(_) => return -1,
-        };
-        // No SPKI pin — backward-compat. The relay is authenticated by the obfs4 ntor
-        // handshake inside the TLS session; the TLS layer still verifies the handshake
-        // signature against whatever certificate the server shows.
-        let (connector, server_name) = match crate::tls_pinned::build_connector_unpinned(
-            &tls_server_name,
-            &relay_addr,
-            config.tls_profile,
-            None,
-        ) {
-            Ok(v) => v,
-            Err(_) => return -1,
-        };
-
-        let result: Result<u16, ()> = start_in_slot(&PROXY_TLS, |listener, shutdown_rx| {
-            get_runtime().spawn(proxy_loop_tls(
-                listener,
-                relay_addr,
-                connector,
-                server_name,
-                config,
-                shutdown_rx,
-            ));
-        });
-
-        match result {
-            Ok(p) => {
-                if !port_out.is_null() {
-                    unsafe { *port_out = p };
-                }
-                0
-            }
-            Err(()) => -1,
-        }
-    })
-}
-
-#[cfg(feature = "tls")]
-#[unsafe(no_mangle)]
-/// Start the TLS-wrapped obfs4 proxy with SPKI certificate pinning.
-///
-/// Connections flow: local TCP → TLS (SNI=`tls_sni`) → obfs4 → relay.
-///
-/// `bridge_line`  — bridge parameters (`"cert=<base64> iat-mode=<n>"`).
-/// `relay_addr`   — relay IP:port (`"158.160.140.67:443"`).
-/// `tls_sni`      — SNI for ClientHello. Empty string → no SNI (IP-based ServerName).
-///                  Set to `"storage.yandexcloud.net"` for REALITY-style fake SNI.
-/// `spki_hex`     — hex SHA-256 of DER SubjectPublicKeyInfo (64 hex digits). Required:
-///                  NULL, empty or malformed → -1. There is no unpinned mode here;
-///                  `veil_proxy_start_tls` is the one entry point without a pin.
-/// `port_out`     — local TCP port the proxy listens on.
-///
-/// Returns 0 on success, -1 on failure (including a pin the connector refuses).
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn veil_proxy_start_tls_pinned(
-    bridge_line: *const c_char,
-    relay_addr: *const c_char,
-    tls_sni: *const c_char,
-    spki_hex: *const c_char,
-    port_out: *mut u16,
-) -> i32 {
-    ffi_guard(-1, || {
-        let bridge_line = unsafe {
-            match bridge_line
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-            {
-                Some(s) => s.to_owned(),
-                None => return -1,
-            }
-        };
-        let relay_addr = unsafe {
-            match relay_addr
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-            {
-                Some(s) => s.to_owned(),
-                None => return -1,
-            }
-        };
-        let tls_sni = unsafe {
-            tls_sni
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-                .unwrap_or("")
-                .to_owned()
-        };
-        let spki_hex = unsafe {
-            match spki_hex
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-            {
-                Some(s) => s.to_owned(),
-                None => return -1,
-            }
-        };
-
-        let config = match ClientConfig::from_bridge_line(&bridge_line) {
-            Ok(c) => c,
-            Err(_) => return -1,
-        };
-        // Built once, here, so a bad pin fails the start instead of every connection.
-        let (connector, server_name) = match crate::tls_pinned::build_connector(
-            &tls_sni,
-            &spki_hex,
-            &relay_addr,
-            config.tls_profile,
-            None,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("veil-tls: {e}");
-                return -1;
-            }
-        };
-
-        let result: Result<u16, ()> = start_in_slot(&PROXY_TLS, |listener, shutdown_rx| {
-            get_runtime().spawn(proxy_loop_tls(
-                listener,
-                relay_addr,
-                connector,
-                server_name,
-                config,
-                shutdown_rx,
-            ));
-        });
-
-        match result {
-            Ok(p) => {
-                if !port_out.is_null() {
-                    unsafe { *port_out = p };
-                }
-                0
-            }
-            Err(()) => -1,
-        }
-    })
-}
-
-#[cfg(feature = "tls")]
-async fn proxy_loop_tls(
-    listener: TcpListener,
-    relay_addr: String,
-    connector: tokio_rustls::TlsConnector,
-    server_name: rustls::pki_types::ServerName<'static>,
-    config: ClientConfig,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) {
-    loop {
-        tokio::select! {
-            _ = &mut shutdown_rx => break,
-            result = listener.accept() => {
-                match result {
-                    Ok((local, _)) => {
-                        let addr = relay_addr.clone();
-                        let cfg  = config.clone();
-                        tokio::spawn(handle_connection_tls(
-                            local, addr, connector.clone(), server_name.clone(), cfg,
-                        ));
-                    }
-                    Err(e) => {
-                        if !should_keep_accepting(&e).await {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// One local connection → TLS to the relay with the connector the start call
-/// built (SNI mode and pin decided there) → obfs4 → bidirectional proxy.
-#[cfg(feature = "tls")]
-async fn handle_connection_tls(
-    mut local: TcpStream,
-    relay_addr: String,
-    connector: tokio_rustls::TlsConnector,
-    server_name: rustls::pki_types::ServerName<'static>,
-    config: ClientConfig,
-) {
-    use tokio::net::TcpStream as TokioTcp;
-
-    // Attempt the obfs4-over-TLS connection up to 2 times before giving up.
-    // The server may momentarily reject a handshake (e.g. during restart or
-    // due to clock-skew on epoch boundary); a single retry avoids false
-    // "always relay" fallbacks on iOS.
-    for attempt in 0u8..2 {
-        // 1. TCP connect to relay (IP string — no DNS lookup)
-        let tcp = match TokioTcp::connect(&relay_addr).await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("veil-tls: tcp connect failed (attempt {attempt}): {e}");
-                // ECONNREFUSED is often transient (relay restart / rate-limit window).
-                // Retry once with a brief pause; any other error is persistent.
-                if attempt == 0 && e.kind() == std::io::ErrorKind::ConnectionRefused {
-                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-                    continue;
-                }
-                break;
-            }
-        };
-
-        // Disable Nagle's algorithm so the obfs4 client request is sent
-        // immediately without waiting for a full MSS — critical on iOS cellular
-        // where Nagle can add ~200 ms of artificial latency.
-        let _ = tcp.set_nodelay(true);
-
-        // 2. TLS handshake via rustls.
-        //    With SPKI pinning: ignores CA chain, verifies public key hash.
-        //    With fake SNI: sends the configured domain in ClientHello but
-        //    cert validation is still by pin — no domain match required.
-        let tls_stream = match connector.connect(server_name.clone(), tcp).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("veil-tls: TLS handshake failed (attempt {attempt}): {e}");
-                break; // TLS failure is not transient
-            }
-        };
-
-        // 3. obfs4 handshake over the TLS stream, then bidirectional proxy
-        match Obfs4Stream::client_handshake_stream(tls_stream, config.clone()).await {
-            Ok(mut remote) => {
-                let _ = copy_bidirectional(&mut local, &mut remote).await;
-                return; // Success — done
-            }
-            Err(e) => {
-                eprintln!("veil-tls: obfs4 handshake failed (attempt {attempt}): {e}");
-                if attempt == 0 {
-                    // Brief pause before retry to avoid hammering the server
-                    // during epoch-boundary MAC window (~1 second is sufficient).
-                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-                }
-            }
-        }
-    }
-}
-
-// ── uTLS profiled proxy ───────────────────────────────────────────────────────
-
-/// Start a TLS-over-obfs4 proxy with a specific browser TLS fingerprint profile.
-///
-/// Identical to `veil_proxy_start_tls_pinned` but accepts a `tls_profile` string
-/// that controls cipher suite ordering and ALPN:
-///
-/// - `"chrome131"` or `"chrome"` — Chrome 131 ordering
-/// - `"firefox128"` or `"firefox"` — Firefox 128 ordering
-/// - `""` — the production default (`Chrome131`); `"rustls"` — rustls defaults, test-only
-///
-/// # Safety
-/// All pointer parameters must be valid null-terminated C strings or null.
-#[cfg(all(feature = "ffi", feature = "tls"))]
-#[unsafe(no_mangle)]
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn veil_proxy_start_tls_profiled(
-    bridge_line: *const c_char,
-    relay_addr: *const c_char,
-    tls_sni: *const c_char,
-    spki_hex: *const c_char,
-    tls_profile: *const c_char,
-    port_out: *mut u16,
-) -> i32 {
-    ffi_guard(-1, || {
-        let bridge_line = unsafe {
-            match bridge_line
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-            {
-                Some(s) => s.to_owned(),
-                None => return -1,
-            }
-        };
-        let relay_addr = unsafe {
-            match relay_addr
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-            {
-                Some(s) => s.to_owned(),
-                None => return -1,
-            }
-        };
-        let tls_sni = unsafe {
-            tls_sni
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-                .unwrap_or("")
-                .to_owned()
-        };
-        let spki_hex = unsafe {
-            match spki_hex
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-            {
-                Some(s) => s.to_owned(),
-                None => return -1,
-            }
-        };
-        let profile_str = unsafe {
-            tls_profile
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-                .unwrap_or("")
-                .to_owned()
-        };
-
-        let mut config = match ClientConfig::from_bridge_line(&bridge_line) {
-            Ok(c) => c,
-            Err(_) => return -1,
-        };
-        config.tls_profile = match crate::tls_fingerprint::TlsProfile::from_name(&profile_str) {
-            Some(p) => p,
-            None => return -1, // a typo must not degrade to the test-only rustls fingerprint
-        };
-        let (connector, server_name) = match crate::tls_pinned::build_connector(
-            &tls_sni,
-            &spki_hex,
-            &relay_addr,
-            config.tls_profile,
-            None,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("veil-tls: {e}");
-                return -1;
-            }
-        };
-
-        let result: Result<u16, ()> = start_in_slot(&PROXY_TLS, |listener, shutdown_rx| {
-            get_runtime().spawn(proxy_loop_tls(
-                listener,
-                relay_addr,
-                connector,
-                server_name,
-                config,
-                shutdown_rx,
-            ));
-        });
-
-        match result {
-            Ok(p) => {
-                if !port_out.is_null() {
-                    unsafe { *port_out = p };
-                }
-                0
-            }
-            Err(()) => -1,
-        }
-    })
-}
-
-// ── WebTunnel proxy ───────────────────────────────────────────────────────────
-
-#[cfg(feature = "webtunnel")]
-static PROXY_WEBTUNNEL: Mutex<Option<ProxyHandle>> = Mutex::new(None);
-
-#[cfg(feature = "webtunnel")]
-#[unsafe(no_mangle)]
-/// Start the WebTunnel (WebSocket-over-TLS) proxy for DPI evasion.
-///
-/// Traffic flow: local TCP → TLS (SNI=`tls_sni`) → WebSocket → relay.
-///
-/// `relay_addr`   — relay IP:port (`"158.160.140.67:443"`).
-/// `tls_sni`      — SNI for TLS ClientHello; set to CDN domain for fronting.
-///                  Empty → IP-based ServerName (no SNI extension).
-/// `spki_hex`     — hex SHA-256 of DER SubjectPublicKeyInfo (64 hex digits). Required:
-///                  NULL, empty or malformed → -1 (WebTunnel has no inner authentication,
-///                  so the pin is the only proof of the relay's identity).
-/// `host_header`  — HTTP `Host` header for WebSocket upgrade. Can differ from `tls_sni`.
-/// `bridge_cert`  — base64-encoded obfs4 bridge cert from relay manifest (used for token derivation).
-/// `wt_base_path` — WebSocket resource base path (e.g. `"/api/stream"`), without the token.
-/// `port_out`     — local TCP port the proxy listens on.
-///
-/// The auth token is computed per-connection from `bridge_cert` and the current time period.
-/// Returns 0 on success, -1 on failure. Stop with `veil_proxy_stop`.
-///
-/// TODO(refactor): 7 raw C pointers is fragile — group into `WebTunnelConfig` struct passed by
-/// pointer, mirroring the pattern used by the bridging header on the Swift side. This also makes
-/// adding future fields (e.g. obfs4 iat-mode, circuit isolation) a non-breaking change.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub extern "C" fn veil_proxy_start_webtunnel(
-    relay_addr: *const c_char,
-    tls_sni: *const c_char,
-    spki_hex: *const c_char,
-    host_header: *const c_char,
-    bridge_cert: *const c_char,
-    wt_base_path: *const c_char,
-    port_out: *mut u16,
-) -> i32 {
-    ffi_guard(-1, || {
-        fn parse_req(ptr: *const c_char) -> Option<String> {
-            unsafe { ptr.as_ref() }
-                .and_then(|p| unsafe { CStr::from_ptr(p) }.to_str().ok())
-                .map(|s| s.to_owned())
-        }
-        fn parse_opt(ptr: *const c_char) -> String {
-            unsafe { ptr.as_ref() }
-                .and_then(|p| unsafe { CStr::from_ptr(p) }.to_str().ok())
-                .unwrap_or("")
-                .to_owned()
-        }
-
-        let relay_addr = match parse_req(relay_addr) {
-            Some(s) => s,
-            None => return -1,
-        };
-        let tls_sni = parse_opt(tls_sni);
-        let spki_hex = match parse_req(spki_hex) {
-            Some(s) => s,
-            None => return -1,
-        };
-        let host = parse_opt(host_header);
-        let bridge_cert = parse_opt(bridge_cert);
-        let wt_base_path = {
-            let p = parse_opt(wt_base_path);
-            if p.is_empty() { "/".to_owned() } else { p }
-        };
-        let (connector, server_name) = match crate::tls_pinned::build_connector(
-            &tls_sni,
-            &spki_hex,
-            &relay_addr,
-            crate::tls_fingerprint::TlsProfile::Chrome131,
-            // RFC 6455 WebSocket upgrade requires HTTP/1.1.  Advertising h2 in ALPN
-            // while then sending an HTTP/1.1 Upgrade request is inconsistent and can
-            // be detected by DPI (e.g. ТСПУ).  Real Chrome uses http/1.1-only ALPN
-            // for wss:// connections.
-            Some(vec![b"http/1.1".to_vec()]),
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("webtunnel: {e}");
-                return -1;
-            }
-        };
-
-        let result: Result<u16, ()> = start_in_slot(&PROXY_WEBTUNNEL, |listener, shutdown_rx| {
-            get_runtime().spawn(proxy_loop_webtunnel(
-                listener,
-                relay_addr,
-                connector,
-                server_name,
-                host,
-                bridge_cert,
-                wt_base_path,
-                shutdown_rx,
-            ));
-        });
-
-        match result {
-            Ok(p) => {
-                if !port_out.is_null() {
-                    unsafe { *port_out = p };
-                }
-                0
-            }
-            Err(()) => -1,
-        }
-    })
-}
-
-#[cfg(feature = "webtunnel")]
-#[unsafe(no_mangle)]
-/// Returns the local port the WebTunnel proxy is listening on (0 = not running).
-pub extern "C" fn veil_proxy_port_webtunnel() -> u16 {
-    ffi_guard(0, || {
-        PROXY_WEBTUNNEL
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|h| h.port))
-            .unwrap_or(0)
-    })
-}
-
-#[cfg(feature = "webtunnel")]
-#[allow(clippy::too_many_arguments)]
-async fn proxy_loop_webtunnel(
-    listener: TcpListener,
-    relay_addr: String,
-    connector: tokio_rustls::TlsConnector,
-    server_name: rustls::pki_types::ServerName<'static>,
-    host_header: String,
-    bridge_cert: String,
-    wt_base_path: String,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) {
-    loop {
-        tokio::select! {
-            _ = &mut shutdown_rx => break,
-            result = listener.accept() => {
-                match result {
-                    Ok((local, _)) => {
-                        let (addr, host, bc, bp) = (
-                            relay_addr.clone(),
-                            host_header.clone(), bridge_cert.clone(), wt_base_path.clone(),
-                        );
-                        tokio::spawn(handle_connection_webtunnel(
-                            local, addr, connector.clone(), server_name.clone(), host, bc, bp,
-                        ));
-                    }
-                    Err(e) => {
-                        if !should_keep_accepting(&e).await {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[cfg(feature = "webtunnel")]
-async fn handle_connection_webtunnel(
-    mut local: TcpStream,
-    relay_addr: String,
-    connector: tokio_rustls::TlsConnector,
-    server_name: rustls::pki_types::ServerName<'static>,
-    host_header: String,
-    bridge_cert: String,
-    wt_base_path: String,
-) {
-    use crate::transport::webtunnel::WebTunnelStream;
-    use tokio::net::TcpStream as TokioTcp;
-
-    // Compute auth token for the current time period.
-    // Token = SHA-256(bridge_cert || "webtunnel-v1" || period_be)[:8] as lowercase hex.
-    // Period = unix_seconds / 300 (5-minute windows).
-    let auth_token = {
-        use sha2::{Digest, Sha256};
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let period = now / 300;
-        let mut hasher = Sha256::new();
-        hasher.update(bridge_cert.as_bytes());
-        hasher.update(b"webtunnel-v1");
-        hasher.update(period.to_be_bytes());
-        let hash = hasher.finalize();
-        hash[..8]
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<String>()
-    };
-    let path = format!("{}/{}", wt_base_path.trim_end_matches('/'), auth_token);
-
-    for attempt in 0u8..2 {
-        let tcp = match TokioTcp::connect(&relay_addr).await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("webtunnel: tcp connect failed (attempt {attempt}): {e}");
-                if attempt == 0 && e.kind() == std::io::ErrorKind::ConnectionRefused {
-                    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-                    continue;
-                }
-                break;
-            }
-        };
-        let _ = tcp.set_nodelay(true);
-
-        let tls_stream = match connector.connect(server_name.clone(), tcp).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("webtunnel: TLS failed (attempt {attempt}): {e}");
-                break;
-            }
-        };
-
-        match WebTunnelStream::connect(tls_stream, &host_header, &path).await {
-            Ok(mut ws) => {
-                let _ = copy_bidirectional(&mut local, &mut ws).await;
-                return;
-            }
-            Err(e) => {
-                eprintln!("webtunnel: WS upgrade failed (attempt {attempt}): {e}");
-                if attempt == 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-                }
-            }
-        }
-    }
-}
-
-// ── VEIL Coordinator FFI (Phase 1) ───────────────────────────────────────────
-//
-// New FFI surface using the FSM-based coordinator.
-// Replaces the legacy `veil_proxy_start*` functions in Phase 3.
-//
-// ```c
-// int32_t veil_start(VeilStartRequest req, VeilStartResult *out);
-// void    veil_stop(void);
-// bool    veil_is_alive(void);
-// uint16_t veil_port(void);
-// ```
-
-#[cfg(feature = "coordinator")]
 static COORDINATOR: OnceLock<std::sync::Arc<crate::veil::VeilCoordinator>> = OnceLock::new();
 
 /// Request struct for the coordinator-based `veil_start`.
 ///
 /// Fields that are not needed for a particular method should be set to 0/NULL.
-#[cfg(feature = "coordinator")]
+///
+/// The layout is the ABI the apps compile against, so the fields of the retired
+/// transports stay in place and are ignored: `bundle` (obfs4), `host_header` and
+/// `wt_base_path` (WebTunnel).
 #[repr(C)]
 pub struct VeilStartRequest {
     /// Relay address: "host:port" (required).
     pub relay_addr: *const c_char,
-    /// Bridge line: "cert=<base64> iat-mode=<n>" (required).
+    /// Ignored (was the obfs4 bridge line). May be NULL.
     pub bundle: *const c_char,
     /// TLS SNI hostname. Empty = no SNI.
     pub tls_sni: *const c_char,
-    /// SPKI hex pin. Empty = no pinning.
+    /// SPKI hex pin of the front (required; empty or malformed fails the start).
     pub spki_hex: *const c_char,
-    /// WebTunnel: HTTP Host header.
+    /// Ignored (was the WebTunnel Host header). May be NULL.
     pub host_header: *const c_char,
-    /// WebTunnel: WebSocket base path (e.g. "/api/stream").
+    /// Ignored (was the WebTunnel base path). May be NULL.
     pub wt_base_path: *const c_char,
     /// Network fingerprint bytes (opaque, caller-computed). NULL = default.
     pub network_fingerprint: *const u8,
@@ -1073,11 +93,8 @@ pub struct VeilStartRequest {
     pub allowed_methods: u32,
     /// Path to the SQLite scores database. NULL = in-memory (no persistence).
     pub scores_path: *const c_char,
-    /// Base64-encoded veil-front ticket (65 bytes binary). Empty / NULL means
-    /// veil-front is excluded from the race — its probe will fail at ticket
-    /// parsing and the FSM moves on to the other methods. Must be set by
-    /// clients that ship veil-front; obfs4 / WebTunnel callers can leave it
-    /// NULL. Added in WIRE_VER 3 of the FFI — rebuild Swift/Kotlin bindings.
+    /// Base64-encoded veil-front ticket (65 bytes binary, AUTH v2). Empty / NULL
+    /// with no AUTH v3 material below means the probe fails at ticket parsing.
     /// Superseded (but not replaced) by `veil_capability_v2_b64` below — ticket
     /// B1 (`decisions/veil-ticket-provisioning-system.md`); kept as the fallback
     /// when the v2 fields are NULL/empty, no flag-day.
@@ -1094,217 +111,21 @@ pub struct VeilStartRequest {
 }
 
 /// Result struct returned by `veil_start`.
-#[cfg(feature = "coordinator")]
 #[repr(C)]
 pub struct VeilStartResult {
     /// Local TCP port the proxy is listening on.
     pub port: u16,
-    /// Which method won the probe race: 0=obfs4, 1=webtunnel, 2=masque, 3=veil-front.
+    /// Which method won the probe race: always 3 (veil-front) today. 0–2 were
+    /// obfs4, WebTunnel and the never-built MASQUE.
     pub method: u8,
     /// Wall-clock ms from start to first byte through the tunnel.
     pub latency_ms: u32,
 }
 
-// Gated on `coordinator` (not just `unix`): this path uses `crate::veil`, which
-// only exists with that feature. iOS builds enable it; `ffi-tls`-only builds omit
-// the symbol (the host-terminated-TLS path needs the coordinator machinery anyway).
-//
-// Its own handle type (not the shared `ProxyHandle`) carries a `generation`: a
-// restart supersedes the previous session, and the old loop's teardown must only
-// clear the slot when it still owns it — otherwise a slow-exiting old loop would
-// wipe the handle a fresh start just installed. See
-// [`veil_proxy_start_veil_front_external`].
-#[cfg(all(unix, feature = "coordinator"))]
-struct VeilFrontExtHandle {
-    generation: u64,
-    port: u16,
-    shutdown_tx: oneshot::Sender<()>,
-}
-#[cfg(all(unix, feature = "coordinator"))]
-static PROXY_VEIL_FRONT_EXT: Mutex<Option<VeilFrontExtHandle>> = Mutex::new(None);
-#[cfg(all(unix, feature = "coordinator"))]
-static VEIL_FRONT_EXT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Start a veil-front ferry over a host-terminated TLS session (review §3.1
-/// variant A). The platform (Swift Network.framework) owns the TLS to the relay
-/// — for the native ClientHello fingerprint — and hands us:
-///
-/// - `relay_fd`: one end of a socketpair carrying the **decrypted** relay duplex;
-///   the host pumps its `NWConnection` ↔ the other end. We take ownership of this
-///   fd unconditionally (it is closed by us on every return, success or failure);
-///   the caller must not close it after the call.
-/// - `exporter_ptr`/`exporter_len`: the 32-byte TLS exporter the host derived for
-///   that session (`sec_protocol_metadata_create_secret`, `EXPORTER_LABEL`), which
-///   the relay recomputes; AUTH is bound to it.
-/// - `capability_v2_b64` + `veil_sk_hex`: AUTH v3 material; empty `veil_sk_hex`
-///   falls back to AUTH v2 with `ticket_b64`.
-///
-/// Binds a local `127.0.0.1` listener, writes its port to `port_out`, accepts a
-/// single local gRPC connection and ferries it to the relay duplex. One relay fd
-/// serves one session (one `NWConnection` = one tunnel); the host re-invokes on
-/// reconnect. Returns 0 on success, -1 on failure.
-#[cfg(all(unix, feature = "coordinator"))]
-#[unsafe(no_mangle)]
-#[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
-pub extern "C" fn veil_proxy_start_veil_front_external(
-    relay_fd: i32,
-    exporter_ptr: *const u8,
-    exporter_len: usize,
-    capability_v2_b64: *const c_char,
-    veil_sk_hex: *const c_char,
-    ticket_b64: *const c_char,
-    port_out: *mut u16,
-) -> i32 {
-    ffi_guard(-1, || {
-        use construct_veil_protocol::EXPORTER_LEN;
-        use std::os::fd::FromRawFd;
-
-        // A negative fd is the host's own failure (e.g. `socketpair` failed). It is
-        // never adopted: -1 is `OwnedFd`'s niche (the representation of `None` in
-        // `Option<OwnedFd>`), so building one is undefined behaviour even when, as
-        // today, the next syscall happens to fail with EBADF and hide it.
-        if relay_fd < 0 {
-            return -1;
-        }
-        // Adopt the socketpair fd first, so every return path (including the errors
-        // below) closes it — the ownership contract is unconditional.
-        let std_relay = unsafe { std::os::unix::net::UnixStream::from_raw_fd(relay_fd) };
-
-        if exporter_ptr.is_null() || exporter_len != EXPORTER_LEN {
-            return -1;
-        }
-        let mut exporter = [0u8; EXPORTER_LEN];
-        unsafe { std::ptr::copy_nonoverlapping(exporter_ptr, exporter.as_mut_ptr(), EXPORTER_LEN) };
-
-        let cstr = |p: *const c_char| -> String {
-            unsafe {
-                p.as_ref()
-                    .and_then(|p| CStr::from_ptr(p).to_str().ok())
-                    .unwrap_or("")
-                    .to_owned()
-            }
-        };
-        let auth_v3 = crate::veil::obfuscator::VeilFrontAuthV3 {
-            capability_v2_b64: cstr(capability_v2_b64),
-            veil_sk_hex: cstr(veil_sk_hex),
-        };
-        let ticket_b64 = cstr(ticket_b64);
-
-        if std_relay.set_nonblocking(true).is_err() {
-            return -1;
-        }
-
-        let rt = get_runtime();
-        let result: Result<u16, ()> = rt.block_on(async move {
-            use std::sync::atomic::Ordering;
-
-            // Supersede any prior session instead of failing with -1. The host
-            // re-invokes on every reconnect (one relay duplex = one tunnel), and a
-            // previous session may still be lingering — e.g. `veil_proxy_stop` was
-            // not called, or its loop is mid-teardown. Take the old handle and fire
-            // its shutdown; the generation guard below stops that old loop from
-            // clearing the slot we are about to fill.
-            let generation = VEIL_FRONT_EXT_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-            if let Some(old) = PROXY_VEIL_FRONT_EXT.lock().map_err(|_| ())?.take() {
-                let _ = old.shutdown_tx.send(());
-            }
-
-            let relay = tokio::net::UnixStream::from_std(std_relay).map_err(|_| ())?;
-            let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|_| ())?;
-            let port = listener.local_addr().map_err(|_| ())?.port();
-            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-            rt.spawn(veil_front_external_loop(
-                generation,
-                listener,
-                relay,
-                exporter,
-                ticket_b64,
-                auth_v3,
-                shutdown_rx,
-            ));
-            let mut guard = PROXY_VEIL_FRONT_EXT.lock().map_err(|_| ())?;
-            *guard = Some(VeilFrontExtHandle {
-                generation,
-                port,
-                shutdown_tx,
-            });
-            Ok(port)
-        });
-
-        match result {
-            Ok(p) => {
-                if !port_out.is_null() {
-                    unsafe { *port_out = p };
-                }
-                0
-            }
-            Err(()) => -1,
-        }
-    })
-}
-
-/// Ferry a single local gRPC connection over the host-provided relay duplex.
-///
-/// One relay duplex authenticates once (`EXPORTER_LABEL`) and carries exactly one
-/// tunnel — one local gRPC connection ↔ one backend h2 session — so this serves a
-/// single ferry and the host re-invokes on reconnect. The accept runs in a loop
-/// only to ride out transient `accept()` errors without tearing the session down
-/// before the host's real, long-lived connection lands; a shutdown ends it at
-/// once. See [`veil_proxy_start_veil_front_external`].
-#[cfg(all(unix, feature = "coordinator"))]
-async fn veil_front_external_loop(
-    generation: u64,
-    listener: TcpListener,
-    relay: tokio::net::UnixStream,
-    exporter: [u8; construct_veil_protocol::EXPORTER_LEN],
-    ticket_b64: String,
-    auth_v3: crate::veil::obfuscator::VeilFrontAuthV3,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) {
-    // Accept the first real connection (relay is moved into the ferry once, so
-    // the accept retry lives in its own loop that yields an Option rather than
-    // looping over the move).
-    let accepted: Option<tokio::net::TcpStream> = loop {
-        tokio::select! {
-            _ = &mut shutdown_rx => break None,
-            result = listener.accept() => match result {
-                Ok((local, _)) => break Some(local),
-                // Transient errors keep the listener bound; EMFILE backs off
-                // instead of spinning (this was a bare `continue`).
-                Err(e) => {
-                    if !should_keep_accepting(&e).await {
-                        break None;
-                    }
-                }
-            },
-        }
-    };
-    if let Some(local) = accepted {
-        let _ = crate::veil::veil_front_adapter::run_veil_front_ferry_external(
-            local,
-            relay,
-            &exporter,
-            &ticket_b64,
-            &auth_v3,
-        )
-        .await;
-    }
-
-    // Clear the slot only if it is still ours. A newer start (higher generation)
-    // may have superseded this session and installed its own handle; wiping that
-    // would orphan the live tunnel while leaving its port refusing connections.
-    if let Ok(mut guard) = PROXY_VEIL_FRONT_EXT.lock()
-        && guard.as_ref().is_some_and(|h| h.generation == generation)
-    {
-        *guard = None;
-    }
-}
-
 /// Ferry ONE host-terminated veil-front connection over an already-accepted local
 /// socket (review §3.1 variant A, persistent-listener form).
 ///
-/// Unlike [`veil_proxy_start_veil_front_external`], this owns no listener and no
-/// slot: the host (Swift) binds the stable local gRPC listener, accepts each
+/// This owns no listener and no slot: the host (Swift) binds the stable local gRPC listener, accepts each
 /// connection, dials a fresh native `NWConnection` per accept, and calls this once
 /// per (local connection, relay session) pair. That makes the local port outlive
 /// any single gRPC connection — the one-shot listener forced a fresh port + proxy
@@ -1321,7 +142,7 @@ async fn veil_front_external_loop(
 /// must not touch them after the call. Spawns the ferry and returns immediately —
 /// 0 if it was started, -1 on bad arguments. The ferry ends when either side
 /// closes; the host observes that as EOF on its socketpair end.
-#[cfg(all(unix, feature = "coordinator"))]
+#[cfg(unix)]
 #[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref, clippy::too_many_arguments)]
 pub extern "C" fn veil_front_ferry_fd(
@@ -1338,7 +159,7 @@ pub extern "C" fn veil_front_ferry_fd(
         use std::os::fd::FromRawFd;
 
         // A negative fd is the host's own failure and is never adopted (undefined
-        // behaviour, see `veil_proxy_start_veil_front_external`). The valid one is
+        // behaviour). The valid one is
         // still ours to close.
         if local_fd < 0 || relay_fd < 0 {
             for fd in [local_fd, relay_fd] {
@@ -1402,18 +223,106 @@ pub extern "C" fn veil_front_ferry_fd(
     })
 }
 
+/// What `veil_start` reads out of a [`VeilStartRequest`].
+struct StartArgs {
+    relay_addr: String,
+    tls_sni: String,
+    spki_hex: String,
+    veil_front_ticket_b64: String,
+    veil_front_auth_v3: crate::veil::VeilFrontAuthV3,
+    fingerprint: crate::veil::NetworkFingerprint,
+    allowed_methods: crate::veil::MethodSet,
+}
+
+/// Read and validate the request; `Err` is the reason for `veil_last_error`.
+///
+/// # Safety
+///
+/// Every non-NULL pointer in `req` points to what its field documents: a
+/// NUL-terminated string, or `network_fingerprint_len` readable bytes.
+unsafe fn read_start_request(req: &VeilStartRequest) -> Result<StartArgs, String> {
+    use crate::veil::{MethodSet, NetworkFingerprint, VeilFrontAuthV3};
+
+    let relay_addr = unsafe {
+        req.relay_addr
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+            .map(|s| s.to_owned())
+    };
+    let relay_addr = relay_addr.ok_or("relay_addr is NULL or not UTF-8")?;
+
+    let tls_sni = unsafe {
+        req.tls_sni
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    };
+    // The pin is the relay's identity on every TLS method; a missing or malformed
+    // one is a configuration error the host must see, not a silent "accept any
+    // certificate" (which is what an empty pin meant until 2026-10-22).
+    let spki_hex = unsafe {
+        req.spki_hex
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+            .map(|s| s.to_owned())
+    };
+    let spki_hex = spki_hex.ok_or("spki_hex is NULL or not UTF-8")?;
+    crate::tls_pinned::parse_spki_pin(&spki_hex)?;
+    let veil_front_ticket_b64 = unsafe {
+        req.veil_front_ticket_b64
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let veil_capability_v2_b64 = unsafe {
+        req.veil_capability_v2_b64
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let veil_sk_hex = unsafe {
+        req.veil_sk_hex
+            .as_ref()
+            .and_then(|p| CStr::from_ptr(p).to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let veil_front_auth_v3 = VeilFrontAuthV3 {
+        capability_v2_b64: veil_capability_v2_b64,
+        veil_sk_hex,
+    };
+    let fingerprint = if !req.network_fingerprint.is_null() && req.network_fingerprint_len > 0 {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(req.network_fingerprint, req.network_fingerprint_len)
+        };
+        NetworkFingerprint::new(bytes.to_vec())
+    } else {
+        NetworkFingerprint::default()
+    };
+    let allowed_methods = MethodSet::from_bitmask(req.allowed_methods);
+
+    Ok(StartArgs {
+        relay_addr,
+        tls_sni,
+        spki_hex,
+        veil_front_ticket_b64,
+        veil_front_auth_v3,
+        fingerprint,
+        allowed_methods,
+    })
+}
+
 /// Start an VEIL session using the FSM-based coordinator.
 ///
-/// Sequential probing (top_k_probes=1) for Phase 1 backward compatibility.
-/// Returns 0 on success, -1 on failure.
-#[cfg(feature = "coordinator")]
+/// Returns 0 on success, -1 on failure; the reason is then in [`veil_last_error`].
 #[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -> i32 {
     ffi_guard(-1, || {
-        use crate::veil::{
-            MethodSet, NetworkFingerprint, VeilConfig, VeilCoordinator, scoring::PersistentScores,
-        };
+        use crate::veil::{VeilConfig, VeilCoordinator, scoring::PersistentScores};
 
         // One start at a time. Two overlapping calls used to race on the coordinator
         // (`COORDINATOR.set` → "already set (race)") and on its active session; the
@@ -1426,98 +335,13 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
         // failure (not a stale one) via `veil_last_error`.
         crate::veil::diag::clear();
 
-        let relay_addr = unsafe {
-            req.relay_addr
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-                .map(|s| s.to_owned())
-        };
-        let bundle = unsafe {
-            req.bundle
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-                .map(|s| s.to_owned())
-        };
-        let (relay_addr, bundle) = match (relay_addr, bundle) {
-            (Some(r), Some(b)) => (r, b),
-            _ => return -1,
-        };
-
-        let tls_sni = unsafe {
-            req.tls_sni
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-                .unwrap_or("")
-                .to_owned()
-        };
-        // The pin is the relay's identity on every TLS method; a missing or malformed
-        // one is a configuration error the host must see, not a silent "accept any
-        // certificate" (which is what an empty pin meant until 2026-10-22).
-        let spki_hex = unsafe {
-            req.spki_hex
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-                .map(|s| s.to_owned())
-        };
-        let spki_hex = match spki_hex {
-            Some(s) => s,
-            None => {
-                crate::veil::diag::record("veil_start: spki_hex is NULL or not UTF-8");
+        let args = match unsafe { read_start_request(&req) } {
+            Ok(args) => args,
+            Err(reason) => {
+                crate::veil::diag::record(format!("veil_start: {reason}"));
                 return -1;
             }
         };
-        if let Err(e) = crate::tls_pinned::parse_spki_pin(&spki_hex) {
-            crate::veil::diag::record(format!("veil_start: {e}"));
-            return -1;
-        }
-        let host_header = unsafe {
-            req.host_header
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-                .unwrap_or("")
-                .to_owned()
-        };
-        let wt_base_path = unsafe {
-            req.wt_base_path
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-                .unwrap_or("")
-                .to_owned()
-        };
-        let veil_front_ticket_b64 = unsafe {
-            req.veil_front_ticket_b64
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-                .unwrap_or("")
-                .to_owned()
-        };
-        let veil_capability_v2_b64 = unsafe {
-            req.veil_capability_v2_b64
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-                .unwrap_or("")
-                .to_owned()
-        };
-        let veil_sk_hex = unsafe {
-            req.veil_sk_hex
-                .as_ref()
-                .and_then(|p| CStr::from_ptr(p).to_str().ok())
-                .unwrap_or("")
-                .to_owned()
-        };
-        let veil_front_auth_v3 = crate::veil::VeilFrontAuthV3 {
-            capability_v2_b64: veil_capability_v2_b64,
-            veil_sk_hex,
-        };
-        let fingerprint = if !req.network_fingerprint.is_null() && req.network_fingerprint_len > 0 {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(req.network_fingerprint, req.network_fingerprint_len)
-            };
-            NetworkFingerprint::new(bytes.to_vec())
-        } else {
-            NetworkFingerprint::default()
-        };
-        let allowed_methods = MethodSet::from_bitmask(req.allowed_methods);
 
         // Default config: parallel probing (top_k_probes=2, happy-eyeballs).
         let config = VeilConfig::default();
@@ -1552,20 +376,8 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
                 };
 
                 let mut coordinator = VeilCoordinator::new(config, scores);
-                // veil-front-only (2026-06-12): obfs4 and WebTunnel are fundamentally
-                // DPI-cut in the RU target network and are superseded by veil-front
-                // (honest-front HTTPS). On `utls` builds (iOS/mac/android) we probe
-                // veil-front exclusively — probing the dead methods only wasted a
-                // per-start timeout. Non-`utls` builds keep the legacy transports so
-                // no other consumer breaks. See decision: veil-front-only-retire-obfs4.
-                #[cfg(feature = "utls")]
+                // veil-front is the only transport (decision veil-front-only-retire-obfs4).
                 coordinator.register(Box::new(crate::veil::VeilFrontObfuscator::new()));
-                #[cfg(not(feature = "utls"))]
-                {
-                    use crate::veil::{Obfs4Obfuscator, WebTunnelObfuscator};
-                    coordinator.register(Box::new(Obfs4Obfuscator::new()));
-                    coordinator.register(Box::new(WebTunnelObfuscator::new()));
-                }
 
                 let arc = std::sync::Arc::new(coordinator);
                 COORDINATOR
@@ -1574,29 +386,15 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
                 arc
             };
 
-            // Update probe requests with TLS/WebTunnel params.
-            // For Phase 1, we pass the TLS params through a thread-local or re-create
-            // the obfuscators with the params. For simplicity, we modify the coordinator
-            // to accept the params in start_session.
-            //
-            // Actually, for Phase 1, the coordinator's execute_probe creates ProbeRequest
-            // with empty params. We need to pass the params through.
-            //
-            // Simplest fix: the coordinator stores the params from the last start_session call.
-            // Let me add an extra parameter set to start_session.
-
             let session_result = coord
                 .start_session_with_params(
-                    relay_addr,
-                    bundle,
-                    fingerprint,
-                    allowed_methods,
-                    tls_sni,
-                    spki_hex,
-                    host_header,
-                    wt_base_path,
-                    veil_front_ticket_b64,
-                    veil_front_auth_v3,
+                    args.relay_addr,
+                    args.fingerprint,
+                    args.allowed_methods,
+                    args.tls_sni,
+                    args.spki_hex,
+                    args.veil_front_ticket_b64,
+                    args.veil_front_auth_v3,
                 )
                 .await;
 
@@ -1638,7 +436,6 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
 /// NUL (so a return >= `cap` means it was truncated). Call right after
 /// `veil_start` returns -1. The string names the failing method + stage, e.g.
 /// `"veil-front: timeout after 7003ms (no first byte)"`.
-#[cfg(feature = "coordinator")]
 #[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn veil_last_error(buf: *mut c_char, cap: usize) -> usize {
@@ -1658,54 +455,43 @@ pub extern "C" fn veil_last_error(buf: *mut c_char, cap: usize) -> usize {
 }
 
 /// Stop the active VEIL session. Returns 0 if stopped, -1 if nothing was running.
-#[cfg(feature = "coordinator")]
 #[unsafe(no_mangle)]
 pub extern "C" fn veil_stop() -> i32 {
     ffi_guard(-1, || {
         let rt = get_runtime();
         rt.block_on(async {
-            if let Some(coord) = COORDINATOR.get()
-                && coord.stop().await
-            {
-                return 0;
+            match COORDINATOR.get() {
+                Some(coord) if coord.stop().await => 0,
+                _ => -1,
             }
-            // Also try the legacy stop.
-            veil_proxy_stop()
         })
     })
 }
 
 /// Returns 1 if an VEIL session is currently active, 0 otherwise.
-#[cfg(feature = "coordinator")]
 #[unsafe(no_mangle)]
 pub extern "C" fn veil_is_alive() -> i32 {
     ffi_guard(0, || {
         let rt = get_runtime();
         rt.block_on(async {
-            if let Some(coord) = COORDINATOR.get()
-                && coord.is_alive().await
-            {
-                return 1;
+            match COORDINATOR.get() {
+                Some(coord) if coord.is_alive().await => 1,
+                _ => 0,
             }
-            veil_proxy_is_running()
         })
     })
 }
 
 /// Returns the local port the VEIL proxy is listening on, or 0 if not running.
-#[cfg(feature = "coordinator")]
 #[unsafe(no_mangle)]
 pub extern "C" fn veil_port() -> u16 {
     ffi_guard(0, || {
         let rt = get_runtime();
         rt.block_on(async {
-            if let Some(coord) = COORDINATOR.get() {
-                let p = coord.port().await;
-                if p != 0 {
-                    return p;
-                }
+            match COORDINATOR.get() {
+                Some(coord) => coord.port().await,
+                None => 0,
             }
-            veil_proxy_port()
         })
     })
 }
@@ -1715,90 +501,11 @@ mod tests {
     use super::*;
     use std::ffi::CString;
 
-    /// The proxy slots are process-global; these tests take turns.
-    static SERIAL: Mutex<()> = Mutex::new(());
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        SERIAL.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    fn bridge_line() -> CString {
-        let kp = crate::crypto::keypair::StaticKeypair::generate(&mut rand::rngs::OsRng);
-        CString::new(format!("cert={} iat-mode=0", kp.bridge_cert())).unwrap()
-    }
-
     /// Mutation: call `body()` without `catch_unwind` — the panic escapes.
     #[test]
     fn a_panicking_body_returns_the_fallback() {
         assert_eq!(ffi_guard(-1, || -> i32 { panic!("boom") }), -1);
         assert_eq!(ffi_guard(0u16, || 7u16), 7);
-    }
-
-    /// Many concurrent starts on one slot: exactly one wins, and the slot reports
-    /// the winner's port. Mutation: the old check → await bind → install sequence
-    /// (several succeed, the slot holds only the last one's port).
-    #[test]
-    fn concurrent_starts_on_one_slot_have_one_winner() {
-        let _turn = serial();
-        let _ = veil_proxy_stop();
-        let line = bridge_line();
-        let relay = CString::new("127.0.0.1:9").unwrap();
-        let barrier = std::sync::Barrier::new(8);
-
-        let results: Vec<(i32, u16)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..8)
-                .map(|_| {
-                    scope.spawn(|| {
-                        barrier.wait();
-                        let mut port = 0u16;
-                        let rc = veil_proxy_start(line.as_ptr(), relay.as_ptr(), &mut port);
-                        (rc, port)
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-        let winners: Vec<u16> = results
-            .iter()
-            .filter(|(rc, _)| *rc == 0)
-            .map(|(_, p)| *p)
-            .collect();
-        assert_eq!(winners.len(), 1, "{results:?}");
-        assert_eq!(veil_proxy_port_plain(), winners[0]);
-        // The winner's listener is really there.
-        assert!(std::net::TcpStream::connect(("127.0.0.1", winners[0])).is_ok());
-        assert_eq!(veil_proxy_stop(), 0);
-        assert_eq!(veil_proxy_is_running(), 0);
-    }
-
-    /// The host-terminated veil-front slot is visible to the status calls.
-    /// Mutation: drop the EXT branch from `veil_proxy_is_running` / `veil_proxy_port`.
-    #[cfg(all(unix, feature = "coordinator"))]
-    #[test]
-    fn the_external_slot_is_visible_to_status_calls() {
-        use std::os::fd::IntoRawFd;
-
-        let _turn = serial();
-        let _ = veil_proxy_stop();
-        let (ours, _host_end) = std::os::unix::net::UnixStream::pair().unwrap();
-        let exporter = [0u8; construct_veil_protocol::EXPORTER_LEN];
-        let empty = CString::new("").unwrap();
-        let mut port = 0u16;
-        let rc = veil_proxy_start_veil_front_external(
-            ours.into_raw_fd(),
-            exporter.as_ptr(),
-            exporter.len(),
-            empty.as_ptr(),
-            empty.as_ptr(),
-            empty.as_ptr(),
-            &mut port,
-        );
-        assert_eq!(rc, 0);
-        assert_ne!(port, 0);
-        assert_eq!(veil_proxy_is_running(), 1);
-        assert_eq!(veil_proxy_port(), port);
-        assert_eq!(veil_proxy_stop(), 0);
-        assert_eq!(veil_proxy_is_running(), 0);
     }
 
     /// A negative fd from the host is refused, not adopted, and the valid fd of a
@@ -1807,28 +514,13 @@ mod tests {
     /// here (the later `set_nonblocking` fails on -1), so the mutant survives. The
     /// checks exist because adopting -1 is undefined behaviour, which no
     /// assertion can observe.
-    #[cfg(all(unix, feature = "coordinator"))]
+    #[cfg(unix)]
     #[test]
     fn negative_fds_are_refused() {
         use std::os::fd::IntoRawFd;
 
         let exporter = [0u8; construct_veil_protocol::EXPORTER_LEN];
         let empty = CString::new("").unwrap();
-        let mut port = 0u16;
-        assert_eq!(
-            veil_proxy_start_veil_front_external(
-                -1,
-                exporter.as_ptr(),
-                exporter.len(),
-                empty.as_ptr(),
-                empty.as_ptr(),
-                empty.as_ptr(),
-                &mut port,
-            ),
-            -1
-        );
-
-        // The valid fd of a half-bad pair is still closed (we own it).
         let (ours, peer) = std::os::unix::net::UnixStream::pair().unwrap();
         // Before the call: macOS refuses setsockopt (EINVAL) once the peer is gone.
         peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
@@ -1850,5 +542,34 @@ mod tests {
         use std::io::Read;
         let mut buf = [0u8; 1];
         assert_eq!((&peer).read(&mut buf).unwrap(), 0, "fd {raw} was leaked");
+    }
+
+    /// The fields of the retired transports are ignored: NULL `bundle`,
+    /// `host_header` and `wt_base_path` no longer fail the start before the pin
+    /// is even looked at. Mutation: require `bundle` again (the start fails
+    /// without naming the pin).
+    #[test]
+    fn a_request_without_legacy_fields_reaches_the_pin_check() {
+        let relay = CString::new("127.0.0.1:9").unwrap();
+        let bad_pin = CString::new("not-hex").unwrap();
+        let req = VeilStartRequest {
+            relay_addr: relay.as_ptr(),
+            bundle: std::ptr::null(),
+            tls_sni: std::ptr::null(),
+            spki_hex: bad_pin.as_ptr(),
+            host_header: std::ptr::null(),
+            wt_base_path: std::ptr::null(),
+            network_fingerprint: std::ptr::null(),
+            network_fingerprint_len: 0,
+            allowed_methods: 0,
+            scores_path: std::ptr::null(),
+            veil_front_ticket_b64: std::ptr::null(),
+            veil_capability_v2_b64: std::ptr::null(),
+            veil_sk_hex: std::ptr::null(),
+        };
+        let reason = unsafe { read_start_request(&req) }
+            .err()
+            .unwrap_or_default();
+        assert!(reason.contains("SPKI"), "{reason:?}");
     }
 }
