@@ -101,6 +101,33 @@ async fn dial_and_authenticate(
     capability_b64: &str,
     auth_v3: &VeilFrontAuthV3,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ObfuscatorError> {
+    dial_and_authenticate_within(
+        relay_addr,
+        tls_sni,
+        spki_hex,
+        capability_b64,
+        auth_v3,
+        TLS_AND_AUTH_TIMEOUT,
+    )
+    .await
+}
+
+/// Upper bound on the TLS handshake plus the AUTH write, after TCP connects.
+///
+/// Until 2026-10-22 only the TCP connect (5 s) was bounded: a front that accepts
+/// the SYN and then goes silent (or a middlebox that blackholes after the
+/// handshake starts) left the ferry's dial — which, unlike the probe, has no
+/// outer timeout — hanging per local connection, forever.
+const TLS_AND_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn dial_and_authenticate_within(
+    relay_addr: &str,
+    tls_sni: &str,
+    spki_hex: &str,
+    capability_b64: &str,
+    auth_v3: &VeilFrontAuthV3,
+    tls_and_auth_timeout: Duration,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ObfuscatorError> {
     // TCP connect with timeout.
     let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(relay_addr))
         .await
@@ -114,11 +141,15 @@ async fn dial_and_authenticate(
         })?;
     tcp.set_nodelay(true).map_err(ObfuscatorError::Io)?;
 
-    // TLS handshake with SPKI pinning.
-    let mut tls_stream = dial_utls_tcp(tcp, tls_sni, spki_hex, relay_addr).await?;
-    let exporter = derive_exporter(&tls_stream)?;
-    authenticate_over(&mut tls_stream, &exporter, capability_b64, auth_v3).await?;
-    Ok(tls_stream)
+    // TLS handshake with SPKI pinning, then AUTH — bounded together.
+    tokio::time::timeout(tls_and_auth_timeout, async {
+        let mut tls_stream = dial_utls_tcp(tcp, tls_sni, spki_hex, relay_addr).await?;
+        let exporter = derive_exporter(&tls_stream)?;
+        authenticate_over(&mut tls_stream, &exporter, capability_b64, auth_v3).await?;
+        Ok(tls_stream)
+    })
+    .await
+    .map_err(|_| ObfuscatorError::Timeout)?
 }
 
 /// Build and send the veil-front AUTH frame over an already-established relay
@@ -397,11 +428,29 @@ where
         local_wr.shutdown().await.map_err(ObfuscatorError::Io)
     };
 
-    let (r1, r2) = tokio::join!(up, down);
-    let strategy = r1?;
-    r2?;
-
-    Ok(strategy)
+    // Half-close semantics, asymmetric on purpose:
+    // - local finished first (gRPC client closed its write side): `up` has sent
+    //   the relay a shutdown; keep `down` running so the rest of the response
+    //   still reaches the client.
+    // - relay finished first (front closed, reset, or went away): `down` has
+    //   already shut the local write side; nothing more can travel either way,
+    //   so `up` is dropped instead of waiting on a local read that may never
+    //   come. Until 2026-10-22 this was `join!(up, down)`: once the front's chaff
+    //   window ended `up` blocked in `local_rd.read` with no timer, the gRPC
+    //   client saw a hang rather than EOF, and the task and TLS session leaked.
+    tokio::pin!(up);
+    tokio::pin!(down);
+    tokio::select! {
+        r1 = &mut up => {
+            let strategy = r1?;
+            down.await?;
+            Ok(strategy)
+        }
+        r2 = &mut down => {
+            r2?;
+            Ok(WriteStrategy::default())
+        }
+    }
 }
 
 /// Ferry variant for the host-terminated-TLS path (review §3.1 variant A).
@@ -598,6 +647,72 @@ mod probe_logic {
             probe_verdict(&mut codec, &mut buf),
             Some(Err(ObfuscatorError::Handshake(_)))
         ));
+    }
+
+    /// The front closes its side while the gRPC client is idle: the client gets
+    /// EOF and the ferry ends, well inside the chaff window (3 s). Mutation:
+    /// `join!(up, down)` — `up` keeps chaffing into the half-open relay and the
+    /// ferry is still running when this times out.
+    #[tokio::test]
+    async fn the_front_closing_ends_the_ferry_and_the_client_sees_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (local, _) = listener.accept().await.unwrap();
+
+        let (ours, mut front) = tokio::io::duplex(64 * 1024);
+        // The front: says goodbye (EOF on our read side) but keeps draining what
+        // we send, so our writes never fail — the case where nothing but the
+        // read side tells the ferry the tunnel is over.
+        tokio::spawn(async move {
+            front.shutdown().await.unwrap();
+            let mut sink = [0u8; 4096];
+            while front.read(&mut sink).await.unwrap_or(0) > 0 {}
+        });
+
+        let ferry = tokio::spawn(run_ferry(ours, local));
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("client did not see EOF")
+            .unwrap();
+        assert_eq!(n, 0);
+        tokio::time::timeout(Duration::from_secs(2), ferry)
+            .await
+            .expect("ferry still running after the front closed")
+            .unwrap()
+            .unwrap();
+    }
+
+    /// A front that accepts TCP and never answers the ClientHello: the dial gives
+    /// up. Mutation: drop the `timeout` around TLS + AUTH — the dial hangs and the
+    /// outer guard fires.
+    #[tokio::test]
+    async fn a_silent_front_times_out_the_dial() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_silent, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            dial_and_authenticate_within(
+                &addr.to_string(),
+                "",
+                &"ab".repeat(32),
+                "",
+                &VeilFrontAuthV3::default(),
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("dial hung past its own timeout");
+        assert!(matches!(result, Err(ObfuscatorError::Timeout)));
     }
 
     /// Mutation: drop the `ensure_valid_now` calls — the expired capability is

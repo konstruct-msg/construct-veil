@@ -61,10 +61,23 @@ pub struct CoordinatorStartResult {
 /// Handle to a running coordinator session.
 /// Used by `veil_stop()` to shut down the active proxy.
 struct ActiveSession {
+    /// Distinguishes this session from the next one: the proxy task clears the
+    /// slot on exit only if the slot still holds its own session.
+    id: u64,
     port: u16,
     #[allow(dead_code)]
     method: MethodId,
     shutdown_tx: oneshot::Sender<()>,
+    /// Cancels every tunnel this session's listener accepted.
+    tunnels: CancellationToken,
+}
+
+impl ActiveSession {
+    /// Stop accepting and tear down the session's live tunnels.
+    fn shut_down(self) {
+        let _ = self.shutdown_tx.send(());
+        self.tunnels.cancel();
+    }
 }
 
 /// The main VEIL coordinator.
@@ -76,6 +89,7 @@ pub struct VeilCoordinator {
     scores: Arc<PersistentScores>,
     obfuscators: HashMap<MethodId, Arc<dyn Obfuscator>>,
     active: Arc<Mutex<Option<ActiveSession>>>,
+    next_session_id: std::sync::atomic::AtomicU64,
 }
 
 impl VeilCoordinator {
@@ -86,6 +100,7 @@ impl VeilCoordinator {
             scores: Arc::new(scores),
             obfuscators: HashMap::new(),
             active: Arc::new(Mutex::new(None)),
+            next_session_id: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -373,7 +388,7 @@ impl VeilCoordinator {
                 info!(target: "ice::fsm", "stop_active");
                 let mut guard = self.active.lock().await;
                 if let Some(session) = guard.take() {
-                    let _ = session.shutdown_tx.send(());
+                    session.shut_down();
                 }
             }
 
@@ -719,13 +734,6 @@ impl VeilCoordinator {
                     .await;
             }
 
-            // Start proxy loop. shutdown_tx must be stored in ActiveSession —
-            // dropping it here would cancel run_proxy_loop's shutdown_rx.await
-            // immediately, exit the accept loop, drop the listener, and leave
-            // the iOS gRPC client with an unreachable 127.0.0.1:port (ECONNREFUSED).
-            let (shutdown_tx, shutdown_rx) = oneshot::channel();
-            let active = self.active.clone();
-            let proxy_method = winning_method;
             let proxy_params = ProxyParams {
                 method: winning_method,
                 relay_addr: relay.to_owned(),
@@ -735,21 +743,7 @@ impl VeilCoordinator {
                 veil_front_ticket_b64: veil_front_ticket_b64.to_owned(),
                 veil_front_auth_v3: veil_front_auth_v3.clone(),
             };
-
-            {
-                let mut guard = self.active.lock().await;
-                *guard = Some(ActiveSession {
-                    port,
-                    method: proxy_method,
-                    shutdown_tx,
-                });
-            }
-
-            tokio::spawn(async move {
-                run_proxy_loop(listener, proxy_params, shutdown_rx).await;
-                let mut guard = active.lock().await;
-                *guard = None;
-            });
+            self.install_session(listener, port, proxy_params).await;
 
             return Ok(());
         }
@@ -832,11 +826,6 @@ impl VeilCoordinator {
             }
         }
 
-        // Start the proxy loop. shutdown_tx must outlive this scope — see the
-        // parallel-probe path for the failure mode if it doesn't.
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let active = self.active.clone();
-        let proxy_method = method;
         let proxy_params = ProxyParams {
             method,
             relay_addr: relay.to_owned(),
@@ -846,23 +835,52 @@ impl VeilCoordinator {
             veil_front_ticket_b64: veil_front_ticket_b64.to_owned(),
             veil_front_auth_v3: veil_front_auth_v3.clone(),
         };
+        self.install_session(listener, port, proxy_params).await;
 
+        Ok(())
+    }
+
+    /// Make `listener` the active session's proxy and start serving it.
+    ///
+    /// A session still in the slot is shut down first, tunnels included. The
+    /// proxy task clears the slot when it ends only if the slot still holds this
+    /// session: until 2026-10-22 it cleared unconditionally, so an old session
+    /// that exited after a new one was installed wiped the new one — `is_alive`
+    /// said no, `port` said 0, and `stop` could not reach the live listener.
+    async fn install_session(&self, listener: TcpListener, port: u16, params: ProxyParams) {
+        use std::sync::atomic::Ordering;
+
+        // shutdown_tx must live in ActiveSession — dropping it would resolve the
+        // loop's shutdown_rx at once, drop the listener, and leave the gRPC client
+        // with an unreachable 127.0.0.1:port (ECONNREFUSED).
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let tunnels = CancellationToken::new();
+        let id = self.next_session_id.fetch_add(1, Ordering::Relaxed) + 1;
         {
             let mut guard = self.active.lock().await;
+            if let Some(old) = guard.take() {
+                old.shut_down();
+            }
             *guard = Some(ActiveSession {
+                id,
                 port,
-                method: proxy_method,
+                method: params.method,
                 shutdown_tx,
+                tunnels: tunnels.clone(),
             });
         }
 
+        let active = self.active.clone();
         tokio::spawn(async move {
-            run_proxy_loop(listener, proxy_params, shutdown_rx).await;
+            run_proxy_loop(listener, shutdown_rx, tunnels, move |local| {
+                handle_proxy_connection(local, params.clone())
+            })
+            .await;
             let mut guard = active.lock().await;
-            *guard = None;
+            if guard.as_ref().is_some_and(|s| s.id == id) {
+                *guard = None;
+            }
         });
-
-        Ok(())
     }
 
     /// Handle a failed probe: transition FSM, record score.
@@ -1008,10 +1026,11 @@ impl VeilCoordinator {
     }
 
     /// Stop the active session.
+    /// Stop the active session: its listener and every tunnel it accepted.
     pub async fn stop(&self) -> bool {
         let mut guard = self.active.lock().await;
         if let Some(session) = guard.take() {
-            let _ = session.shutdown_tx.send(());
+            session.shut_down();
             true
         } else {
             false
@@ -1065,27 +1084,48 @@ struct ProxyParams {
     veil_front_auth_v3: VeilFrontAuthV3,
 }
 
-/// Run the proxy loop: accept local connections and forward through the winning
-/// method's data plane.
-async fn run_proxy_loop(
+/// Run the proxy loop: accept local connections and hand each to `serve`.
+///
+/// Every connection runs under `tunnels`: cancelling it ends them all, and the
+/// loop cancels it itself when it stops accepting. Until 2026-10-22 `stop()`
+/// only ended this accept loop; tunnels already accepted kept flowing through
+/// the old relay (with its capability and chaff) until a peer closed them — after
+/// "switch front" or "turn VEIL off".
+async fn run_proxy_loop<F, Fut>(
     listener: TcpListener,
-    params: ProxyParams,
     mut shutdown_rx: oneshot::Receiver<()>,
-) {
+    tunnels: CancellationToken,
+    serve: F,
+) where
+    F: Fn(TcpStream) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
     loop {
         tokio::select! {
             _ = &mut shutdown_rx => break,
-            result = listener.accept() => {
-                match result {
-                    Ok((local, _)) => {
-                        let params = params.clone();
-                        tokio::spawn(handle_proxy_connection(local, params));
-                    }
-                    Err(_) => break,
+            result = listener.accept() => match result {
+                Ok((local, _)) => {
+                    let tunnel = serve(local);
+                    let cancelled = tunnels.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = cancelled.cancelled() => {}
+                            _ = tunnel => {}
+                        }
+                    });
                 }
-            }
+                Err(e) => match crate::accept::accept_retry_delay(&e) {
+                    Some(delay) => {
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                    None => break,
+                },
+            },
         }
     }
+    tunnels.cancel();
 }
 
 /// Handle a single proxy connection by dispatching to the winning method's
@@ -1319,6 +1359,71 @@ mod tests {
         assert_ne!(started.port, 0);
         assert_eq!(started.method, MethodId::VeilFront);
         assert!(coord.stop().await);
+    }
+
+    /// A second session replacing the first stays alive after the first one's
+    /// proxy task exits. Mutation: clear the slot unconditionally on exit.
+    #[tokio::test]
+    async fn a_replaced_session_does_not_wipe_its_successor() {
+        let mut coord = coordinator(VeilConfig::legacy()).await;
+        coord.register(Box::new(Fake {
+            method: MethodId::VeilFront,
+            ok: true,
+        }));
+        let first = start(&coord).await.unwrap();
+        let second = start(&coord).await.unwrap();
+        assert_ne!(first.port, second.port);
+        // Let the first session's proxy task observe its shutdown and exit.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(coord.is_alive().await, "the live session was wiped");
+        assert_eq!(coord.port().await, second.port);
+        assert!(coord.stop().await);
+    }
+
+    /// Stopping the session ends tunnels it already accepted, not only the
+    /// listener. Mutation: `shut_down` without `tunnels.cancel()` (or a loop that
+    /// spawns `serve` without the select) — the client never sees EOF.
+    #[tokio::test]
+    async fn stopping_ends_tunnels_already_accepted() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let tunnels = CancellationToken::new();
+        let session = ActiveSession {
+            id: 1,
+            port: addr.port(),
+            method: MethodId::VeilFront,
+            shutdown_tx,
+            tunnels: tunnels.clone(),
+        };
+        // A tunnel that would live forever: it holds the socket and waits.
+        let proxy = tokio::spawn(run_proxy_loop(
+            listener,
+            shutdown_rx,
+            tunnels,
+            |local| async move {
+                let _keep = local;
+                std::future::pending::<()>().await;
+            },
+        ));
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"x").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await; // accepted, tunnel running
+
+        session.shut_down();
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("tunnel outlived stop()")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "expected EOF once the session stopped");
+        tokio::time::timeout(Duration::from_secs(2), proxy)
+            .await
+            .expect("proxy loop did not end")
+            .unwrap();
     }
 
     /// Mutation: map `Tls(_)` back to `FingerprintBlocked`.
