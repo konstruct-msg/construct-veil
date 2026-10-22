@@ -65,6 +65,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs, clippy::all)]
 
+#[cfg(any(feature = "ffi", feature = "coordinator"))]
+pub(crate) mod accept;
 pub mod crypto;
 pub mod framing;
 pub mod handshake;
