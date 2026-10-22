@@ -387,7 +387,11 @@ impl Obfs4Stream<tokio_rustls::client::TlsStream<TcpStream>> {
     ///
     /// `relay_addr`      — TCP address of the relay (`"158.160.140.67:443"`)
     /// `tls_server_name` — SNI to send in ClientHello; empty = no SNI (IP-based name)
-    /// `spki_hex`        — hex SHA-256 of DER SPKI for pinning; empty = no pinning
+    /// `spki_hex`        — hex SHA-256 of DER SPKI for pinning. Empty = no pin:
+    ///                     the relay is then authenticated only by the obfs4 ntor
+    ///                     handshake inside the TLS session (the TLS layer still
+    ///                     verifies the handshake signature against whatever
+    ///                     certificate is shown). A malformed pin is an error.
     /// `config`          — obfs4 client configuration (bridge cert + node ID)
     pub async fn connect_tls(
         relay_addr: &str,
@@ -396,14 +400,13 @@ impl Obfs4Stream<tokio_rustls::client::TlsStream<TcpStream>> {
         config: ClientConfig,
     ) -> Result<Self> {
         let profile = config.tls_profile;
-        let (connector, server_name) = crate::tls_pinned::build_connector(
-            tls_server_name,
-            spki_hex,
-            relay_addr,
-            profile,
-            None,
-        )
-        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
+        let built = if spki_hex.is_empty() {
+            crate::tls_pinned::build_connector_unpinned(tls_server_name, relay_addr, profile, None)
+        } else {
+            crate::tls_pinned::build_connector(tls_server_name, spki_hex, relay_addr, profile, None)
+        };
+        let (connector, server_name) =
+            built.map_err(|e| crate::Error::Io(std::io::Error::other(e)))?;
 
         let tcp = TcpStream::connect(relay_addr).await?;
         let _ = tcp.set_nodelay(true);

@@ -115,17 +115,10 @@ async fn probe_obfs4_over_tls(
     )
     .map_err(|e| ObfuscatorError::Tls(e.to_string()))?;
 
-    let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
-        let err_str = e.to_string();
-        // Detect TLS alert 40 (handshake_failure) — DPI blocking
-        if err_str.contains("40") || err_str.contains("handshake") {
-            ObfuscatorError::FingerprintBlocked
-        } else if err_str.contains("cert") || err_str.contains("verify") {
-            ObfuscatorError::CertProblem(err_str)
-        } else {
-            ObfuscatorError::Tls(err_str)
-        }
-    })?;
+    let tls_stream = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| ObfuscatorError::from_tls_connect(&e))?;
 
     let _stream = crate::Obfs4Stream::client_handshake_stream(tls_stream, config)
         .await
