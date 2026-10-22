@@ -46,11 +46,41 @@ jobs:
       - name: Clippy (tonic-transport)
         run: cargo clippy --all-targets --features tonic-transport -- -D warnings
 
+      # The shipping feature sets: `coordinator`+`utls` is what iOS/Android link,
+      # `server`/`metrics` is the relay side, and the two sub-crates
+      # (construct-veil-protocol, construct-veil-relay) are what the deployed
+      # relay is built from. Until 2026-10-22 none of these were in CI.
+      - name: Clippy (workspace, all features)
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
       - name: Run tests (default)
         run: cargo test
 
       - name: Run tests (tonic-transport)
         run: cargo test --features tonic-transport
+
+      - name: Run tests (workspace, all features)
+        run: cargo test --workspace --all-features
+
+  # ── 1b. Dependency advisories ─────────────────────────────────────────────
+  # cargo-audit against Cargo.lock; ignores live in .cargo/audit.toml with the
+  # reason for each. A vulnerability fails the job, an "unmaintained"/"yanked"
+  # warning does not. Added 2026-10-22: rustls sat on 0.23.37 with five
+  # advisories (one a PQ key-exchange downgrade) and h2 on a DoS for weeks.
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: cargo audit
+        run: cargo audit
 
   # ── 2. macOS FFI build (matches iOS platform SDK) ────────────────────────
   build-macos:
