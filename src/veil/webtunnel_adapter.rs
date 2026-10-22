@@ -89,22 +89,10 @@ async fn probe_webtunnel(req: &ProbeRequest) -> Result<(), ObfuscatorError> {
     let (connector, server_name) =
         connector_result.map_err(|e| ObfuscatorError::Tls(e.to_string()))?;
 
-    let tls_stream = connector.connect(server_name, tcp).await.map_err(|e| {
-        let err_str = e.to_string();
-        // Detect TLS alert 40 (handshake_failure) — DPI blocking
-        if err_str.contains("alert") && err_str.contains("40")
-            || err_str.contains("handshake_failure")
-        {
-            ObfuscatorError::FingerprintBlocked
-        } else if err_str.contains("cert")
-            || err_str.contains("verify")
-            || err_str.contains("certificate")
-        {
-            ObfuscatorError::CertProblem(err_str)
-        } else {
-            ObfuscatorError::Tls(err_str)
-        }
-    })?;
+    let tls_stream = connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| ObfuscatorError::from_tls_connect(&e))?;
 
     // WebSocket upgrade
     let host = if req.host_header.is_empty() {

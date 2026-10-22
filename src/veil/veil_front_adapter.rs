@@ -444,21 +444,10 @@ async fn dial_utls_tcp(
     )
     .map_err(|e| ObfuscatorError::Tls(e.to_string()))?;
 
-    connector.connect(server_name, tcp).await.map_err(|e| {
-        let err_str = e.to_string();
-        if (err_str.contains("alert") && err_str.contains("40"))
-            || err_str.contains("handshake_failure")
-        {
-            ObfuscatorError::FingerprintBlocked
-        } else if err_str.contains("cert")
-            || err_str.contains("verify")
-            || err_str.contains("certificate")
-        {
-            ObfuscatorError::CertProblem(err_str)
-        } else {
-            ObfuscatorError::Tls(err_str)
-        }
-    })
+    connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| ObfuscatorError::from_tls_connect(&e))
 }
 
 /// Derive the TLS exporter keying material (32 bytes).
@@ -840,10 +829,9 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            // Empty SPKI → accept ams's real cert without pinning (test only).
-            let (connector, server_name) = crate::tls_pinned::build_connector(
+            // No pin: accept ams's real cert (test only — the pin is not known here).
+            let (connector, server_name) = crate::tls_pinned::build_connector_unpinned(
                 "ams.konstruct.cc",
-                "",
                 "ams.konstruct.cc:443",
                 crate::TlsProfile::Chrome131,
                 Some(vec![b"h2".to_vec()]),

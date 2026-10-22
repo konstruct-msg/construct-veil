@@ -365,6 +365,18 @@ pub extern "C" fn veil_proxy_start_tls(
         Ok(c) => c,
         Err(_) => return -1,
     };
+    // No SPKI pin — backward-compat. The relay is authenticated by the obfs4 ntor
+    // handshake inside the TLS session; the TLS layer still verifies the handshake
+    // signature against whatever certificate the server shows.
+    let (connector, server_name) = match crate::tls_pinned::build_connector_unpinned(
+        &tls_server_name,
+        &relay_addr,
+        config.tls_profile,
+        None,
+    ) {
+        Ok(v) => v,
+        Err(_) => return -1,
+    };
 
     let rt = get_runtime();
     let result: Result<u16, ()> = rt.block_on(async {
@@ -380,9 +392,8 @@ pub extern "C" fn veil_proxy_start_tls(
         rt.spawn(proxy_loop_tls(
             listener,
             relay_addr,
-            tls_server_name,
-            String::new(), // no SPKI pin — backward-compat (CA chain not checked either,
-            // but SNI is still sent so the server cert domain must match)
+            connector,
+            server_name,
             config,
             shutdown_rx,
         ));
@@ -412,10 +423,12 @@ pub extern "C" fn veil_proxy_start_tls(
 /// `relay_addr`   — relay IP:port (`"158.160.140.67:443"`).
 /// `tls_sni`      — SNI for ClientHello. Empty string → no SNI (IP-based ServerName).
 ///                  Set to `"storage.yandexcloud.net"` for REALITY-style fake SNI.
-/// `spki_hex`     — lowercase hex SHA-256 of DER SubjectPublicKeyInfo. Empty → no pinning.
+/// `spki_hex`     — hex SHA-256 of DER SubjectPublicKeyInfo (64 hex digits). Required:
+///                  NULL, empty or malformed → -1. There is no unpinned mode here;
+///                  `veil_proxy_start_tls` is the one entry point without a pin.
 /// `port_out`     — local TCP port the proxy listens on.
 ///
-/// Returns 0 on success, -1 on failure.
+/// Returns 0 on success, -1 on failure (including a pin the connector refuses).
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn veil_proxy_start_tls_pinned(
     bridge_line: *const c_char,
@@ -450,16 +463,32 @@ pub extern "C" fn veil_proxy_start_tls_pinned(
             .to_owned()
     };
     let spki_hex = unsafe {
-        spki_hex
+        match spki_hex
             .as_ref()
             .and_then(|p| CStr::from_ptr(p).to_str().ok())
-            .unwrap_or("")
-            .to_owned()
+        {
+            Some(s) => s.to_owned(),
+            None => return -1,
+        }
     };
 
     let config = match ClientConfig::from_bridge_line(&bridge_line) {
         Ok(c) => c,
         Err(_) => return -1,
+    };
+    // Built once, here, so a bad pin fails the start instead of every connection.
+    let (connector, server_name) = match crate::tls_pinned::build_connector(
+        &tls_sni,
+        &spki_hex,
+        &relay_addr,
+        config.tls_profile,
+        None,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("veil-tls: {e}");
+            return -1;
+        }
     };
 
     let rt = get_runtime();
@@ -476,8 +505,8 @@ pub extern "C" fn veil_proxy_start_tls_pinned(
         rt.spawn(proxy_loop_tls(
             listener,
             relay_addr,
-            tls_sni,
-            spki_hex,
+            connector,
+            server_name,
             config,
             shutdown_rx,
         ));
@@ -501,8 +530,8 @@ pub extern "C" fn veil_proxy_start_tls_pinned(
 async fn proxy_loop_tls(
     listener: TcpListener,
     relay_addr: String,
-    tls_server_name: String,
-    tls_spki_hex: String,
+    connector: tokio_rustls::TlsConnector,
+    server_name: rustls::pki_types::ServerName<'static>,
     config: ClientConfig,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
@@ -513,10 +542,10 @@ async fn proxy_loop_tls(
                 match result {
                     Ok((local, _)) => {
                         let addr = relay_addr.clone();
-                        let sni  = tls_server_name.clone();
-                        let spki = tls_spki_hex.clone();
                         let cfg  = config.clone();
-                        tokio::spawn(handle_connection_tls(local, addr, sni, spki, cfg));
+                        tokio::spawn(handle_connection_tls(
+                            local, addr, connector.clone(), server_name.clone(), cfg,
+                        ));
                     }
                     Err(_) => break,
                 }
@@ -525,32 +554,17 @@ async fn proxy_loop_tls(
     }
 }
 
+/// One local connection → TLS to the relay with the connector the start call
+/// built (SNI mode and pin decided there) → obfs4 → bidirectional proxy.
 #[cfg(feature = "tls")]
 async fn handle_connection_tls(
     mut local: TcpStream,
     relay_addr: String,
-    tls_server_name: String,
-    tls_spki_hex: String,
+    connector: tokio_rustls::TlsConnector,
+    server_name: rustls::pki_types::ServerName<'static>,
     config: ClientConfig,
 ) {
     use tokio::net::TcpStream as TokioTcp;
-
-    // Build rustls connector with SPKI pinning + SNI control.
-    // sni = ""   → IP-based ServerName, no SNI extension in ClientHello (Path 1).
-    // sni = name → sends as SNI; cert verified by SPKI pin, not CA chain (Path 2).
-    let (connector, server_name) = match crate::tls_pinned::build_connector(
-        &tls_server_name,
-        &tls_spki_hex,
-        &relay_addr,
-        config.tls_profile,
-        None,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("veil-tls: connector build failed: {e}");
-            return;
-        }
-    };
 
     // Attempt the obfs4-over-TLS connection up to 2 times before giving up.
     // The server may momentarily reject a handshake (e.g. during restart or
@@ -616,7 +630,7 @@ async fn handle_connection_tls(
 ///
 /// - `"chrome131"` or `"chrome"` — Chrome 131 ordering
 /// - `"firefox128"` or `"firefox"` — Firefox 128 ordering
-/// - `""` or `"rustls"` — rustls defaults (same as `veil_proxy_start_tls_pinned`)
+/// - `""` — the production default (`Chrome131`); `"rustls"` — rustls defaults, test-only
 ///
 /// # Safety
 /// All pointer parameters must be valid null-terminated C strings or null.
@@ -657,11 +671,13 @@ pub extern "C" fn veil_proxy_start_tls_profiled(
             .to_owned()
     };
     let spki_hex = unsafe {
-        spki_hex
+        match spki_hex
             .as_ref()
             .and_then(|p| CStr::from_ptr(p).to_str().ok())
-            .unwrap_or("")
-            .to_owned()
+        {
+            Some(s) => s.to_owned(),
+            None => return -1,
+        }
     };
     let profile_str = unsafe {
         tls_profile
@@ -675,7 +691,23 @@ pub extern "C" fn veil_proxy_start_tls_profiled(
         Ok(c) => c,
         Err(_) => return -1,
     };
-    config.tls_profile = crate::tls_fingerprint::TlsProfile::from_name(&profile_str);
+    config.tls_profile = match crate::tls_fingerprint::TlsProfile::from_name(&profile_str) {
+        Some(p) => p,
+        None => return -1, // a typo must not degrade to the test-only rustls fingerprint
+    };
+    let (connector, server_name) = match crate::tls_pinned::build_connector(
+        &tls_sni,
+        &spki_hex,
+        &relay_addr,
+        config.tls_profile,
+        None,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("veil-tls: {e}");
+            return -1;
+        }
+    };
 
     let rt = get_runtime();
     let result: Result<u16, ()> = rt.block_on(async {
@@ -691,8 +723,8 @@ pub extern "C" fn veil_proxy_start_tls_profiled(
         rt.spawn(proxy_loop_tls(
             listener,
             relay_addr,
-            tls_sni,
-            spki_hex,
+            connector,
+            server_name,
             config,
             shutdown_rx,
         ));
@@ -726,7 +758,9 @@ static PROXY_WEBTUNNEL: Mutex<Option<ProxyHandle>> = Mutex::new(None);
 /// `relay_addr`   — relay IP:port (`"158.160.140.67:443"`).
 /// `tls_sni`      — SNI for TLS ClientHello; set to CDN domain for fronting.
 ///                  Empty → IP-based ServerName (no SNI extension).
-/// `spki_hex`     — lowercase hex SHA-256 of DER SubjectPublicKeyInfo. Empty → no pinning.
+/// `spki_hex`     — hex SHA-256 of DER SubjectPublicKeyInfo (64 hex digits). Required:
+///                  NULL, empty or malformed → -1 (WebTunnel has no inner authentication,
+///                  so the pin is the only proof of the relay's identity).
 /// `host_header`  — HTTP `Host` header for WebSocket upgrade. Can differ from `tls_sni`.
 /// `bridge_cert`  — base64-encoded obfs4 bridge cert from relay manifest (used for token derivation).
 /// `wt_base_path` — WebSocket resource base path (e.g. `"/api/stream"`), without the token.
@@ -765,12 +799,32 @@ pub extern "C" fn veil_proxy_start_webtunnel(
         None => return -1,
     };
     let tls_sni = parse_opt(tls_sni);
-    let spki_hex = parse_opt(spki_hex);
+    let spki_hex = match parse_req(spki_hex) {
+        Some(s) => s,
+        None => return -1,
+    };
     let host = parse_opt(host_header);
     let bridge_cert = parse_opt(bridge_cert);
     let wt_base_path = {
         let p = parse_opt(wt_base_path);
         if p.is_empty() { "/".to_owned() } else { p }
+    };
+    let (connector, server_name) = match crate::tls_pinned::build_connector(
+        &tls_sni,
+        &spki_hex,
+        &relay_addr,
+        crate::tls_fingerprint::TlsProfile::Chrome131,
+        // RFC 6455 WebSocket upgrade requires HTTP/1.1.  Advertising h2 in ALPN
+        // while then sending an HTTP/1.1 Upgrade request is inconsistent and can
+        // be detected by DPI (e.g. ТСПУ).  Real Chrome uses http/1.1-only ALPN
+        // for wss:// connections.
+        Some(vec![b"http/1.1".to_vec()]),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("webtunnel: {e}");
+            return -1;
+        }
     };
 
     let rt = get_runtime();
@@ -787,8 +841,8 @@ pub extern "C" fn veil_proxy_start_webtunnel(
         rt.spawn(proxy_loop_webtunnel(
             listener,
             relay_addr,
-            tls_sni,
-            spki_hex,
+            connector,
+            server_name,
             host,
             bridge_cert,
             wt_base_path,
@@ -826,8 +880,8 @@ pub extern "C" fn veil_proxy_port_webtunnel() -> u16 {
 async fn proxy_loop_webtunnel(
     listener: TcpListener,
     relay_addr: String,
-    tls_sni: String,
-    tls_spki_hex: String,
+    connector: tokio_rustls::TlsConnector,
+    server_name: rustls::pki_types::ServerName<'static>,
     host_header: String,
     bridge_cert: String,
     wt_base_path: String,
@@ -839,11 +893,13 @@ async fn proxy_loop_webtunnel(
             result = listener.accept() => {
                 match result {
                     Ok((local, _)) => {
-                        let (addr, sni, spki, host, bc, bp) = (
-                            relay_addr.clone(), tls_sni.clone(), tls_spki_hex.clone(),
+                        let (addr, host, bc, bp) = (
+                            relay_addr.clone(),
                             host_header.clone(), bridge_cert.clone(), wt_base_path.clone(),
                         );
-                        tokio::spawn(handle_connection_webtunnel(local, addr, sni, spki, host, bc, bp));
+                        tokio::spawn(handle_connection_webtunnel(
+                            local, addr, connector.clone(), server_name.clone(), host, bc, bp,
+                        ));
                     }
                     Err(_) => break,
                 }
@@ -856,8 +912,8 @@ async fn proxy_loop_webtunnel(
 async fn handle_connection_webtunnel(
     mut local: TcpStream,
     relay_addr: String,
-    tls_sni: String,
-    tls_spki_hex: String,
+    connector: tokio_rustls::TlsConnector,
+    server_name: rustls::pki_types::ServerName<'static>,
     host_header: String,
     bridge_cert: String,
     wt_base_path: String,
@@ -886,24 +942,6 @@ async fn handle_connection_webtunnel(
             .collect::<String>()
     };
     let path = format!("{}/{}", wt_base_path.trim_end_matches('/'), auth_token);
-
-    let (connector, server_name) = match crate::tls_pinned::build_connector(
-        &tls_sni,
-        &tls_spki_hex,
-        &relay_addr,
-        crate::tls_fingerprint::TlsProfile::Chrome131,
-        // RFC 6455 WebSocket upgrade requires HTTP/1.1.  Advertising h2 in ALPN
-        // while then sending an HTTP/1.1 Upgrade request is inconsistent and can
-        // be detected by DPI (e.g. ТСПУ).  Real Chrome uses http/1.1-only ALPN
-        // for wss:// connections.
-        Some(vec![b"http/1.1".to_vec()]),
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("webtunnel: connector build failed: {e}");
-            return;
-        }
-    };
 
     for attempt in 0u8..2 {
         let tcp = match TokioTcp::connect(&relay_addr).await {
@@ -1322,13 +1360,26 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
             .unwrap_or("")
             .to_owned()
     };
+    // The pin is the relay's identity on every TLS method; a missing or malformed
+    // one is a configuration error the host must see, not a silent "accept any
+    // certificate" (which is what an empty pin meant until 2026-10-22).
     let spki_hex = unsafe {
         req.spki_hex
             .as_ref()
             .and_then(|p| CStr::from_ptr(p).to_str().ok())
-            .unwrap_or("")
-            .to_owned()
+            .map(|s| s.to_owned())
     };
+    let spki_hex = match spki_hex {
+        Some(s) => s,
+        None => {
+            crate::veil::diag::record("veil_start: spki_hex is NULL or not UTF-8");
+            return -1;
+        }
+    };
+    if let Err(e) = crate::tls_pinned::parse_spki_pin(&spki_hex) {
+        crate::veil::diag::record(format!("veil_start: {e}"));
+        return -1;
+    }
     let host_header = unsafe {
         req.host_header
             .as_ref()

@@ -170,12 +170,17 @@ impl TlsProfile {
     /// Parse a profile from a case-insensitive string.
     ///
     /// Accepts: `"chrome131"`, `"chrome"`, `"firefox128"`, `"firefox"`,
-    /// `"rustls"`, `""` (empty → `Rustls`).
-    pub fn from_name(s: &str) -> Self {
+    /// `"rustls"`, and `""` for the production default ([`TlsProfile::default`]).
+    /// Anything else is `None`: until 2026-10-22 an unknown name (a typo such as
+    /// `"chrome-131"`) silently selected `Rustls`, the one profile that is
+    /// documented as test-only and whose fingerprint is recognisably not a browser.
+    pub fn from_name(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "chrome131" | "chrome" => TlsProfile::Chrome131,
-            "firefox128" | "firefox" => TlsProfile::Firefox128,
-            _ => TlsProfile::Rustls,
+            "" => Some(TlsProfile::default()),
+            "chrome131" | "chrome" => Some(TlsProfile::Chrome131),
+            "firefox128" | "firefox" => Some(TlsProfile::Firefox128),
+            "rustls" => Some(TlsProfile::Rustls),
+            _ => None,
         }
     }
 }
@@ -286,14 +291,27 @@ mod tests {
         );
     }
 
+    /// Names map to profiles; the test-only `Rustls` profile needs its own name
+    /// and is never what a typo or an empty string gets.
     #[test]
-    fn from_str_round_trip() {
-        assert_eq!(TlsProfile::from_name("chrome131"), TlsProfile::Chrome131);
-        assert_eq!(TlsProfile::from_name("Chrome"), TlsProfile::Chrome131);
-        assert_eq!(TlsProfile::from_name("firefox128"), TlsProfile::Firefox128);
-        assert_eq!(TlsProfile::from_name("Firefox"), TlsProfile::Firefox128);
-        assert_eq!(TlsProfile::from_name(""), TlsProfile::Rustls);
-        assert_eq!(TlsProfile::from_name("unknown"), TlsProfile::Rustls);
+    fn from_name_never_falls_back_to_the_rustls_fingerprint() {
+        assert_eq!(
+            TlsProfile::from_name("chrome131"),
+            Some(TlsProfile::Chrome131)
+        );
+        assert_eq!(TlsProfile::from_name("Chrome"), Some(TlsProfile::Chrome131));
+        assert_eq!(
+            TlsProfile::from_name("firefox128"),
+            Some(TlsProfile::Firefox128)
+        );
+        assert_eq!(
+            TlsProfile::from_name("Firefox"),
+            Some(TlsProfile::Firefox128)
+        );
+        assert_eq!(TlsProfile::from_name("rustls"), Some(TlsProfile::Rustls));
+        assert_eq!(TlsProfile::from_name(""), Some(TlsProfile::Chrome131));
+        assert_eq!(TlsProfile::from_name("chrome-131"), None);
+        assert_eq!(TlsProfile::from_name("unknown"), None);
     }
 
     #[cfg(feature = "utls")]

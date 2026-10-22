@@ -84,6 +84,34 @@ pub enum ObfuscatorError {
     Unknown(String),
 }
 
+impl ObfuscatorError {
+    /// Classify a failed `TlsConnector::connect` by the rustls error inside the
+    /// `io::Error`, not by its message:
+    ///
+    /// - alert 40 (`handshake_failure`) from the peer → [`FingerprintBlocked`]:
+    ///   a DPI box or a front that will not negotiate with this ClientHello;
+    /// - any certificate verdict (SPKI pin mismatch, bad handshake signature,
+    ///   expired, …) → [`CertProblem`]: MitM, key rotation or a stale pin;
+    /// - everything else → [`Tls`] with the message.
+    ///
+    /// [`FingerprintBlocked`]: ObfuscatorError::FingerprintBlocked
+    /// [`CertProblem`]: ObfuscatorError::CertProblem
+    /// [`Tls`]: ObfuscatorError::Tls
+    pub fn from_tls_connect(e: &std::io::Error) -> Self {
+        use rustls::{AlertDescription, Error as TlsError};
+        match e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<TlsError>())
+        {
+            Some(TlsError::AlertReceived(AlertDescription::HandshakeFailure)) => {
+                ObfuscatorError::FingerprintBlocked
+            }
+            Some(TlsError::InvalidCertificate(_)) => ObfuscatorError::CertProblem(e.to_string()),
+            _ => ObfuscatorError::Tls(e.to_string()),
+        }
+    }
+}
+
 /// Convert a generic error into an ObfuscatorError.
 impl From<Box<dyn std::error::Error + Send + Sync>> for ObfuscatorError {
     fn from(e: Box<dyn std::error::Error + Send + Sync>) -> Self {
@@ -152,4 +180,60 @@ pub trait Obfuscator: Send + Sync {
         req: &ProbeRequest,
         cancel: CancellationToken,
     ) -> Result<ObfuscatorHandle, ObfuscatorError>;
+}
+
+#[cfg(test)]
+mod tls_classification {
+    use super::ObfuscatorError;
+    use rustls::{AlertDescription, CertificateError, Error as TlsError};
+    use std::io;
+
+    fn wrapped(e: TlsError) -> io::Error {
+        // What tokio-rustls hands back from `connect`.
+        io::Error::new(io::ErrorKind::InvalidData, e)
+    }
+
+    /// Alert 40 is the DPI signal; a certificate verdict is a pin/MitM signal;
+    /// the two must never be confused — a pin mismatch used to be classified by
+    /// substring and landed in `Tls`, which the coordinator scores as a block.
+    #[test]
+    fn classifies_by_type_not_by_message() {
+        assert!(matches!(
+            ObfuscatorError::from_tls_connect(&wrapped(TlsError::AlertReceived(
+                AlertDescription::HandshakeFailure
+            ))),
+            ObfuscatorError::FingerprintBlocked
+        ));
+        for cert_err in [
+            CertificateError::BadSignature,
+            CertificateError::Expired,
+            CertificateError::Other(rustls::OtherError(std::sync::Arc::new(
+                crate::tls_pinned::PinError::Mismatch,
+            ))),
+        ] {
+            assert!(
+                matches!(
+                    ObfuscatorError::from_tls_connect(&wrapped(TlsError::InvalidCertificate(
+                        cert_err.clone()
+                    ))),
+                    ObfuscatorError::CertProblem(_)
+                ),
+                "{cert_err:?}"
+            );
+        }
+        // Another alert, or a plain socket error: neither blocked nor a cert problem.
+        assert!(matches!(
+            ObfuscatorError::from_tls_connect(&wrapped(TlsError::AlertReceived(
+                AlertDescription::InternalError
+            ))),
+            ObfuscatorError::Tls(_)
+        ));
+        assert!(matches!(
+            ObfuscatorError::from_tls_connect(&io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "reset by peer, message mentions 40 and handshake"
+            )),
+            ObfuscatorError::Tls(_)
+        ));
+    }
 }
