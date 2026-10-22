@@ -12,7 +12,7 @@ COPY crates/construct-veil-relay/Cargo.toml    crates/construct-veil-relay/
 RUN mkdir -p crates/construct-veil-protocol/src crates/construct-veil-relay/src/bin \
     && echo "pub fn dummy() {}" > crates/construct-veil-protocol/src/lib.rs \
     && echo "fn main() {}" > crates/construct-veil-relay/src/main.rs \
-    && echo "fn main() {}" > crates/construct-veil-relay/src/bin/issue_ticket.rs \
+    && echo "fn main() {}" > crates/construct-veil-relay/src/bin/make_config_link.rs \
     && cargo build --release -p construct-veil-relay --bins --target-dir /tmp/deps 2>/dev/null || true \
     && rm -rf /tmp/deps
 
@@ -32,7 +32,6 @@ RUN apt-get update \
 RUN useradd -r -u 65532 -s /sbin/nologin veil
 
 COPY --from=build /src/target/release/construct-veil-relay /usr/local/bin/
-COPY --from=build /src/target/release/issue-ticket          /usr/local/bin/
 
 RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/construct-veil-relay
 

@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("invalid Ed25519 seed: {e}"))?;
     let pub_hex = hex_encode(key_pair.public_key().as_ref());
 
-    // ── Issue a fresh ticket (same as issue-ticket) ─────────────────────────
+    // ── Issue a fresh ticket ────────────────────────────────────────────────
     let mut rng = rand::thread_rng();
     let mut ticket_id = [0u8; TICKET_ID_LEN];
     rng.fill_bytes(&mut ticket_id);

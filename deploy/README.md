@@ -133,7 +133,6 @@ deploy/
 │   ├── bootstrap-prod.sh
 │   ├── bootstrap.sh            # local relay build variant
 │   ├── provision-link.sh       # local-only capability/config link issuer
-│   ├── issue-ticket.sh         # legacy raw-ticket helper, not production
 │   └── renew-cert.sh
 ```
 

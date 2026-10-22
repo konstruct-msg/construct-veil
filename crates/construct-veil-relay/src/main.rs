@@ -339,6 +339,7 @@ impl ConnStats {
         let handler_error = self.handler_error.swap(0, Ordering::Relaxed);
         let shed_global = self.shed_global.swap(0, Ordering::Relaxed);
         let shed_per_ip = self.shed_per_ip.swap(0, Ordering::Relaxed);
+        let auth_after_second_read = gate::take_tunnels_after_second_read();
 
         if completed
             | handshake_timeout
@@ -346,6 +347,7 @@ impl ConnStats {
             | handler_error
             | shed_global
             | shed_per_ip
+            | auth_after_second_read
             == 0
         {
             return;
@@ -359,6 +361,7 @@ impl ConnStats {
             handler_error,
             shed_global,
             shed_per_ip,
+            auth_after_second_read,
             "connection summary"
         );
     }
