@@ -111,6 +111,23 @@ impl WarnLimiter {
 
 static INVALID_AUTH_WARN: WarnLimiter = WarnLimiter::new();
 
+/// Tunnels that authenticated only thanks to the second read — the AUTH frame
+/// arrived split across reads (e.g. two TLS records from a native-TLS client
+/// whose pump sent part of the frame first).
+///
+/// The second read is what costs a known-format prober a measurable +100 ms
+/// (GATE_READ_TIMEOUT); it can only go once real clients never need it. This
+/// counter, reported in the relay's per-minute `connection summary`, is the
+/// evidence for that (vault todo 211, owner decision 2026-10-22: first make the
+/// native clients send AUTH as one record, then remove the second read).
+static TUNNELS_AFTER_SECOND_READ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read and reset [`TUNNELS_AFTER_SECOND_READ`].
+pub fn take_tunnels_after_second_read() -> u64 {
+    TUNNELS_AFTER_SECOND_READ.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Result of the gate decision.
 pub enum GateResult<S> {
     /// Valid auth — this connection is a tunnel.
@@ -252,6 +269,9 @@ pub async fn gate_stream<S: AsyncRead + Unpin>(
         Ok(Ok(_n2)) => {
             // Got more data, try decode again.
             if let Some(result) = try_decode_auth(&buf, &exporter, issuer_pubkey, relay_scope) {
+                if matches!(result, GateDecision::Tunnel { .. }) {
+                    TUNNELS_AFTER_SECOND_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 return Ok(result.consume(reader, buf));
             }
             // Still incomplete/invalid → Site.
@@ -654,5 +674,31 @@ mod tests {
             limiter.admit(1_000 + INVALID_AUTH_WARN_EVERY.as_secs()),
             Some(500)
         );
+    }
+
+    /// An AUTH frame split across two reads still authenticates, and is counted.
+    /// Mutation: drop the `fetch_add` — the counter stays put.
+    #[tokio::test]
+    async fn a_split_auth_frame_is_counted() {
+        use tokio::io::AsyncWriteExt;
+
+        let pubkey = construct_veil_protocol::issuer_public_key(&SEED);
+        let frame = auth_v2_buf("");
+        let (mut client, server) = tokio::io::duplex(4096);
+        let before = TUNNELS_AFTER_SECOND_READ.load(std::sync::atomic::Ordering::Relaxed);
+        let gate = tokio::spawn(async move {
+            gate_stream(server, EXPORTER, &pubkey, "", Duration::from_secs(5)).await
+        });
+        let (head, tail) = frame.split_at(frame.len() / 2);
+        client.write_all(head).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await; // first read sees only `head`
+        client.write_all(tail).await.unwrap();
+
+        match gate.await.unwrap().unwrap() {
+            GateResult::Tunnel { .. } => {}
+            GateResult::Site { .. } => panic!("a split AUTH frame was routed to the site"),
+        }
+        let after = TUNNELS_AFTER_SECOND_READ.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "the split frame was not counted");
     }
 }

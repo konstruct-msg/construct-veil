@@ -9,10 +9,6 @@ description = "Veil-front relay — honest-front HTTPS server with session-bound
 name = "construct-veil-relay"
 path = "src/main.rs"
 
-[[bin]]
-name = "issue-ticket"
-path = "src/bin/issue_ticket.rs"
-
 # Tester-provisioning tool: issue a ticket + emit a signed konstruct://veil-config
 # link and a terminal QR. Run locally/manually; not shipped in the relay image.
 [[bin]]
