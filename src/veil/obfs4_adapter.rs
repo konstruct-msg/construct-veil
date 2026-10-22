@@ -128,22 +128,57 @@ async fn probe_obfs4_over_tls(
 }
 
 /// Classify an obfs4 handshake error.
+///
+/// By type, never by message: until 2026-10-22 an I/O error was matched on the
+/// lowercase text "connection refused" (std spells it "Connection refused", so
+/// that branch never fired) and an ntor AUTH mismatch — a wrong bridge bundle or
+/// a MitM, nothing a DPI box does — counted as `FingerprintBlocked`, which the
+/// scorer turns into a week-long block after five of them.
 fn classify_obfs4_error(e: &crate::Error) -> ObfuscatorError {
+    use std::io::ErrorKind;
     match e {
         crate::Error::HandshakeTimeout => ObfuscatorError::Timeout,
-        crate::Error::HandshakeRejected => ObfuscatorError::Handshake(e.to_string()),
-        crate::Error::NtorAuthMismatch => ObfuscatorError::FingerprintBlocked,
-        crate::Error::InvalidServerPublicKey(_) => ObfuscatorError::Handshake(e.to_string()),
-        crate::Error::Io(io_err) => {
-            let err_str = io_err.to_string();
-            if err_str.contains("connection refused") {
-                ObfuscatorError::ConnectionRefused
-            } else if err_str.contains("timeout") {
-                ObfuscatorError::Timeout
-            } else {
-                ObfuscatorError::Io(io_err.kind().into())
-            }
-        }
+        crate::Error::HandshakeRejected
+        | crate::Error::NtorAuthMismatch
+        | crate::Error::InvalidServerPublicKey(_) => ObfuscatorError::Handshake(e.to_string()),
+        crate::Error::Io(io_err) => match io_err.kind() {
+            ErrorKind::ConnectionRefused => ObfuscatorError::ConnectionRefused,
+            ErrorKind::TimedOut => ObfuscatorError::Timeout,
+            kind => ObfuscatorError::Io(kind.into()),
+        },
         _ => ObfuscatorError::Handshake(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod classification {
+    use super::*;
+    use std::io::{Error as IoError, ErrorKind};
+
+    /// Mutation: restore `NtorAuthMismatch => FingerprintBlocked`, or match the
+    /// refused error on its lowercase text — each reddens one assertion.
+    #[test]
+    fn obfs4_errors_classify_by_type() {
+        assert!(matches!(
+            classify_obfs4_error(&crate::Error::NtorAuthMismatch),
+            ObfuscatorError::Handshake(_)
+        ));
+        assert!(matches!(
+            classify_obfs4_error(&crate::Error::Io(IoError::from(
+                ErrorKind::ConnectionRefused
+            ))),
+            ObfuscatorError::ConnectionRefused
+        ));
+        assert!(matches!(
+            classify_obfs4_error(&crate::Error::Io(IoError::from(ErrorKind::TimedOut))),
+            ObfuscatorError::Timeout
+        ));
+        assert!(matches!(
+            classify_obfs4_error(&crate::Error::Io(IoError::new(
+                ErrorKind::ConnectionReset,
+                "connection refused handshake 40"
+            ))),
+            ObfuscatorError::Io(_)
+        ));
     }
 }
