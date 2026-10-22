@@ -28,7 +28,7 @@ use construct_veil_protocol::{
     AuthRecordV2, AuthRecordV3, EXPORTER_LABEL, ROLE_RELAY, ROLE_USER, VeilFrontCodec,
 };
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_rustls::server::TlsStream;
 use tokio_util::codec::Decoder;
 use tracing::{debug, warn};
@@ -97,7 +97,10 @@ pub async fn gate_with_exporter(
     issuer_pubkey: &[u8; 32],
     relay_scope: &str,
 ) -> Result<GateResult<TlsStream<tokio::net::TcpStream>>, std::io::Error> {
-    // Extract TLS exporter BEFORE splitting the stream.
+    // Extract the TLS exporter from the rustls connection BEFORE handing the
+    // stream to the transport-agnostic gate. This `get_ref().1` access is the
+    // ONLY thing that coupled the gate to rustls; `gate_stream` below takes the
+    // exporter as a plain value so a non-rustls terminator can reuse everything.
     let exporter = {
         let (_, conn) = tls_stream.get_ref();
         let mut exp = [0u8; 32];
@@ -112,7 +115,36 @@ pub async fn gate_with_exporter(
         exp
     };
 
-    let mut reader = tls_stream;
+    gate_stream(tls_stream, exporter, issuer_pubkey, relay_scope).await
+}
+
+/// Transport-agnostic gate — the load-bearing core, over any byte duplex.
+///
+/// Runs the constant-shape read/decode/route of [`gate_with_exporter`] over
+/// ANY `S: AsyncRead + Unpin`, given the TLS exporter for that session as a
+/// value. Callers:
+///
+/// - [`gate_with_exporter`] — rustls `TlsStream`; exporter read from the rustls
+///   connection (Pattern A, relay terminates TLS on :443).
+/// - the external-terminator path (path A / ECH) — a *decrypted* duplex handed
+///   up by an out-of-process TLS/ECH terminator, with the exporter the
+///   terminator computed via `SSL_export_keying_material` using the same
+///   `EXPORTER_LABEL` / length. The exporter is symmetric between the TLS
+///   endpoints by RFC 5705/8446, so the exporter-bound authcode (`AuthRecordV2`
+///   / `AuthRecordV3`) verifies identically regardless of which stack
+///   terminated TLS — that is what makes an external ECH terminator possible
+///   without the relay speaking TLS at all.
+///
+/// Passing the exporter in (instead of reading it off the stream) is the whole
+/// of the refactor: the read strategy, decode, scope/issuer/exporter validation
+/// and Tunnel/Site decision are byte-identical to before.
+pub async fn gate_stream<S: AsyncRead + Unpin>(
+    stream: S,
+    exporter: [u8; 32],
+    issuer_pubkey: &[u8; 32],
+    relay_scope: &str,
+) -> Result<GateResult<S>, std::io::Error> {
+    let mut reader = stream;
     let mut buf = BytesMut::with_capacity(4096);
 
     // ── First read (like a web server reading an HTTP request) ───────────
@@ -472,5 +504,42 @@ mod tests {
         // (would give probes a timing oracle).
         assert!(GATE_READ_TIMEOUT >= Duration::from_millis(50));
         assert!(GATE_READ_TIMEOUT <= Duration::from_millis(200));
+    }
+
+    /// The transport-agnostic gate must route a valid AUTH frame to Tunnel over
+    /// a plain in-memory duplex — i.e. with NO rustls in the path, exporter
+    /// supplied as a value. This is the path-A / external-ECH-terminator seam:
+    /// a decrypted stream + externally-computed exporter reuse the whole gate.
+    #[tokio::test]
+    async fn gate_stream_routes_valid_auth_over_plain_duplex() {
+        let pubkey = issuer_public_key(&SEED);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let buf = auth_v2_buf("");
+        tokio::io::AsyncWriteExt::write_all(&mut client, &buf)
+            .await
+            .unwrap();
+        let result = gate_stream(server, EXPORTER, &pubkey, "").await.unwrap();
+        assert!(matches!(result, GateResult::Tunnel { .. }));
+    }
+
+    /// Same seam, failure direction: a well-formed AUTH frame whose authcode was
+    /// bound to a DIFFERENT exporter must fall to Site, and the bytes read must
+    /// be carried through as `first_bytes` (the cover site needs them).
+    #[tokio::test]
+    async fn gate_stream_routes_wrong_exporter_to_site() {
+        let pubkey = issuer_public_key(&SEED);
+        let (mut client, server) = tokio::io::duplex(4096);
+        let buf = auth_v2_buf("");
+        tokio::io::AsyncWriteExt::write_all(&mut client, &buf)
+            .await
+            .unwrap();
+        drop(client); // EOF so the second (timeout) read returns 0 promptly
+        let mut wrong = EXPORTER;
+        wrong[0] ^= 0x01;
+        let result = gate_stream(server, wrong, &pubkey, "").await.unwrap();
+        match result {
+            GateResult::Site { first_bytes, .. } => assert!(!first_bytes.is_empty()),
+            GateResult::Tunnel { .. } => panic!("wrong exporter must not tunnel"),
+        }
     }
 }

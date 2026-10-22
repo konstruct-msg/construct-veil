@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use ed25519_dalek::SigningKey;
-use gate::{GateResult, gate_with_exporter};
+use gate::{GateResult, gate_stream, gate_with_exporter};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
@@ -595,10 +595,40 @@ async fn handle_connection(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The TLS handshake is done by the caller, under a timeout and a handshake
     // permit — neither of which should cover the connection's whole lifetime.
-
-    // Run the constant-shape gate (offline capability validation).
+    //
+    // Own-TLS path (Pattern A, relay on :443): the gate reads the exporter off
+    // the rustls connection, then the Tunnel/Site decision is handed to the
+    // shared `dispatch_gate_result` (same dispatch as the external path).
     match gate_with_exporter(tls_stream, issuer_pubkey, relay_scope).await {
-        Ok(GateResult::Tunnel { stream, leftover }) => {
+        Ok(result) => {
+            dispatch_gate_result(result, peer, backend, backend_dialer, site, chain_config).await?;
+        }
+        Err(e) => {
+            debug!(peer = %peer, error = %e, "gate error, treating as site traffic");
+        }
+    }
+
+    Ok(())
+}
+
+/// Dispatch a gate decision to Tunnel (local backend / chain upstream) or Site,
+/// over any client stream `S`. Shared by the own-TLS [`handle_connection`] and
+/// the external-terminator [`handle_external_stream`]: the forwarding layer
+/// (`forward_tunnel` / `forward_chain` / `forward_to_site`) was already generic,
+/// so lifting the concrete `TlsStream` type here is all that was needed.
+async fn dispatch_gate_result<S>(
+    result: GateResult<S>,
+    peer: SocketAddr,
+    backend: &str,
+    backend_dialer: BackendDialer,
+    site: &str,
+    chain_config: Option<Arc<ChainConfig>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    match result {
+        GateResult::Tunnel { stream, leftover } => {
             if let Some(cfg) = chain_config {
                 // Chain relay mode — ferry through the upstream relay instead
                 // of a local backend (decisions/veil-relay-topology.md §3).
@@ -624,10 +654,10 @@ async fn handle_connection(
                 }
             }
         }
-        Ok(GateResult::Site {
+        GateResult::Site {
             stream,
             first_bytes,
-        }) => {
+        } => {
             // Invalid auth — serve the cover site.
             if first_bytes.is_empty() {
                 return Ok(());
@@ -643,8 +673,40 @@ async fn handle_connection(
                 }
             }
         }
+    }
+
+    Ok(())
+}
+
+/// External-terminator entry (path A / ECH): an out-of-process TLS/ECH
+/// terminator hands up an already-*decrypted* client duplex plus the 32-byte
+/// TLS exporter it computed for that session. We run the same gate + dispatch
+/// as the own-TLS path — the relay speaks no TLS here.
+///
+/// Not yet wired to a listener (the listener + the terminator's wire framing
+/// land in the next increment); kept so the seam is explicit and type-checked.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_external_stream<S>(
+    stream: S,
+    exporter: [u8; 32],
+    peer: SocketAddr,
+    issuer_pubkey: &[u8; 32],
+    relay_scope: &str,
+    backend: &str,
+    backend_dialer: BackendDialer,
+    site: &str,
+    chain_config: Option<Arc<ChainConfig>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    match gate_stream(stream, exporter, issuer_pubkey, relay_scope).await {
+        Ok(result) => {
+            dispatch_gate_result(result, peer, backend, backend_dialer, site, chain_config).await?;
+        }
         Err(e) => {
-            debug!(peer = %peer, error = %e, "gate error, treating as site traffic");
+            debug!(peer = %peer, error = %e, "gate error (external stream), routing as site");
         }
     }
 
