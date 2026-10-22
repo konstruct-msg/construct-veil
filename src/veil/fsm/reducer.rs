@@ -34,6 +34,21 @@ pub fn reduce(
             let candidates =
                 select_probe_candidates(fingerprint, allowed_methods, scores, cfg, now_sys);
 
+            // Nothing to probe (the host allowed no method, or none is registered):
+            // there is no probe race to run, so this is "all probes failed" right
+            // away. Until 2026-10-22 this produced `StartProbes { methods: [] }`,
+            // which the coordinator's parallel path turned into `mpsc::channel(0)`
+            // — a panic, and through the FFI an abort of the host app.
+            if candidates.is_empty() {
+                let until = now + cfg.cooldown_duration;
+                return (
+                    VeilState::Cooldown { until },
+                    vec![VeilEffect::ScheduleCooldown {
+                        duration: cfg.cooldown_duration,
+                    }],
+                );
+            }
+
             let attempts: HashMap<MethodId, ProbeAttempt> = candidates
                 .iter()
                 .map(|m| (*m, ProbeAttempt { started_at: now }))
@@ -117,12 +132,22 @@ pub fn reduce(
                 .collect();
 
             if new_candidates.is_empty() {
-                // All probes failed.
+                // All probes failed. The last failure is scored like every other
+                // one — until 2026-10-22 it was not, so with a single candidate
+                // (the shipping veil-front-only build) no failure was ever recorded
+                // and penalties, blocks and consecutive_failures never accumulated.
                 let until = now + cfg.cooldown_duration;
                 let new_state = VeilState::Cooldown { until };
-                let effects = vec![VeilEffect::ScheduleCooldown {
-                    duration: cfg.cooldown_duration,
-                }];
+                let effects = vec![
+                    VeilEffect::RecordScore {
+                        method,
+                        fingerprint: NetworkFingerprint::default(),
+                        outcome: ScoreOutcome::Failure { reason },
+                    },
+                    VeilEffect::ScheduleCooldown {
+                        duration: cfg.cooldown_duration,
+                    },
+                ];
                 return (new_state, effects);
             }
 
@@ -322,6 +347,89 @@ mod tests {
     }
 
     // ── Idle transitions ──────────────────────────────────────────────────
+
+    /// No allowed method → straight to Cooldown, never `StartProbes { [] }`.
+    /// Mutation: drop the `candidates.is_empty()` guard — this gets Probing with
+    /// an empty StartProbes effect.
+    #[test]
+    fn start_with_no_allowed_method_goes_to_cooldown_without_probes() {
+        let (new_state, effects) = reduce(
+            VeilState::Idle,
+            VeilEvent::Start {
+                relay: "relay:443".into(),
+                bundle: String::new(),
+                fingerprint: NetworkFingerprint::default(),
+                allowed_methods: MethodSet::none(),
+            },
+            &NoScores,
+            &VeilConfig::default(),
+            now(),
+            now_sys(),
+        );
+        assert!(
+            matches!(new_state, VeilState::Cooldown { .. }),
+            "{new_state:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, VeilEffect::StartProbes { .. })),
+            "{effects:?}"
+        );
+    }
+
+    /// The last candidate's failure is scored. Mutation: emit only
+    /// `ScheduleCooldown` in the all-failed branch (the code until 2026-10-22).
+    #[test]
+    fn last_candidate_failure_is_recorded() {
+        let cfg = VeilConfig::legacy(); // top_k = 1: one candidate, as shipped
+        let (state, effects) = reduce(
+            VeilState::Idle,
+            VeilEvent::Start {
+                relay: "relay:443".into(),
+                bundle: String::new(),
+                fingerprint: NetworkFingerprint::default(),
+                allowed_methods: MethodSet::all(),
+            },
+            &NoScores,
+            &cfg,
+            now(),
+            now_sys(),
+        );
+        let method = match &effects[0] {
+            VeilEffect::StartProbes { methods, .. } => {
+                assert_eq!(methods.len(), 1);
+                methods[0]
+            }
+            other => panic!("expected StartProbes, got {other:?}"),
+        };
+
+        let (state, effects) = reduce(
+            state,
+            VeilEvent::ProbeFailed {
+                method,
+                reason: ProbeFailureReason::ConnectionFailed,
+            },
+            &NoScores,
+            &cfg,
+            now(),
+            now_sys(),
+        );
+        assert!(matches!(state, VeilState::Cooldown { .. }), "{state:?}");
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                VeilEffect::RecordScore {
+                    method: m,
+                    outcome: ScoreOutcome::Failure {
+                        reason: ProbeFailureReason::ConnectionFailed
+                    },
+                    ..
+                } if *m == method
+            )),
+            "{effects:?}"
+        );
+    }
 
     #[test]
     fn idle_start_goes_to_probing() {

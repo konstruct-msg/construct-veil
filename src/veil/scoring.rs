@@ -50,35 +50,73 @@ impl PersistentScores {
         max_fingerprints: usize,
     ) -> Result<Self, ScoringError> {
         let path_ref = path.as_ref();
+        if path_ref.as_os_str() == ":memory:" {
+            // `:memory:` is a special token: keep the URL form for that case.
+            let pool = SqlitePool::connect("sqlite::memory:").await.map_err(|e| {
+                ScoringError::DbError(format!("failed to connect to :memory:: {e}"))
+            })?;
+            Self::migrate(&pool).await?;
+            return Ok(Self {
+                pool,
+                max_fingerprints,
+            });
+        }
+
+        match Self::open_file(path_ref).await {
+            Ok(pool) => Ok(Self {
+                pool,
+                max_fingerprints,
+            }),
+            Err(first) => {
+                // The file exists but is not a usable database (truncated write,
+                // a different file at that path, a schema we cannot migrate):
+                // scores are a cache, so recreate it rather than fail every start.
+                // The doc promised this since the store was written; the code
+                // did not do it until 2026-10-22.
+                tracing::warn!(
+                    target: "ice::scoring",
+                    "scores db unusable, recreating: {first}"
+                );
+                for suffix in ["", "-wal", "-shm", "-journal"] {
+                    let mut name = path_ref.as_os_str().to_owned();
+                    name.push(suffix);
+                    let _ = std::fs::remove_file(name);
+                }
+                let pool = Self::open_file(path_ref).await?;
+                Ok(Self {
+                    pool,
+                    max_fingerprints,
+                })
+            }
+        }
+    }
+
+    /// Connect to the file at `path` (creating it if absent) and migrate.
+    async fn open_file(path: &Path) -> Result<SqlitePool, ScoringError> {
         // `SqlitePool::connect("sqlite:PATH")` opens the file read-write but does
         // NOT create it if absent — sqlx returns SQLITE_CANTOPEN(14). On iOS the
         // first launch always misses, so we must opt in to creation explicitly.
-        // `:memory:` is a special token: keep the URL form for that case.
-        let pool = if path_ref.as_os_str() == ":memory:" {
-            SqlitePool::connect("sqlite::memory:")
-                .await
-                .map_err(|e| ScoringError::DbError(format!("failed to connect to :memory:: {e}")))?
-        } else {
-            let opts = SqliteConnectOptions::new()
-                .filename(path_ref)
-                .create_if_missing(true);
-            SqlitePoolOptions::new()
-                .connect_with(opts)
-                .await
-                .map_err(|e| {
-                    ScoringError::DbError(format!(
-                        "failed to connect to {}: {e}",
-                        path_ref.display(),
-                    ))
-                })?
-        };
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .connect_with(opts)
+            .await
+            .map_err(|e| {
+                ScoringError::DbError(format!("failed to connect to {}: {e}", path.display()))
+            })?;
+        if let Err(e) = Self::migrate(&pool).await {
+            pool.close().await;
+            return Err(e);
+        }
+        Ok(pool)
+    }
 
-        Self::migrate(&pool).await?;
-
-        Ok(Self {
-            pool,
-            max_fingerprints,
-        })
+    /// Close the pool: every later query fails. Models a store that has become
+    /// unusable mid-session (locked, disk full, file gone) in tests.
+    #[cfg(test)]
+    pub(crate) async fn close(&self) {
+        self.pool.close().await;
     }
 
     /// Open with default max_fingerprints (50).
@@ -264,7 +302,7 @@ impl PersistentScores {
                     last_failure_at: last_failure_at.map(epoch_to_system),
                     median_latency_ms: median_latency_ms as u32,
                     blocked_at: blocked_at.map(epoch_to_system),
-                    consecutive_failures: consecutive_failures as u8,
+                    consecutive_failures: consecutive_failures.clamp(0, u8::MAX as i64) as u8,
                 }))
             }
             None => Ok(None),
@@ -318,7 +356,9 @@ impl PersistentScores {
 
                 if let Some(ba) = blocked_at {
                     let blocked_time = epoch_to_system(ba);
-                    let consecutive = consecutive_failures as u8;
+                    // Saturate: the column is unbounded, and `as u8` wrapped 256
+                    // failures back to 0, i.e. "not blocked".
+                    let consecutive = consecutive_failures.clamp(0, u8::MAX as i64) as u8;
                     let expired = now
                         .duration_since(blocked_time)
                         .map(|d| d > block_ttl)
@@ -405,7 +445,7 @@ impl PersistentScores {
                 last_failure_at: row.get::<Option<i64>, _>(4).map(epoch_to_system),
                 median_latency_ms: row.get::<i64, _>(5) as u32,
                 blocked_at: row.get::<Option<i64>, _>(6).map(epoch_to_system),
-                consecutive_failures: row.get::<i64, _>(7) as u8,
+                consecutive_failures: row.get::<i64, _>(7).clamp(0, u8::MAX as i64) as u8,
             };
             result.push((method, entry));
         }
@@ -439,6 +479,15 @@ impl CachedScoreLookup {
             fingerprint: fingerprint.clone(),
             entries,
         })
+    }
+
+    /// A lookup with no history — what the coordinator falls back to when the
+    /// store cannot be read, so telemetry never gates connectivity.
+    pub fn empty(fingerprint: &NetworkFingerprint) -> Self {
+        Self {
+            fingerprint: fingerprint.clone(),
+            entries: std::collections::HashMap::new(),
+        }
     }
 
     /// Pre-compute blocked status for all methods.
@@ -489,4 +538,100 @@ fn epoch_to_system(secs: i64) -> SystemTime {
 pub enum ScoringError {
     #[error("database error: {0}")]
     DbError(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::veil::fsm::ProbeFailureReason;
+
+    fn fp() -> NetworkFingerprint {
+        NetworkFingerprint::new(vec![7; 32])
+    }
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "construct-veil-scores-{}-{name}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// A file at the scores path that is not a database is replaced, not fatal.
+    /// Mutation: make `open` return the first error — this fails.
+    #[tokio::test]
+    async fn a_corrupt_scores_file_is_recreated() {
+        let path = temp_path("corrupt");
+        std::fs::write(&path, b"this is not a sqlite database, not even close\n").unwrap();
+
+        let scores = PersistentScores::open(&path, 50)
+            .await
+            .expect("corrupt file should be recreated");
+        scores
+            .record(
+                &fp(),
+                MethodId::VeilFront,
+                ScoreOutcome::Failure {
+                    reason: ProbeFailureReason::ConnectionFailed,
+                },
+            )
+            .await
+            .unwrap();
+        let entry = scores.get_score(&fp(), MethodId::VeilFront).await.unwrap();
+        assert_eq!(entry.map(|e| e.failures), Some(1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 256 consecutive failures used to wrap `as u8` to 0 — "not blocked".
+    /// Mutation: restore the plain `as u8` casts.
+    #[tokio::test]
+    async fn consecutive_failures_saturate_instead_of_wrapping() {
+        let scores = PersistentScores::open(":memory:", 50).await.unwrap();
+        let now = SystemTime::now();
+        let now_secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        sqlx::query(
+            "INSERT INTO scores (fingerprint, method, failures, blocked_at, consecutive_failures)
+             VALUES (?, ?, 256, ?, 256)",
+        )
+        .bind(fp().as_bytes())
+        .bind(MethodId::VeilFront as i64)
+        .bind(now_secs)
+        .execute(&scores.pool)
+        .await
+        .unwrap();
+
+        assert!(
+            scores
+                .is_permanently_blocked_async(
+                    &fp(),
+                    MethodId::VeilFront,
+                    Duration::from_secs(3600),
+                    now
+                )
+                .await
+                .unwrap()
+        );
+        let entry = scores
+            .get_score(&fp(), MethodId::VeilFront)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.consecutive_failures, u8::MAX);
+        let cache = CachedScoreLookup::build(&scores, &fp()).await.unwrap();
+        assert!(cache.blocked_for(MethodId::VeilFront, Duration::from_secs(3600), now));
+    }
+
+    /// Fixture check for the coordinator tests: a closed store fails every query.
+    #[tokio::test]
+    async fn a_closed_store_fails_queries() {
+        let scores = PersistentScores::open(":memory:", 50).await.unwrap();
+        scores.close().await;
+        assert!(scores.get_score(&fp(), MethodId::VeilFront).await.is_err());
+        assert!(CachedScoreLookup::build(&scores, &fp()).await.is_err());
+    }
 }

@@ -145,6 +145,7 @@ where
             // The relay never learns a reusable secret (only a public key and a
             // signature bound to this TLS session).
             let capability = parse_capability_v2(&auth_v3.capability_v2_b64)?;
+            ensure_valid_now(capability.is_valid_at(unix_now()))?;
             let veil_sk = parse_veil_sk(&auth_v3.veil_sk_hex)?;
             let auth = AuthRecordV3::from_capability(&capability, &veil_sk, exporter);
             Frame::auth_v3(auth.encode_payload())
@@ -153,6 +154,7 @@ where
             // || ticket_id || not_after). The relay verifies the issuer signature
             // offline (no ticket store) then the exporter-bound authcode.
             let capability = parse_capability(capability_b64)?;
+            ensure_valid_now(capability.is_valid_at(unix_now()))?;
             let auth = AuthRecordV2::from_capability(&capability, exporter);
             Frame::auth_v2(auth.encode_payload())
         };
@@ -227,28 +229,45 @@ async fn probe_veil_front(req: &ProbeRequest) -> Result<(), ObfuscatorError> {
         }
         total_read += n;
 
-        match codec.decode(&mut rx_buf) {
+        if let Some(verdict) = probe_verdict(&mut codec, &mut rx_buf) {
+            return verdict;
+        }
+        if total_read > 65536 {
+            return Err(ObfuscatorError::Handshake(
+                "received >64KB without a DATA frame (likely routed to site)".into(),
+            ));
+        }
+    }
+}
+
+/// Decode every complete frame already in `rx_buf` and decide the probe:
+/// `Some(Ok)` on the first DATA frame, `Some(Err)` on anything that is not our
+/// tunnel, `None` when only CHAFF (or nothing complete) is buffered — read more.
+///
+/// It drains the buffer before returning `None`: CHAFF and the backend's DATA
+/// often arrive in one TLS record, and until 2026-10-22 the probe decoded one
+/// frame per read, skipped the CHAFF, then waited on the socket for bytes that
+/// were already buffered — a spurious 7 s `Timeout`.
+fn probe_verdict(
+    codec: &mut VeilFrontCodec,
+    rx_buf: &mut BytesMut,
+) -> Option<Result<(), ObfuscatorError>> {
+    loop {
+        match codec.decode(rx_buf) {
             Ok(Some(frame)) => match frame.frame_type {
-                FRAME_TYPE_DATA => return Ok(()),
-                FRAME_TYPE_CHAFF => continue, // relay-side cover, keep reading
+                FRAME_TYPE_DATA => return Some(Ok(())),
+                FRAME_TYPE_CHAFF => continue, // relay-side cover
                 other => {
-                    return Err(ObfuscatorError::Handshake(format!(
+                    return Some(Err(ObfuscatorError::Handshake(format!(
                         "unexpected frame type after auth: 0x{other:02x} (routed to site?)"
-                    )));
+                    ))));
                 }
             },
-            Ok(None) => {
-                if total_read > 65536 {
-                    return Err(ObfuscatorError::Handshake(
-                        "received >64KB without a DATA frame (likely routed to site)".into(),
-                    ));
-                }
-                continue;
-            }
+            Ok(None) => return None,
             Err(e) => {
-                return Err(ObfuscatorError::Handshake(format!(
+                return Some(Err(ObfuscatorError::Handshake(format!(
                     "frame decode error (routed to site): {e}"
-                )));
+                ))));
             }
         }
     }
@@ -464,6 +483,28 @@ fn derive_exporter(
     Ok(exporter)
 }
 
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// An expired (or not-yet-valid) capability is a credential problem, reported
+/// as such and scored as `TlsCertProblem` — not a front that "did not answer".
+/// Until 2026-10-22 the client never checked `not_after`: the relay routed the
+/// stale AUTH to its cover site and the probe failed as an opaque `Handshake`
+/// after a full TLS dial and a 7 s wait.
+fn ensure_valid_now(valid: bool) -> Result<(), ObfuscatorError> {
+    if valid {
+        Ok(())
+    } else {
+        Err(ObfuscatorError::CertProblem(
+            "veil-front capability is outside its validity window (expired?)".into(),
+        ))
+    }
+}
+
 /// Parse a base64-encoded veil-front ticket.
 ///
 /// Wire format: 65 raw bytes (see `construct_veil_protocol::ticket`), base64-
@@ -512,6 +553,63 @@ fn parse_veil_sk(veil_sk_hex: &str) -> Result<SigningKey, ObfuscatorError> {
         ObfuscatorError::Handshake(format!("veil_sk must be 32 bytes, got {}", v.len()))
     })?;
     Ok(SigningKey::from_bytes(&seed))
+}
+
+#[cfg(test)]
+mod probe_logic {
+    use super::*;
+
+    fn wire(frames: &[Frame]) -> BytesMut {
+        let mut codec = VeilFrontCodec::default().with_buckets(LENGTH_BUCKETS);
+        let mut buf = BytesMut::new();
+        for f in frames {
+            codec.encode(f.clone(), &mut buf).unwrap();
+        }
+        buf
+    }
+
+    /// CHAFF and DATA in one buffer → success without another read. Mutation:
+    /// return `None` after the first CHAFF (the one-frame-per-read loop) — this
+    /// gets `None` and the real probe would wait 7 s and time out.
+    #[test]
+    fn chaff_then_data_in_one_read_is_a_success() {
+        let mut codec = VeilFrontCodec::default().with_buckets(LENGTH_BUCKETS);
+        let mut buf = wire(&[
+            Frame::chaff(Bytes::from_static(&[0u8; 40])),
+            Frame::chaff(Bytes::from_static(&[0u8; 10])),
+            Frame::data(Bytes::from_static(b"settings")),
+        ]);
+        assert!(matches!(probe_verdict(&mut codec, &mut buf), Some(Ok(()))));
+    }
+
+    #[test]
+    fn only_chaff_buffered_asks_for_more() {
+        let mut codec = VeilFrontCodec::default().with_buckets(LENGTH_BUCKETS);
+        let mut buf = wire(&[Frame::chaff(Bytes::from_static(&[0u8; 40]))]);
+        assert!(probe_verdict(&mut codec, &mut buf).is_none());
+    }
+
+    /// The cover site's bytes are not our framing → a probe failure, not a wait.
+    #[test]
+    fn cover_site_bytes_fail_the_probe() {
+        let mut codec = VeilFrontCodec::default().with_buckets(LENGTH_BUCKETS);
+        let mut buf = BytesMut::from(&b"HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n\r\n"[..]);
+        assert!(matches!(
+            probe_verdict(&mut codec, &mut buf),
+            Some(Err(ObfuscatorError::Handshake(_)))
+        ));
+    }
+
+    /// Mutation: drop the `ensure_valid_now` calls — the expired capability is
+    /// sent and only fails at the relay.
+    #[test]
+    fn an_expired_capability_is_a_cert_problem() {
+        assert!(ensure_valid_now(true).is_ok());
+        assert!(matches!(
+            ensure_valid_now(false),
+            Err(ObfuscatorError::CertProblem(_))
+        ));
+    }
 }
 
 #[cfg(test)]

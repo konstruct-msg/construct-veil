@@ -20,7 +20,7 @@ use tokio::{
     sync::{Mutex, mpsc, oneshot},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::veil::fsm::{
     MethodId, MethodSet, NetworkFingerprint, ProbeFailureReason, TransportFailureKind, VeilConfig,
@@ -133,6 +133,12 @@ impl VeilCoordinator {
             }
             MethodSet::from_bitmask(bits)
         };
+        // Nothing allowed and registered: a configuration error for the host, not
+        // a probe race. (Until 2026-10-22 this reached the parallel path as an
+        // empty method list and panicked in `mpsc::channel(0)`.)
+        if allowed_methods.iter_allowed().next().is_none() {
+            return Err(CoordinatorError::NoMethods);
+        }
 
         info!(
             target: "ice::coordinator",
@@ -153,9 +159,19 @@ impl VeilCoordinator {
         // 15:32→16:15 "session was stopped" after a suspended internal cooldown.
         loop {
             // Build cached score lookup for this iteration.
-            let scores_cache = CachedScoreLookup::build(&self.scores, &fingerprint)
-                .await
-                .map_err(|e| CoordinatorError::Scoring(e.to_string()))?;
+            // Scores are telemetry for ordering the probes; they never gate
+            // connectivity. An unreadable store (locked, full disk, corrupt file)
+            // means "probe without history", not "fail the start".
+            let scores_cache = match CachedScoreLookup::build(&self.scores, &fingerprint).await {
+                Ok(cache) => cache,
+                Err(e) => {
+                    warn!(
+                        target: "ice::coordinator",
+                        "scores unreadable, probing without history: {e}"
+                    );
+                    CachedScoreLookup::empty(&fingerprint)
+                }
+            };
 
             let now = Instant::now();
             let now_sys = SystemTime::now();
@@ -486,6 +502,11 @@ impl VeilCoordinator {
         veil_front_auth_v3: &VeilFrontAuthV3,
     ) -> Result<(), CoordinatorError> {
         let num_probes = methods.len();
+        if num_probes == 0 {
+            // The reducer never emits an empty StartProbes; guard the channel
+            // capacity anyway — `mpsc::channel(0)` panics.
+            return Err(CoordinatorError::NoMethods);
+        }
         let (tx, mut rx) = mpsc::channel::<ProbeResult>(num_probes);
         let mut cancel_tokens: HashMap<MethodId, CancellationToken> = HashMap::new();
 
@@ -673,7 +694,8 @@ impl VeilCoordinator {
             );
             *state = new_state;
 
-            // Execute effects (RecordScore).
+            // Execute effects (RecordScore). A store that cannot be written is
+            // logged, not returned: the probe has already won.
             for sub_effect in &effects {
                 if let VeilEffect::RecordScore {
                     method: sm,
@@ -681,10 +703,7 @@ impl VeilCoordinator {
                     ..
                 } = sub_effect
                 {
-                    self.scores
-                        .record(fingerprint, *sm, *outcome)
-                        .await
-                        .map_err(|e| CoordinatorError::Scoring(e.to_string()))?;
+                    self.record_score(fingerprint, *sm, *outcome).await;
                 }
             }
 
@@ -735,32 +754,18 @@ impl VeilCoordinator {
             return Ok(());
         }
 
-        // All probes failed.
-        for (method, reason, _latency_ms) in &failures {
-            let _ = self
-                .scores
-                .record(
-                    fingerprint,
-                    *method,
-                    crate::veil::fsm::ScoreOutcome::Failure { reason: *reason },
-                )
-                .await;
-
-            // Feed individual ProbeFailed events into FSM.
-            let now = Instant::now();
-            let now_sys = SystemTime::now();
-            let (new_state, _effects) = reduce(
-                state.clone(),
-                VeilEvent::ProbeFailed {
-                    method: *method,
-                    reason: *reason,
-                },
+        // All probes failed: feed each failure through the FSM and score it from
+        // the reducer's effects — the same path the sequential probes take.
+        for (method, reason, latency_ms) in &failures {
+            self.handle_probe_failure(
+                *method,
+                *reason,
+                *latency_ms,
+                fingerprint,
+                state,
                 scores_cache,
-                &self.config,
-                now,
-                now_sys,
-            );
-            *state = new_state;
+            )
+            .await;
         }
 
         self.handle_all_probes_failed(state, scores_cache);
@@ -814,20 +819,16 @@ impl VeilCoordinator {
         );
         *state = new_state;
 
-        // Execute the new effects.
+        // Execute the new effects. A store that cannot be written is logged, not
+        // returned: the probe has already won.
         for sub_effect in &effects {
-            match sub_effect {
-                VeilEffect::RecordScore {
-                    method: sm,
-                    outcome,
-                    ..
-                } => {
-                    self.scores
-                        .record(fingerprint, *sm, *outcome)
-                        .await
-                        .map_err(|e| CoordinatorError::Scoring(e.to_string()))?;
-                }
-                _ => {}
+            if let VeilEffect::RecordScore {
+                method: sm,
+                outcome,
+                ..
+            } = sub_effect
+            {
+                self.record_score(fingerprint, *sm, *outcome).await;
             }
         }
 
@@ -903,9 +904,33 @@ impl VeilCoordinator {
                 ..
             } = sub_effect
             {
-                let _ = self.scores.record(fingerprint, *sm, *outcome).await;
+                self.record_score(fingerprint, *sm, *outcome).await;
             }
         }
+    }
+
+    /// Write one outcome to the store; a failure is logged and otherwise
+    /// ignored, because scores never gate connectivity.
+    async fn record_score(
+        &self,
+        fingerprint: &NetworkFingerprint,
+        method: MethodId,
+        outcome: crate::veil::fsm::ScoreOutcome,
+    ) {
+        if let Err(e) = self.scores.record(fingerprint, method, outcome).await {
+            warn!(
+                target: "ice::coordinator",
+                "score not recorded  method={} outcome={:?}: {e}",
+                method.name(),
+                outcome,
+            );
+        }
+    }
+
+    /// The scores store, for tests that read back what a session recorded.
+    #[cfg(test)]
+    pub(crate) fn scores(&self) -> &PersistentScores {
+        &self.scores
     }
 
     /// Handle all probes failed: transition to Cooldown.
@@ -1098,7 +1123,13 @@ async fn forward_obfs4(mut local: TcpStream, params: ProxyParams) {
         }
     };
 
-    match TcpStream::connect(&params.relay_addr).await {
+    let connect = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(&params.relay_addr),
+    )
+    .await
+    .unwrap_or_else(|_| Err(std::io::Error::from(std::io::ErrorKind::TimedOut)));
+    match connect {
         Ok(tcp) => {
             let _ = tcp.set_nodelay(true);
             match crate::Obfs4Stream::client_handshake_stream(tcp, config).await {
@@ -1126,7 +1157,10 @@ fn classify_obfuscator_error(e: &ObfuscatorError) -> ProbeFailureReason {
         ObfuscatorError::Cancelled => ProbeFailureReason::ConnectionFailed,
         ObfuscatorError::ConnectionRefused => ProbeFailureReason::ConnectionFailed,
         ObfuscatorError::Handshake(_) => ProbeFailureReason::ConnectionFailed,
-        ObfuscatorError::Tls(_) => ProbeFailureReason::FingerprintBlocked,
+        // A TLS error that is neither alert 40 nor a certificate verdict (reset,
+        // EOF, another alert): a failed connection, not a DPI verdict — which the
+        // scorer would turn into a week-long block after five of them.
+        ObfuscatorError::Tls(_) => ProbeFailureReason::ConnectionFailed,
         ObfuscatorError::Io(_) => ProbeFailureReason::ConnectionFailed,
         ObfuscatorError::Unknown(_) => ProbeFailureReason::Unknown,
     }
@@ -1146,4 +1180,161 @@ pub enum CoordinatorError {
 
     #[error("all probes failed")]
     AllProbesFailed,
+
+    #[error("no obfuscation method is both allowed and registered")]
+    NoMethods,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::veil::obfuscator::ObfuscatorHandle;
+
+    /// An obfuscator whose probe resolves at once with a fixed outcome.
+    struct Fake {
+        method: MethodId,
+        ok: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Obfuscator for Fake {
+        fn method_id(&self) -> MethodId {
+            self.method
+        }
+        async fn start(
+            &self,
+            _req: &ProbeRequest,
+            _cancel: CancellationToken,
+        ) -> Result<ObfuscatorHandle, ObfuscatorError> {
+            let ok = self.ok;
+            Ok(ObfuscatorHandle::new(
+                async move {
+                    if ok {
+                        Ok(())
+                    } else {
+                        Err(ObfuscatorError::ConnectionRefused)
+                    }
+                },
+                async {},
+            ))
+        }
+    }
+
+    async fn coordinator(config: VeilConfig) -> VeilCoordinator {
+        VeilCoordinator::new(
+            config,
+            PersistentScores::open(":memory:", 50).await.unwrap(),
+        )
+    }
+
+    fn fingerprint() -> NetworkFingerprint {
+        NetworkFingerprint::new(vec![3; 32])
+    }
+
+    async fn start(coord: &VeilCoordinator) -> Result<CoordinatorStartResult, CoordinatorError> {
+        coord
+            .start_session(
+                "relay:443".into(),
+                String::new(),
+                fingerprint(),
+                MethodSet::all(),
+            )
+            .await
+    }
+
+    /// No registered method: an error, not `mpsc::channel(0)`. Mutation: remove
+    /// the `NoMethods` returns — the parallel path panics.
+    #[tokio::test]
+    async fn no_registered_method_is_an_error_not_a_panic() {
+        let coord = coordinator(VeilConfig::default()).await;
+        assert!(matches!(
+            start(&coord).await,
+            Err(CoordinatorError::NoMethods)
+        ));
+    }
+
+    /// One candidate (the shipping veil-front-only build), one failure: it is
+    /// recorded. Mutation: the reducer's all-failed branch without `RecordScore`.
+    #[tokio::test]
+    async fn a_single_failing_probe_is_scored() {
+        let mut coord = coordinator(VeilConfig::legacy()).await;
+        coord.register(Box::new(Fake {
+            method: MethodId::VeilFront,
+            ok: false,
+        }));
+        assert!(matches!(
+            start(&coord).await,
+            Err(CoordinatorError::AllProbesFailed)
+        ));
+        let entry = coord
+            .scores()
+            .get_score(&fingerprint(), MethodId::VeilFront)
+            .await
+            .unwrap()
+            .expect("the failure was not recorded");
+        assert_eq!((entry.failures, entry.consecutive_failures), (1, 1));
+    }
+
+    /// The parallel path scores the losers the same way. Mutation: skip the
+    /// `handle_probe_failure` loop after the race.
+    #[tokio::test]
+    async fn parallel_failures_are_scored() {
+        let mut coord = coordinator(VeilConfig {
+            inter_probe_delay: Duration::from_millis(1),
+            ..VeilConfig::default()
+        })
+        .await;
+        for method in [MethodId::VeilFront, MethodId::Obfs4] {
+            coord.register(Box::new(Fake { method, ok: false }));
+        }
+        assert!(matches!(
+            start(&coord).await,
+            Err(CoordinatorError::AllProbesFailed)
+        ));
+        for method in [MethodId::VeilFront, MethodId::Obfs4] {
+            let entry = coord
+                .scores()
+                .get_score(&fingerprint(), method)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{} failure not recorded", method.name()));
+            assert_eq!(entry.failures, 1, "{}", method.name());
+        }
+    }
+
+    /// A store that cannot be read or written does not stop a reachable front
+    /// from being used. Mutation: restore the `?` on `CachedScoreLookup::build`.
+    #[tokio::test]
+    async fn an_unusable_scores_store_does_not_block_the_session() {
+        let mut coord = coordinator(VeilConfig::legacy()).await;
+        coord.register(Box::new(Fake {
+            method: MethodId::VeilFront,
+            ok: true,
+        }));
+        coord.scores().close().await;
+
+        let started = start(&coord)
+            .await
+            .expect("session must start without the scores store");
+        assert_ne!(started.port, 0);
+        assert_eq!(started.method, MethodId::VeilFront);
+        assert!(coord.stop().await);
+    }
+
+    /// Mutation: map `Tls(_)` back to `FingerprintBlocked`.
+    #[test]
+    fn a_generic_tls_error_is_not_a_dpi_verdict() {
+        assert_eq!(
+            classify_obfuscator_error(&ObfuscatorError::Tls("reset".into())),
+            ProbeFailureReason::ConnectionFailed
+        );
+        assert_eq!(
+            classify_obfuscator_error(&ObfuscatorError::FingerprintBlocked),
+            ProbeFailureReason::FingerprintBlocked
+        );
+        assert_eq!(
+            classify_obfuscator_error(&ObfuscatorError::CertProblem("pin".into())),
+            ProbeFailureReason::TlsCertProblem
+        );
+    }
 }
