@@ -129,6 +129,19 @@ pub fn take_tunnels_after_second_read() -> u64 {
     TUNNELS_AFTER_SECOND_READ.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Connections the gate admitted as tunnels, either read.
+///
+/// The relay's `connection summary` counts every connection in `completed`, a
+/// cover-site visit and a tunnel alike, and the per-tunnel lines are at `debug`
+/// (no client address above debug) except `tunnel closed`. Without this, a relay
+/// at `info` cannot say whether any client got through since it started.
+static TUNNELS_ADMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read and reset [`TUNNELS_ADMITTED`].
+pub fn take_tunnels_admitted() -> u64 {
+    TUNNELS_ADMITTED.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Result of the gate decision.
 pub enum GateResult<S> {
     /// Valid auth — this connection is a tunnel.
@@ -438,7 +451,10 @@ impl GateDecision {
     /// (empty reply), so the cover site never responded to any non-auth request.
     fn consume<S>(self, stream: S, buf: BytesMut) -> GateResult<S> {
         match self {
-            GateDecision::Tunnel { leftover } => GateResult::Tunnel { stream, leftover },
+            GateDecision::Tunnel { leftover } => {
+                TUNNELS_ADMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                GateResult::Tunnel { stream, leftover }
+            }
             GateDecision::Site => GateResult::Site {
                 stream,
                 first_bytes: buf,
@@ -704,5 +720,23 @@ mod tests {
         }
         let after = TUNNELS_AFTER_SECOND_READ.load(std::sync::atomic::Ordering::Relaxed);
         assert!(after > before, "the split frame was not counted");
+    }
+
+    /// A valid AUTH frame is counted as an admitted tunnel.
+    /// Mutation: drop the `fetch_add` in `consume` — the counter stays put.
+    #[tokio::test]
+    async fn an_admitted_tunnel_is_counted() {
+        let pubkey = issuer_public_key(&SEED);
+        let (mut client, server) = tokio::io::duplex(4096);
+        tokio::io::AsyncWriteExt::write_all(&mut client, &auth_v2_buf(""))
+            .await
+            .unwrap();
+        let before = TUNNELS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed);
+        let result = gate_stream(server, EXPORTER, &pubkey, "", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(matches!(result, GateResult::Tunnel { .. }));
+        let after = TUNNELS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "the admitted tunnel was not counted");
     }
 }
