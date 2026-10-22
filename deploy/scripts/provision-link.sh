@@ -70,8 +70,10 @@ fi
 
 # ── Issue the signed link + ticket ──────────────────────────────────────────
 echo "▸ issuing link for '$LABEL' (relay=$RELAY, days=$DAYS) …" >&2
-( cd "$VEIL_REPO" && cargo run -q -p construct-veil-relay --bin make-config-link -- \
-    --signing-key "$SEED" \
+# The seed goes through the environment, not argv: argv is readable by every
+# local user via `ps` for as long as cargo + the tool run; the environment only
+# by the owner.
+( cd "$VEIL_REPO" && VEIL_SIGNING_KEY="$SEED" cargo run -q -p construct-veil-relay --bin make-config-link -- \
     --relay "$RELAY" \
     --spki "$SPKI" \
     --days "$DAYS" )

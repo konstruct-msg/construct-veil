@@ -60,6 +60,57 @@ fn exp_h6(exporter: &[u8; 32]) -> String {
 /// 100ms is within the variance of typical web server first-read latency.
 const GATE_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// At most one "invalid AUTH" warning per this window; the rest are counted and
+/// reported with the next warning.
+///
+/// The warning exists for a real diagnosis — a well-formed AUTH that fails is
+/// the signature of an exporter mismatch on the host-terminated TLS path, and
+/// `exp=` is compared against the host's log. But the frame format is public:
+/// a prober can produce well-formed, invalid AUTH frames at line rate, and a
+/// per-frame `warn!` turns that into a log flood (the 2026-09-05 incident showed
+/// what per-connection logging does under load). One line a minute keeps the
+/// diagnosis and drops the amplifier.
+const INVALID_AUTH_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// Rate limiter for the invalid-AUTH warning.
+struct WarnLimiter {
+    /// Unix seconds of the last emitted warning (0 = never).
+    last: std::sync::atomic::AtomicU64,
+    /// Warnings suppressed since then.
+    suppressed: std::sync::atomic::AtomicU64,
+}
+
+impl WarnLimiter {
+    const fn new() -> Self {
+        Self {
+            last: std::sync::atomic::AtomicU64::new(0),
+            suppressed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// `Some(suppressed_since_last)` when this one may be logged, else `None`.
+    fn admit(&self, now_secs: u64) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        let last = self.last.load(Ordering::Relaxed);
+        if last != 0 && now_secs.saturating_sub(last) < INVALID_AUTH_WARN_EVERY.as_secs() {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        if self
+            .last
+            .compare_exchange(last, now_secs.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            // Another connection won the slot for this window.
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(self.suppressed.swap(0, Ordering::Relaxed))
+    }
+}
+
+static INVALID_AUTH_WARN: WarnLimiter = WarnLimiter::new();
+
 /// Result of the gate decision.
 pub enum GateResult<S> {
     /// Valid auth — this connection is a tunnel.
@@ -96,6 +147,7 @@ pub async fn gate_with_exporter(
     tls_stream: TlsStream<tokio::net::TcpStream>,
     issuer_pubkey: &[u8; 32],
     relay_scope: &str,
+    first_read_timeout: Duration,
 ) -> Result<GateResult<TlsStream<tokio::net::TcpStream>>, std::io::Error> {
     // Extract the TLS exporter from the rustls connection BEFORE handing the
     // stream to the transport-agnostic gate. This `get_ref().1` access is the
@@ -115,7 +167,14 @@ pub async fn gate_with_exporter(
         exp
     };
 
-    gate_stream(tls_stream, exporter, issuer_pubkey, relay_scope).await
+    gate_stream(
+        tls_stream,
+        exporter,
+        issuer_pubkey,
+        relay_scope,
+        first_read_timeout,
+    )
+    .await
 }
 
 /// Transport-agnostic gate — the load-bearing core, over any byte duplex.
@@ -143,16 +202,30 @@ pub async fn gate_stream<S: AsyncRead + Unpin>(
     exporter: [u8; 32],
     issuer_pubkey: &[u8; 32],
     relay_scope: &str,
+    first_read_timeout: Duration,
 ) -> Result<GateResult<S>, std::io::Error> {
     let mut reader = stream;
     let mut buf = BytesMut::with_capacity(4096);
 
     // ── First read (like a web server reading an HTTP request) ───────────
-
-    let n = reader.read_buf(&mut buf).await.map_err(|e| {
-        warn!(error = %e, "read error during gate");
-        e
-    })?;
+    //
+    // Bounded like a web server's header timeout: a peer that completes TLS and
+    // then says nothing is dropped (`Site` with no bytes → the caller closes).
+    // Until 2026-10-22 this read had no limit and such a peer held its task,
+    // socket and per-IP slot forever.
+    let n = match tokio::time::timeout(first_read_timeout, reader.read_buf(&mut buf)).await {
+        Ok(read) => read.map_err(|e| {
+            debug!(error = %e, "read error during gate");
+            e
+        })?,
+        Err(_) => {
+            debug!("no data after TLS handshake within the first-byte timeout, closing");
+            return Ok(GateResult::Site {
+                stream: reader,
+                first_bytes: BytesMut::new(),
+            });
+        }
+    };
 
     if n == 0 {
         debug!("no data after TLS handshake, routing to site");
@@ -185,22 +258,13 @@ pub async fn gate_stream<S: AsyncRead + Unpin>(
             debug!("second read still incomplete, routing to site");
         }
         Ok(Err(e)) => {
-            warn!(error = %e, "read error during gate (second read), routing to site");
+            debug!(error = %e, "read error during gate (second read), routing to site");
         }
         Err(_) => {
             // Timeout — no more data within 100ms.
             // A web server would have started processing the HTTP request by now.
             debug!("read timeout after first read, routing to site");
         }
-    }
-
-    // Safety cap: if we accumulated >64KB without a valid frame, it's
-    // definitely not our protocol.
-    if buf.len() > 65536 {
-        debug!(
-            bytes = buf.len(),
-            "too much data without valid auth frame, routing to site"
-        );
     }
 
     Ok(GateResult::Site {
@@ -251,11 +315,16 @@ fn try_decode_auth(
                 // the frame decoded, so AUTH *arrived* (up-pump works), but the
                 // exporter-bound authcode did not verify. warn! (not debug) so it
                 // surfaces at prod log level; compare exp= against the host's log.
-                warn!(
-                    exp = %exp_h6(exporter),
-                    scope_ok,
-                    "capability (v2) invalid (sig/expiry/scope/authcode), routing to site"
-                );
+                if let Some(suppressed) = INVALID_AUTH_WARN.admit(now_unix()) {
+                    warn!(
+                        exp = %exp_h6(exporter),
+                        scope_ok,
+                        suppressed,
+                        "capability (v2) invalid (sig/expiry/scope/authcode), routing to site"
+                    );
+                } else {
+                    debug!(exp = %exp_h6(exporter), scope_ok, "capability (v2) invalid");
+                }
                 Some(GateDecision::Site)
             }
         }
@@ -295,13 +364,18 @@ fn try_decode_auth(
                 // arrived, up-pump works) but the client signature over the
                 // exporter did not verify. warn! at prod level; compare exp=
                 // against the host's derived-exporter log to confirm the cause.
-                warn!(
-                    exp = %exp_h6(exporter),
-                    scope_ok,
-                    user_ok,
-                    relay_ok,
-                    "capability (v3) invalid (sig/role/expiry/scope/client_sig), routing to site"
-                );
+                if let Some(suppressed) = INVALID_AUTH_WARN.admit(now_unix()) {
+                    warn!(
+                        exp = %exp_h6(exporter),
+                        scope_ok,
+                        user_ok,
+                        relay_ok,
+                        suppressed,
+                        "capability (v3) invalid (sig/role/expiry/scope/client_sig), routing to site"
+                    );
+                } else {
+                    debug!(exp = %exp_h6(exporter), scope_ok, user_ok, relay_ok, "capability (v3) invalid");
+                }
                 Some(GateDecision::Site)
             }
         }
@@ -518,7 +592,9 @@ mod tests {
         tokio::io::AsyncWriteExt::write_all(&mut client, &buf)
             .await
             .unwrap();
-        let result = gate_stream(server, EXPORTER, &pubkey, "").await.unwrap();
+        let result = gate_stream(server, EXPORTER, &pubkey, "", Duration::from_secs(5))
+            .await
+            .unwrap();
         assert!(matches!(result, GateResult::Tunnel { .. }));
     }
 
@@ -536,10 +612,47 @@ mod tests {
         drop(client); // EOF so the second (timeout) read returns 0 promptly
         let mut wrong = EXPORTER;
         wrong[0] ^= 0x01;
-        let result = gate_stream(server, wrong, &pubkey, "").await.unwrap();
+        let result = gate_stream(server, wrong, &pubkey, "", Duration::from_secs(5))
+            .await
+            .unwrap();
         match result {
             GateResult::Site { first_bytes, .. } => assert!(!first_bytes.is_empty()),
             GateResult::Tunnel { .. } => panic!("wrong exporter must not tunnel"),
         }
+    }
+
+    /// A peer that completes TLS and sends nothing is dropped after the
+    /// first-byte timeout (Site, no bytes → the caller closes). Mutation: drop the
+    /// `timeout` around the first read — the gate waits forever.
+    #[tokio::test]
+    async fn a_silent_peer_is_dropped_after_the_first_byte_timeout() {
+        let (_client, server) = tokio::io::duplex(4096);
+        let pubkey = construct_veil_protocol::issuer_public_key(&SEED);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            gate_stream(server, EXPORTER, &pubkey, "", Duration::from_millis(100)),
+        )
+        .await
+        .expect("gate waited past its first-byte timeout")
+        .unwrap();
+        match result {
+            GateResult::Site { first_bytes, .. } => assert!(first_bytes.is_empty()),
+            GateResult::Tunnel { .. } => panic!("a silent peer became a tunnel"),
+        }
+    }
+
+    /// One warning per window; the rest are counted into the next one.
+    /// Mutation: `admit` always `Some` (per-frame warn) — the second call logs.
+    #[test]
+    fn invalid_auth_warnings_are_rate_limited() {
+        let limiter = WarnLimiter::new();
+        assert_eq!(limiter.admit(1_000), Some(0));
+        for _ in 0..500 {
+            assert_eq!(limiter.admit(1_001), None);
+        }
+        assert_eq!(
+            limiter.admit(1_000 + INVALID_AUTH_WARN_EVERY.as_secs()),
+            Some(500)
+        );
     }
 }

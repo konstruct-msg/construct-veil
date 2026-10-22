@@ -11,9 +11,13 @@
 //! it must equal both the app's `relayConfigSigningKey` AND the relay's `--issuer-pubkey`.
 //!
 //! ```text
-//! make-config-link --signing-key <64-hex-seed> --spki <relay-spki-hex> \
+//! make-config-link --signing-key-file issuer.seed --spki <relay-spki-hex> \
 //!     --relay front.example.com:443 --scope "" --days 60
 //! ```
+//!
+//! The seed comes from `--signing-key-file` or the `VEIL_SIGNING_KEY` environment
+//! variable. `--signing-key <hex>` still works but puts the master key in `ps`
+//! output and shell history, so it prints a warning.
 //!
 //! No relay restart / tickets.json needed: the relay validates the capability's
 //! signature offline, so the link works as soon as the relay runs with the matching
@@ -36,9 +40,14 @@ use ring::signature::{Ed25519KeyPair, KeyPair};
     about = "Issue a ticket + emit a signed veil-front config link + QR"
 )]
 struct Args {
-    /// Ed25519 private seed (32-byte hex) for relayConfigSigningKey.
+    /// File holding the Ed25519 private seed (64 hex chars) = relayConfigSigningKey.
+    #[arg(long, value_name = "PATH")]
+    signing_key_file: Option<String>,
+
+    /// The seed itself, on the command line. Discouraged: visible in `ps` and
+    /// shell history. Prefer `--signing-key-file` or `VEIL_SIGNING_KEY`.
     #[arg(long)]
-    signing_key: String,
+    signing_key: Option<String>,
 
     /// Relay address (host:port). Required — no production default (opsec).
     #[arg(long)]
@@ -77,7 +86,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // ── Signing key ─────────────────────────────────────────────────────────
-    let seed = hex_decode(&args.signing_key).ok_or("--signing-key must be hex")?;
+    let signing_key = resolve_signing_key(
+        args.signing_key_file.as_deref(),
+        std::env::var("VEIL_SIGNING_KEY").ok(),
+        args.signing_key.as_deref(),
+    )?;
+    let seed = hex_decode(&signing_key).ok_or("signing key must be hex")?;
     if seed.len() != 32 {
         return Err(format!(
             "--signing-key must be 32 bytes (64 hex chars), got {}",
@@ -176,13 +190,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .min_dimensions(256, 256)
                     .quiet_zone(true)
                     .build();
-                fs::write(path, svg)?;
+                // The QR is a credential (the link inside it admits the bearer).
+                write_private(path, svg.as_bytes())?;
                 eprintln!("✓ QR written to {path}");
             }
         }
         Err(e) => eprintln!("(QR render failed: {e})"),
     }
     Ok(())
+}
+
+/// Where the issuer seed comes from, in order of preference: a file, the
+/// `VEIL_SIGNING_KEY` environment variable, then `--signing-key` (with a warning —
+/// argv is readable by every local user via `ps` and lands in shell history).
+/// Until 2026-10-22 argv was the only way.
+fn resolve_signing_key(
+    file: Option<&str>,
+    env: Option<String>,
+    argv: Option<&str>,
+) -> Result<String, String> {
+    if let Some(path) = file {
+        return fs::read_to_string(path)
+            .map(|s| s.trim().to_owned())
+            .map_err(|e| format!("reading --signing-key-file: {e}"));
+    }
+    if let Some(key) = env.filter(|k| !k.trim().is_empty()) {
+        return Ok(key.trim().to_owned());
+    }
+    if let Some(key) = argv {
+        eprintln!(
+            "warning: --signing-key puts the issuer seed in `ps` output and shell history; \
+             use --signing-key-file or VEIL_SIGNING_KEY"
+        );
+        return Ok(key.trim().to_owned());
+    }
+    Err("no signing key: pass --signing-key-file PATH or set VEIL_SIGNING_KEY".into())
+}
+
+/// Write a file only its owner can read (0600 on unix), replacing any old one.
+fn write_private(path: &str, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let _ = fs::remove_file(path);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents)
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
@@ -197,4 +253,46 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// File beats env beats argv; nothing at all is an error. Mutation: read
+    /// argv first — the file path is ignored.
+    #[test]
+    fn the_signing_key_prefers_file_then_env_then_argv() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("veil-mcl-{}-seed", std::process::id()));
+        fs::write(&path, "  aa\n").unwrap();
+        let file = path.to_str().unwrap();
+
+        assert_eq!(
+            resolve_signing_key(Some(file), Some("bb".into()), Some("cc")).unwrap(),
+            "aa"
+        );
+        assert_eq!(
+            resolve_signing_key(None, Some("bb".into()), Some("cc")).unwrap(),
+            "bb"
+        );
+        assert_eq!(resolve_signing_key(None, None, Some("cc")).unwrap(), "cc");
+        assert!(resolve_signing_key(None, Some("  ".into()), None).is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_qr_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut path = std::env::temp_dir();
+        path.push(format!("veil-mcl-{}-qr.svg", std::process::id()));
+        let path = path.to_str().unwrap().to_owned();
+        write_private(&path, b"<svg/>").unwrap();
+        write_private(&path, b"<svg>2</svg>").unwrap(); // regenerating replaces it
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(fs::read(&path).unwrap(), b"<svg>2</svg>");
+        let _ = fs::remove_file(&path);
+    }
 }

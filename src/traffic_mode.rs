@@ -427,6 +427,10 @@ mod tests {
         let mut sched =
             CoverTrafficScheduler::new(TrafficMode::Mimicry(MimicryProfile::BackgroundSync));
         let d1 = sched.next_deadline().unwrap();
+        // Both deadlines are `Instant::now() + interval`; without a pause the two
+        // clock reads can land in the same tick, the deadlines tie, and the strict
+        // comparison below fails intermittently (seen in CI-style runs).
+        std::thread::sleep(std::time::Duration::from_millis(2));
         sched.record_real_write();
         let d2 = sched.next_deadline().unwrap();
         // After a real write the deadline should be pushed forward

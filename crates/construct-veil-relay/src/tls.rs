@@ -65,6 +65,14 @@ pub struct RelayTls {
 }
 
 impl RelayTls {
+    /// Offer these ALPN protocols (most preferred first). See the `--alpn` flag
+    /// for why this is off by default.
+    pub fn set_alpn(&mut self, protocols: Vec<Vec<u8>>) {
+        let mut config = (*self.acceptor.config()).as_ref().clone();
+        config.alpn_protocols = protocols;
+        self.acceptor = TlsAcceptor::from(Arc::new(config));
+    }
+
     /// Load TLS from PEM certificate and key files (production, ACME).
     pub fn from_pem_files(cert_path: &str, key_path: &str) -> Result<Self, std::io::Error> {
         let certs: Vec<_> = CertificateDer::pem_file_iter(cert_path)
@@ -275,5 +283,46 @@ mod tests {
     fn classical_client_still_connects() {
         use rustls::NamedGroup::X25519;
         assert_eq!(negotiated_group(&[X25519]), X25519);
+    }
+
+    /// Runs a handshake with a client offering `h2, http/1.1`; the protocol the
+    /// relay chose.
+    fn negotiated_alpn(tls: &RelayTls) -> Option<Vec<u8>> {
+        let provider = crypto_provider();
+        let mut client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyCert(provider)))
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let mut client =
+            rustls::ClientConnection::new(Arc::new(client_config), "localhost".try_into().unwrap())
+                .unwrap();
+        let mut server = rustls::ServerConnection::new(tls.acceptor.config().clone()).unwrap();
+        for _ in 0..10 {
+            let mut buf = Vec::new();
+            client.write_tls(&mut buf).unwrap();
+            server.read_tls(&mut &buf[..]).unwrap();
+            server.process_new_packets().unwrap();
+            let mut buf = Vec::new();
+            server.write_tls(&mut buf).unwrap();
+            client.read_tls(&mut &buf[..]).unwrap();
+            client.process_new_packets().unwrap();
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        server.alpn_protocol().map(|p| p.to_vec())
+    }
+
+    /// Off by default (no ALPN in the ServerHello, as before); `--alpn` turns it
+    /// on. Mutation: `set_alpn` that leaves the config untouched.
+    #[test]
+    fn alpn_is_off_by_default_and_follows_the_flag() {
+        let mut tls = RelayTls::self_signed().unwrap();
+        assert_eq!(negotiated_alpn(&tls), None);
+        tls.set_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        assert_eq!(negotiated_alpn(&tls).as_deref(), Some(&b"h2"[..]));
     }
 }

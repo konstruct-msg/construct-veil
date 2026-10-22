@@ -90,7 +90,28 @@ pub enum ChainError {
 ///
 /// Returns the authenticated TLS stream — application data from here on must
 /// be DATA/CHAFF frames (see [`ferry_client_to_upstream`] / [`ferry_upstream_to_client`]).
-pub async fn dial_upstream(cfg: &ChainConfig) -> Result<ClientTlsStream<TcpStream>, ChainError> {
+///
+/// The whole dial — TCP connect, TLS handshake, AUTH write — is bounded by
+/// `limit`. Until 2026-10-22 only the TCP connect (5 s) was:
+/// an upstream that accepted the SYN and went silent held the client's tunnel
+/// for as long as the client waited.
+pub async fn dial_upstream_within(
+    cfg: &ChainConfig,
+    limit: Duration,
+) -> Result<ClientTlsStream<TcpStream>, ChainError> {
+    tokio::time::timeout(limit, dial_upstream_unbounded(cfg))
+        .await
+        .unwrap_or_else(|_| {
+            Err(ChainError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upstream dial timed out",
+            )))
+        })
+}
+
+async fn dial_upstream_unbounded(
+    cfg: &ChainConfig,
+) -> Result<ClientTlsStream<TcpStream>, ChainError> {
     let capability = {
         let raw = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
@@ -439,5 +460,31 @@ mod tests {
         drop(upstream_test_wr);
         drop(upstream_test_rd);
         let _ = chain.await;
+    }
+
+    /// An upstream that accepts TCP and never answers the ClientHello: the dial
+    /// gives up. Mutation: `dial_upstream_within` without the timeout — hangs.
+    #[tokio::test]
+    async fn a_silent_upstream_times_out_the_dial() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_silent, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut cfg = test_chain_config(&"ab".repeat(32));
+        cfg.upstream_addr = addr.to_string();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            dial_upstream_within(&cfg, Duration::from_millis(200)),
+        )
+        .await
+        .expect("upstream dial hung past its own timeout");
+        match result {
+            Err(ChainError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            Err(other) => panic!("expected a timeout, got {other}"),
+            Ok(_) => panic!("a silent upstream authenticated"),
+        }
     }
 }
