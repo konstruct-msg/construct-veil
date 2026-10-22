@@ -123,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_slice()
         .try_into()
         .expect("seed length checked above");
-    let capability = Capability::sign(ticket, args.scope.clone(), &seed32);
+    let capability = Capability::sign(ticket, args.scope.clone(), &seed32)?;
     let cap_b64 = base64::engine::general_purpose::STANDARD.encode(capability.encode());
 
     // ── Build + sign the config blob ────────────────────────────────────────

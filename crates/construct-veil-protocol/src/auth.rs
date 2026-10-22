@@ -42,11 +42,11 @@ pub struct AuthRecord {
 impl AuthRecord {
     /// Build an auth record from a ticket and TLS exporter output.
     ///
-    /// `exporter` must be exactly 32 bytes (the output of
-    /// `Connection::export_keying_material(EXPORTER_LABEL, &[], 32)`).
-    pub fn from_ticket(ticket: &Ticket, exporter: &[u8]) -> Self {
-        assert_eq!(exporter.len(), 32, "exporter must be 32 bytes");
-
+    /// `exporter` is the output of
+    /// `Connection::export_keying_material(EXPORTER_LABEL, &[], 32)`. Typed as
+    /// 32 bytes: until 2026-10-22 it was a slice with an `assert_eq!` on its
+    /// length, which `verify` reached — a wrong length panicked the verifier.
+    pub fn from_ticket(ticket: &Ticket, exporter: &[u8; 32]) -> Self {
         let mut mac = Hmac::<Sha256>::new_from_slice(ticket.auth_key.as_bytes())
             .expect("HMAC-SHA256 accepts any key length");
 
@@ -70,7 +70,7 @@ impl AuthRecord {
     ///
     /// Uses **constant-time comparison** — never `==` on the authcode bytes.
     /// Returns `true` if the authcode matches.
-    pub fn verify(&self, ticket: &Ticket, exporter: &[u8]) -> bool {
+    pub fn verify(&self, ticket: &Ticket, exporter: &[u8; 32]) -> bool {
         if self.ticket_id != ticket.ticket_id {
             return false;
         }

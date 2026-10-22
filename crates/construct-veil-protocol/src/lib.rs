@@ -19,7 +19,10 @@
 //!
 //! # Security rules
 //! - **Never** use `==` on authcode bytes — always `subtle::ConstantTimeEq`
-//! - `AuthKey` and `Ticket` implement `ZeroizeOnDrop`
+//! - `AuthKey` wipes its bytes on drop (so does every `Ticket`, which holds one);
+//!   buffers that copy the key (`ticket_to_bytes`, signing messages) are `Zeroizing`.
+//!   The encoded capability blob (`Bytes`) is not wiped: it is the bearer
+//!   credential the client stores and sends anyway.
 //! - `wire_ver` must be bumped on any wire format change
 
 #![deny(unsafe_code)]
@@ -30,6 +33,9 @@ mod capability;
 mod framing;
 pub mod ticket;
 mod varint;
+
+#[cfg(test)]
+mod hardening_tests;
 
 pub use auth::*;
 pub use capability::*;

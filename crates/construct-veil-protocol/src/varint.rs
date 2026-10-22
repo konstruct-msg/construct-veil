@@ -1,4 +1,4 @@
-//! Variable-length integer encoding (LEB128-style, max 8 bytes).
+//! Variable-length integer encoding (LEB128-style, at most 10 bytes).
 //!
 //! Used for frame length fields in the veil-front wire protocol.
 //! Supports values 0..=2^64-1, but practically frames are < 64KB.
@@ -11,7 +11,8 @@ pub const VARINT_MAX_BYTES: usize = 10;
 
 /// Encode a u64 as a LEB128 varint into the given buffer.
 ///
-/// Returns the number of bytes written (1–8).
+/// Returns the number of bytes written (1–10). Always the shortest (canonical)
+/// encoding — the decoder rejects anything longer.
 pub fn encode_varint(mut value: u64, buf: &mut impl BufMut) -> usize {
     if value == 0 {
         buf.put_u8(0);
@@ -31,41 +32,68 @@ pub fn encode_varint(mut value: u64, buf: &mut impl BufMut) -> usize {
     len
 }
 
-/// Decode a LEB128 varint from the given buffer.
+/// Outcome of decoding a varint from a buffer that may hold only part of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Varint {
+    /// A complete varint: its value and how many bytes it took.
+    Value(u64, usize),
+    /// The buffer ends inside the varint — more bytes may complete it.
+    Incomplete,
+    /// No amount of further bytes can make this valid: more than
+    /// [`VARINT_MAX_BYTES`], a value past `u64::MAX`, or a non-canonical
+    /// (overlong) encoding.
+    Malformed,
+}
+
+/// Decode a LEB128 varint, telling "incomplete" apart from "malformed".
 ///
-/// Returns `Some((value, bytes_read))` or `None` if the buffer is too short
-/// or the varint is malformed (too many continuation bytes).
-pub fn decode_varint(buf: &mut impl Buf) -> Option<(u64, usize)> {
+/// Until 2026-10-22 the decoder returned `None` for both, and the frame codec
+/// read every `None` as "need more data": a peer sending `03 01` followed by
+/// 0xFF bytes kept the decoder waiting — and the read buffer growing — for as
+/// long as it kept sending. It also accepted overlong (`80 00` = 0) and
+/// overflowing (`FF×9 7F`) encodings.
+pub fn decode_varint_checked(buf: &mut impl Buf) -> Varint {
     let mut result: u64 = 0;
-    let mut shift: u32 = 0;
-    let mut bytes_read = 0;
+    let mut bytes_read = 0usize;
 
     loop {
-        if !buf.has_remaining() {
-            return None; // incomplete varint
+        if bytes_read == VARINT_MAX_BYTES {
+            return Varint::Malformed; // a 10th byte with the continuation bit set
         }
-
+        if !buf.has_remaining() {
+            return Varint::Incomplete;
+        }
         let byte = buf.get_u8();
+        let low7 = (byte & 0x7F) as u64;
+        let shift = 7 * bytes_read as u32;
         bytes_read += 1;
 
-        if bytes_read > VARINT_MAX_BYTES {
-            return None; // malformed: too many bytes
+        // The 10th byte holds only bit 63: anything above 1 overflows u64.
+        if bytes_read == VARINT_MAX_BYTES && low7 > 1 {
+            return Varint::Malformed;
         }
-
-        let low7 = (byte & 0x7F) as u64;
-
-        // Check for overflow: can we fit 7 more bits?
-        if shift >= 64 {
-            return None;
-        }
-        let shifted = low7.checked_shl(shift)?;
-        result |= shifted;
-        shift += 7;
+        result |= low7 << shift;
 
         if byte & 0x80 == 0 {
-            // Last byte — done.
-            return Some((result, bytes_read));
+            // A last byte of 0 after other bytes is an overlong encoding of a
+            // value that fits in fewer bytes.
+            if bytes_read > 1 && low7 == 0 {
+                return Varint::Malformed;
+            }
+            return Varint::Value(result, bytes_read);
         }
+    }
+}
+
+/// Decode a LEB128 varint from the given buffer.
+///
+/// Returns `Some((value, bytes_read))`, or `None` if the buffer is too short
+/// **or** the varint is malformed. Use [`decode_varint_checked`] where the two
+/// must be told apart (a stream decoder deciding whether to wait for more).
+pub fn decode_varint(buf: &mut impl Buf) -> Option<(u64, usize)> {
+    match decode_varint_checked(buf) {
+        Varint::Value(v, n) => Some((v, n)),
+        Varint::Incomplete | Varint::Malformed => None,
     }
 }
 

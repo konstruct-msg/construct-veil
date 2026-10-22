@@ -347,7 +347,8 @@ mod tests {
             1,
             String::new(),
             &SEED,
-        );
+        )
+        .unwrap();
         ChainConfig {
             upstream_addr: "127.0.0.1:1".into(),
             upstream_sni: "localhost".into(),
@@ -374,7 +375,7 @@ mod tests {
         let cap = CapabilityV2::decode_slice(&raw).unwrap();
         let rec = AuthRecordV3::from_capability(&cap, &cfg.veil_sk, &EXPORTER);
         let pubkey = issuer_public_key(&SEED);
-        assert!(rec.verify(&pubkey, ROLE_RELAY, &EXPORTER, 1_000));
+        assert!(rec.verify(&pubkey, "", ROLE_RELAY, &EXPORTER, 1_000));
     }
 
     #[test]

@@ -20,7 +20,7 @@
 //! - Tickets are short-lived (PoC: 6 hours; production: TBD)
 //! - `ticket_id` is random, not derived from client identity
 
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// A veil-front ticket, issued over the authenticated manifest channel.
 ///
@@ -74,6 +74,17 @@ impl Zeroize for AuthKey {
     }
 }
 
+/// Wipes the key when the value is dropped.
+///
+/// Until 2026-10-22 there was only `impl ZeroizeOnDrop for AuthKey {}` — a
+/// marker trait that does nothing by itself — so the doc's "zeroised on drop"
+/// was not true and dropped bearer keys stayed in freed memory.
+impl Drop for AuthKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 impl ZeroizeOnDrop for AuthKey {}
 
 impl std::fmt::Debug for AuthKey {
@@ -88,22 +99,22 @@ impl Ticket {
         now_secs >= self.not_before && now_secs <= self.not_after
     }
 
-    /// Check whether the ticket is currently valid.
+    /// Check whether the ticket is currently valid. A clock set before the Unix
+    /// epoch means "not valid", not a panic.
     pub fn is_valid_now(&self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before Unix epoch")
-            .as_secs();
-        self.is_valid_at(now)
+        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(now) => self.is_valid_at(now.as_secs()),
+            Err(_) => false,
+        }
     }
 }
 
 /// Serialise a ticket to a byte blob (for manifest channel transport).
 ///
 /// Format: `ticket_id[16] || auth_key[32] || not_before[8] || not_after[8] || suite_id[1]`
-/// Total: 65 bytes.
-pub fn ticket_to_bytes(ticket: &Ticket) -> [u8; TICKET_WIRE_LEN] {
-    let mut out = [0u8; TICKET_WIRE_LEN];
+/// Total: 65 bytes. The blob carries the auth key, so it is wiped when dropped.
+pub fn ticket_to_bytes(ticket: &Ticket) -> Zeroizing<[u8; TICKET_WIRE_LEN]> {
+    let mut out = Zeroizing::new([0u8; TICKET_WIRE_LEN]);
     out[0..16].copy_from_slice(&ticket.ticket_id);
     out[16..48].copy_from_slice(ticket.auth_key.as_bytes());
     out[48..56].copy_from_slice(&ticket.not_before.to_le_bytes());
@@ -126,7 +137,7 @@ pub fn ticket_from_bytes(data: &[u8]) -> Option<Ticket> {
     let mut ticket_id = [0u8; TICKET_ID_LEN];
     ticket_id.copy_from_slice(&data[0..16]);
 
-    let mut auth_key_bytes = [0u8; AUTH_KEY_LEN];
+    let mut auth_key_bytes = Zeroizing::new([0u8; AUTH_KEY_LEN]);
     auth_key_bytes.copy_from_slice(&data[16..48]);
 
     let mut not_before_bytes = [0u8; 8];
@@ -141,7 +152,7 @@ pub fn ticket_from_bytes(data: &[u8]) -> Option<Ticket> {
 
     Some(Ticket {
         ticket_id,
-        auth_key: AuthKey::new(auth_key_bytes),
+        auth_key: AuthKey::new(*auth_key_bytes),
         not_before,
         not_after,
         suite_id,
@@ -184,7 +195,7 @@ mod tests {
         let bytes = ticket_to_bytes(&original);
         assert_eq!(bytes.len(), TICKET_WIRE_LEN);
 
-        let restored = ticket_from_bytes(&bytes).expect("deserialisation failed");
+        let restored = ticket_from_bytes(&bytes[..]).expect("deserialisation failed");
         assert_eq!(restored.ticket_id, original.ticket_id);
         assert_eq!(restored.auth_key.0, original.auth_key.0);
         assert_eq!(restored.not_before, original.not_before);
