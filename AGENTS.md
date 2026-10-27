@@ -1,34 +1,91 @@
 # AGENTS.md — construct-veil
 
-Context for AI agents working in this repository.
+The rules this project paid for in its first year, and the invariants of this repository. Each
+line is here because breaking it already cost something; the incident behind it lives in the
+vault. If a rule here and your plan disagree, the rule wins until a `decisions/` note says
+otherwise.
 
----
+`construct-veil` is the anti-censorship transport of Construct Messenger: the **veil-front**
+client (coordinator, adapter, C FFI linked into construct-core), the wire protocol
+(`crates/construct-veil-protocol`) and the relay (`crates/construct-veil-relay`). obfs4 and
+WebTunnel were removed on 2026-10-22; do not bring them back without a new decision.
 
-## What is construct-veil?
+## Read first
 
-The anti-censorship transport of Construct Messenger: the **veil-front** client
-(coordinator, adapter, C FFI linked into construct-core), the wire protocol
-(`crates/construct-veil-protocol`) and the relay (`crates/construct-veil-relay`).
-obfs4 and WebTunnel were removed on 2026-10-22 (decision `veil-front-only-retire-obfs4`);
-do not bring them back without a new decision.
+| Area | File |
+|---|---|
+| Why these rules exist | `~/Code/construct-docs/decisions/rules-from-the-first-year.md` |
+| Source layout | `README.md`, "Source layout" |
+| veil-front only (obfs4 retired) | `~/Code/construct-docs/decisions/veil-front-only-retire-obfs4.md` |
+| Front coordinates, delivery, logs | `~/Code/construct-docs/decisions/` — `veil-front-coordinates-are-not-public.md` · `veil-front-delivery-is-link-voucher.md` · `veil-front-in-logs-is-a-keyed-label.md` · `veil-front-topup-keep-two-usable.md` |
+| Redundancy plan | `~/Code/construct-docs/decisions/veil-front-redundancy-execution-plan.md` |
+| Everything else | `~/Code/construct-docs` (vault; its own `AGENTS.md` is authoritative) · `security/` for VEIL |
 
----
+Layout: `src/ffi.rs` (C ABI: `veil_start`, `veil_front_ferry_fd`, …) · `src/veil/` (coordinator
+FSM, scoring, adapter) · `src/tls_pinned.rs` (SPKI-pinned rustls connector).
 
-## Architecture
-
-See README.md, "Source layout". In short:
+## The Zen of Konstruct
 
 ```
-src/ffi.rs                 — C ABI the apps call (veil_start, veil_front_ferry_fd, …)
-src/veil/                  — coordinator FSM, scoring, veil-front adapter
-src/tls_pinned.rs          — SPKI-pinned rustls connector (pin is mandatory)
-crates/construct-veil-protocol — frames, tickets, capabilities, AUTH v2/v3
-crates/construct-veil-relay    — the relay binary
+Someone has solved it before. Read them first.
+The core decides; the app executes.
+A message names the state it means. Time is not an address.
+Reproduce, then fix.
+One meaning, one carrier.
+Bytes stay bytes.
+Measure, then build.
+The effect is the proof, not the exit code.
+A test that cannot fail is worse than no test.
+Boring before new.
+Temporary is permanent, unless something checks it.
+What nothing reads is not sent.
+Silence is the worst failure: a message that never appears raises no error.
 ```
 
----
+Canonical source: `~/Code/construct-docs/decisions/rules-from-the-first-year.md` — change it there first.
 
-## Build & Test
+## Rules
+
+1. **Prior art first.** Before any obfuscation or transport mechanism, write down what Tor,
+   V2Ray / Reality, Snowflake or QUIC-based circumvention do and why we deviate.
+2. **The core decides.** Session and crypto decisions belong to `construct-core`; veil moves bytes
+   and decides only transport (which front, scoring, failover). It never touches ratchet or
+   session state.
+3. **Frames and handshakes name the state they mean** (AUTH version, ticket, capability). A fix
+   that adds a timer or retry budget in place of an address is a signal to stop.
+4. **Reproduce before fixing.** Every fix carries a regression test that fails on the old code.
+5. **One meaning, one carrier.** A constant two crates must agree on lives in one place
+   (`crates/construct-veil-protocol`); a comment saying "must match" means one should call the other.
+6. **Bytes stay bytes** across the C ABI and the wire; no base64/JSON for binary payloads.
+7. **Measure, then build.** Five obfuscation designs preceded the measurement that settled the
+   question. A new mechanism needs a measurement on the real path first.
+8. **Verify the effect, not the exit code:** a connection by traffic observed on the wire, a relay
+   deploy by the version it reports.
+9. **A test must be able to fail.** Put the decision in a pure function, test that, and
+   mutation-check new tests (one mutation at a time, an unapplied mutation is fatal).
+10. **Depth before breadth.** No new transport or front kind until the existing path is boring on
+    a real device.
+11. **A temporary exception has an end date and a check.**
+12. **A branch and a PR, always** (see Git).
+
+**A change on the delivery path answers three questions** in its commit message: (1) what does
+the relay, a front or an observer learn that it did not before (including SNI, timing, sizes);
+(2) what can a party withhold or substitute that it could not before; (3) which trust boundary
+moves, and which way. An honest "something" to 1 or 2 is a `decisions/` note, not a merge.
+
+**A producer with no consumer is a defect:** a frame type, capability or FFI field lands with its
+reader in the same change, or is removed.
+
+## Invariants of this repo
+
+- **`VeilStartRequest` / `VeilStartResult` are a C ABI the apps compile against:** never reorder
+  or remove fields; retired fields stay and are ignored. (Apps and core are built separately.)
+- **The SPKI pin is required on every client connection;** there is no unpinned production path.
+- **Only veil-front.** obfs4 and WebTunnel stay removed (decision `veil-front-only-retire-obfs4`).
+- **Front coordinates are not public and appear in logs only as a keyed label** (the
+  `veil-front-*` decisions above).
+
+## Build and test
 
 ```bash
 cargo test --workspace --all-features
@@ -36,65 +93,15 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo check --features ffi --target aarch64-apple-ios
 ```
 
----
+## Git and process
 
-## Key conventions
-
-- `VeilStartRequest` / `VeilStartResult` are a C ABI the apps compile against: never
-  reorder or remove fields; retired fields stay and are ignored.
-- The SPKI pin is required on every client connection; there is no unpinned
-  production path.
-- Every fix carries a regression test that fails on the old code.
-
----
-## Documentation
-
-All project documentation: `~/Code/construct-docs` (Obsidian vault).
-**Authoritative map + writing rules: `~/Code/construct-docs/AGENTS.md`** (read it before contributing
-docs). The vault is a flat domain-folder structure.
-
-### Vault layout (top-level domain folders)
-
-| Folder | Holds |
-|--------|-------|
-| `overview/` | Vision, philosophy, high-level project overview |
-| `architecture/` | Service map, data flows, server infrastructure, design principles |
-| `backend/` | Server service-specific docs (auth, messaging, federation) |
-| `client/` | Client docs (iOS, Android, desktop, shared); specs in `client/specs/` |
-| `cryptocore/` | Crypto protocol specs and key management |
-| `security/` | Security model, threat model, VEIL anti-censorship |
-| `deployment/` · `testing/` · `compliance/` · `whitepaper/` | as named |
-| `sessions/` | Session logs (this is where your session notes go) |
-| `decisions/` | Architectural decision records (ADRs) |
-| `_archive/` | Superseded docs — read-only |
-
-### Where to save durable reasoning
-
-After any session involving architectural changes, design decisions, API changes, or non-obvious implementation choices:
-
-1. **Always** create or update `sessions/YYYY-MM-DD-<topic>.md`.
-2. **Always** fill in `# Why` — reasoning, alternatives considered, why rejected. Most important section.
-3. If the decision constrains future work, also create `decisions/<topic>.md`.
-4. Session notes: plain markdown, no YAML frontmatter; `[[wikilinks]]` to other notes are welcome.
-
-Required note sections: `# Context`, `# What Changed`, `# Why`, `# Intended Outcome`, `# Decisions`, `# Open Questions`
-
-### Operational logging
-
-Append a one-line entry to `log.md` after writing a note.
-Format: `[YYYY-MM-DD HH:MM] note | <topic>`
-
-## Git workflow (branch + PR only)
-
-**Never commit on `main`.** Every change goes on a topic branch cut from an up-to-date `main`
-(`feat|fix|docs|chore|test/<topic>`) and lands through a GitHub pull request. Agents push and
-open the PR only when asked.
-
-`main` is what a release is built from, so it moves only by a reviewed merge. From 2026-09-11 to
-2026-10-01 changes went straight to `main` across the construct-* repos — two people on the
-project made a branch per change look like ceremony. That was reversed on purpose: the habit has
-to be in place before there is a release for it to break.
-
-A commit that landed on `main` by mistake and is not pushed moves off it with
-`git branch <topic> && git reset --keep origin/main && git switch <topic>`. Pushed history is
-never rewritten.
+- **Never commit on `main`.** Topic branch (`feat|fix|docs|chore|test/<topic>`) from an up-to-date
+  `main`, PR into `main`; `main` is what a release is built from. Agents push and open the PR only
+  when asked.
+- Check `git branch --show-current` and `git status` before every commit: other sessions share the
+  tree. Never `checkout -- .`, `restore .`, `reset --hard` or `stash`; name the files. Never
+  rewrite pushed history. A commit made on `main` by mistake and not pushed moves with
+  `git branch <topic> && git reset --keep origin/main && git switch <topic>`.
+- The vault holds all documentation. After work: progress into the task note, a
+  `decisions/<slug>.md` for anything that constrains future work, one line in `log.md`
+  (`[YYYY-MM-DD HH:MM] note | <topic>`).
