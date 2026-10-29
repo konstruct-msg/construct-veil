@@ -99,8 +99,24 @@ pub fn parse_spki_pin(spki_hex: &str) -> Result<[u8; 32], String> {
     Ok(arr)
 }
 
+/// A change the embedding application makes to every client config before it dials a front.
+pub type TlsClientHook = Arc<dyn Fn(&mut ClientConfig) + Send + Sync>;
+
+static TLS_CLIENT_HOOK: std::sync::RwLock<Option<TlsClientHook>> = std::sync::RwLock::new(None);
+
+/// Install `hook`, applied to the client config of every veil-front connection from now on
+/// (`None` removes it). One per process, like the coordinator.
+///
+/// It exists for a ClientHello rustls does not build itself: an application linking a rustls
+/// with a hello rewriter (the desktop, through `maxeliseyev/rustls`) sets it here, and
+/// construct-veil keeps building against upstream rustls. The hook runs after the pin, ALPN and
+/// record cap are set; it must not replace the certificate verifier.
+pub fn set_tls_client_hook(hook: Option<TlsClientHook>) {
+    *TLS_CLIENT_HOOK.write().unwrap_or_else(|e| e.into_inner()) = hook;
+}
+
 /// The client config [`build_connector`] dials with: the profile's provider and groups,
-/// the SPKI pin (`None` = unpinned), ALPN, and the record-size cap.
+/// the SPKI pin (`None` = unpinned), ALPN, the record-size cap, then the application's hook.
 pub(crate) fn client_config(
     pin: Option<[u8; 32]>,
     profile: TlsProfile,
@@ -131,6 +147,13 @@ pub(crate) fn client_config(
     config.max_fragment_size = Some(
         construct_veil_protocol::LENGTH_BUCKETS[construct_veil_protocol::LENGTH_BUCKETS.len() - 1],
     );
+    if let Some(hook) = TLS_CLIENT_HOOK
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        hook(&mut config);
+    }
     Ok(config)
 }
 
@@ -634,5 +657,39 @@ mod key_exchange {
                 "{profile:?}"
             );
         }
+    }
+
+    /// The application's hook sees every client config built for a front, and stops seeing
+    /// them once removed. It only counts, so tests running beside it are not disturbed.
+    ///
+    /// Mutation: drop the hook call from `client_config` — the count stays put.
+    #[test]
+    fn the_application_hook_is_applied_to_every_front_config() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEEN: AtomicUsize = AtomicUsize::new(0);
+        set_tls_client_hook(Some(Arc::new(|_config: &mut ClientConfig| {
+            SEEN.fetch_add(1, Ordering::SeqCst);
+        })));
+        let before = SEEN.load(Ordering::SeqCst);
+        build_connector(
+            "localhost",
+            &"ab".repeat(32),
+            "127.0.0.1:443",
+            TlsProfile::Chrome131,
+            None,
+        )
+        .unwrap();
+        assert!(SEEN.load(Ordering::SeqCst) > before, "the hook ran");
+        set_tls_client_hook(None);
+        let after = SEEN.load(Ordering::SeqCst);
+        build_connector(
+            "localhost",
+            &"ab".repeat(32),
+            "127.0.0.1:443",
+            TlsProfile::Chrome131,
+            None,
+        )
+        .unwrap();
+        assert_eq!(SEEN.load(Ordering::SeqCst), after, "removed, it does not");
     }
 }
