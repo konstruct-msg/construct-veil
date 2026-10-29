@@ -44,3 +44,7 @@ pub mod veil;
 
 #[cfg(feature = "tls")]
 pub use tls_fingerprint::TlsProfile;
+
+/// How an embedding application changes the TLS client config of veil-front connections.
+#[cfg(feature = "coordinator")]
+pub use tls_pinned::{TlsClientHook, set_tls_client_hook};
