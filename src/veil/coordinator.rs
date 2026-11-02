@@ -153,8 +153,7 @@ impl VeilCoordinator {
 
         info!(
             target: "ice::coordinator",
-            "session started  fingerprint={} methods={:?}",
-            fingerprint.short_hex(),
+            "session started  methods={:?}",
             allowed_methods.iter_allowed().collect::<Vec<_>>(),
         );
 
@@ -319,8 +318,7 @@ impl VeilCoordinator {
             VeilEffect::StartProbes { methods, .. } => {
                 info!(
                     target: "ice::fsm",
-                    "probing started  fingerprint={} methods={:?} reason=fresh",
-                    fingerprint.short_hex(),
+                    "probing started  methods={:?} reason=fresh",
                     methods,
                 );
 
@@ -1177,7 +1175,7 @@ mod tests {
     async fn coordinator(config: VeilConfig) -> VeilCoordinator {
         VeilCoordinator::new(
             config,
-            PersistentScores::open(":memory:", 50).await.unwrap(),
+            PersistentScores::open(":memory:", 50, None).await.unwrap(),
         )
     }
 

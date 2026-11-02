@@ -80,15 +80,6 @@ impl NetworkFingerprint {
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
-
-    /// Short hex display (first 4 bytes).
-    pub fn short_hex(&self) -> String {
-        self.bytes
-            .iter()
-            .take(4)
-            .map(|b| format!("{:02x}", b))
-            .collect()
-    }
 }
 
 impl Default for NetworkFingerprint {

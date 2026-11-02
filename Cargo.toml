@@ -27,11 +27,17 @@ name = "construct_veil"
 path = "src/lib.rs"
 crate-type = ["staticlib", "rlib"]
 
+[[example]]
+name = "veil_front_probe"
+path = "examples/veil_front_probe.rs"
+required-features = ["coordinator", "utls"]
+
 [dependencies]
 # Shared veil-front protocol types (tickets, auth, framing)
 construct-veil-protocol = { path = "crates/construct-veil-protocol" }
 
 # Crypto
+hmac = "0.12"
 sha2 = "0.10"
 rand_chacha = "0.3"
 rand = "0.8"

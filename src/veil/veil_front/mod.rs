@@ -13,5 +13,5 @@ pub mod session;
 
 pub use construct_veil_protocol::LENGTH_BUCKETS;
 pub use padding::mode0_front::{FrontChaffScheduler, PayloadQueue, WriteStrategy};
-pub use padding::{ChaffScheduler, PaddingMode, bucket_size};
+pub use padding::{ChaffScheduler, bucket_size};
 pub use session::{VeilFrontDown, VeilFrontSession, VeilFrontUp};

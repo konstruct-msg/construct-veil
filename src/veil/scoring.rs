@@ -38,6 +38,9 @@ use crate::veil::fsm::{MethodId, NetworkFingerprint, ScoreEntry, ScoreLookup, Sc
 pub struct PersistentScores {
     pool: SqlitePool,
     max_fingerprints: usize,
+    /// The caller's device key (Keychain/Keystore) that keys the fingerprint
+    /// hash. `None` (in-memory, tests) falls back to a bare SHA-256.
+    scoring_key: Option<[u8; 32]>,
 }
 
 impl PersistentScores {
@@ -48,6 +51,7 @@ impl PersistentScores {
     pub async fn open(
         path: impl AsRef<Path>,
         max_fingerprints: usize,
+        scoring_key: Option<[u8; 32]>,
     ) -> Result<Self, ScoringError> {
         let path_ref = path.as_ref();
         if path_ref.as_os_str() == ":memory:" {
@@ -59,6 +63,7 @@ impl PersistentScores {
             return Ok(Self {
                 pool,
                 max_fingerprints,
+                scoring_key,
             });
         }
 
@@ -66,6 +71,7 @@ impl PersistentScores {
             Ok(pool) => Ok(Self {
                 pool,
                 max_fingerprints,
+                scoring_key,
             }),
             Err(first) => {
                 // The file exists but is not a usable database (truncated write,
@@ -86,6 +92,7 @@ impl PersistentScores {
                 Ok(Self {
                     pool,
                     max_fingerprints,
+                    scoring_key,
                 })
             }
         }
@@ -121,7 +128,36 @@ impl PersistentScores {
 
     /// Open with default max_fingerprints (50).
     pub async fn open_default(path: impl AsRef<Path>) -> Result<Self, ScoringError> {
-        Self::open(path, 50).await
+        Self::open(path, 50, None).await
+    }
+
+    /// The fingerprint's storage form: HMAC-SHA256 under the caller's key when one
+    /// was handed over, else a bare SHA-256 (the in-memory / test path, where
+    /// nothing is persisted). With a key, a scores DB read without it is a list of
+    /// opaque blobs, not a network history.
+    fn hash_fp(&self, fp: &[u8]) -> Vec<u8> {
+        use hmac::{Hmac, Mac};
+        use sha2::{Digest, Sha256};
+        match &self.scoring_key {
+            Some(key) => {
+                let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("32-byte key");
+                mac.update(fp);
+                mac.finalize().into_bytes().to_vec()
+            }
+            None => Sha256::digest(fp).to_vec(),
+        }
+    }
+
+    /// A network-visit time, rounded to the hour: a precise "when was I on this
+    /// network" is a history the scoring store has no reason to keep. The block
+    /// TTL is 7 days, so an hour of slack does not change any verdict.
+    fn coarse_now() -> i64 {
+        const HOUR: i64 = 3600;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        now / HOUR * HOUR
     }
 
     /// Run schema migrations. Idempotent — safe to call on every startup.
@@ -156,7 +192,8 @@ impl PersistentScores {
         method: MethodId,
         outcome: ScoreOutcome,
     ) -> Result<(), ScoringError> {
-        let fp = fingerprint.as_bytes();
+        let fp_hash = self.hash_fp(fingerprint.as_bytes());
+        let fp = fp_hash.as_slice();
 
         match outcome {
             ScoreOutcome::Success { latency_ms } => {
@@ -177,10 +214,7 @@ impl PersistentScores {
                     ((current_latency as f64 * 0.7) + (latency_ms as f64 * 0.3)).round() as u32
                 };
 
-                let now = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
+                let now = Self::coarse_now();
 
                 sqlx::query(
                     r#"
@@ -206,10 +240,7 @@ impl PersistentScores {
             }
 
             ScoreOutcome::Failure { reason } => {
-                let now = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
+                let now = Self::coarse_now();
 
                 let is_hard_block =
                     reason == crate::veil::fsm::ProbeFailureReason::FingerprintBlocked;
@@ -276,7 +307,7 @@ impl PersistentScores {
             FROM scores WHERE fingerprint = ? AND method = ?
             "#,
         )
-        .bind(fingerprint.as_bytes())
+        .bind(self.hash_fp(fingerprint.as_bytes()).as_slice())
         .bind(method as i64)
         .fetch_optional(&self.pool)
         .await
@@ -340,7 +371,7 @@ impl PersistentScores {
             FROM scores WHERE fingerprint = ? AND method = ?
             "#,
         )
-        .bind(fingerprint.as_bytes())
+        .bind(self.hash_fp(fingerprint.as_bytes()).as_slice())
         .bind(method as i64)
         .fetch_optional(&self.pool)
         .await
@@ -420,7 +451,7 @@ impl PersistentScores {
             FROM scores WHERE fingerprint = ?
             "#,
         )
-        .bind(fingerprint.as_bytes())
+        .bind(self.hash_fp(fingerprint.as_bytes()).as_slice())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| ScoringError::DbError(format!("query failed: {e}")))?;
@@ -563,7 +594,7 @@ mod tests {
         let path = temp_path("corrupt");
         std::fs::write(&path, b"this is not a sqlite database, not even close\n").unwrap();
 
-        let scores = PersistentScores::open(&path, 50)
+        let scores = PersistentScores::open(&path, 50, None)
             .await
             .expect("corrupt file should be recreated");
         scores
@@ -585,7 +616,7 @@ mod tests {
     /// Mutation: restore the plain `as u8` casts.
     #[tokio::test]
     async fn consecutive_failures_saturate_instead_of_wrapping() {
-        let scores = PersistentScores::open(":memory:", 50).await.unwrap();
+        let scores = PersistentScores::open(":memory:", 50, None).await.unwrap();
         let now = SystemTime::now();
         let now_secs = now
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -595,7 +626,7 @@ mod tests {
             "INSERT INTO scores (fingerprint, method, failures, blocked_at, consecutive_failures)
              VALUES (?, ?, 256, ?, 256)",
         )
-        .bind(fp().as_bytes())
+        .bind(scores.hash_fp(fp().as_bytes()).as_slice())
         .bind(MethodId::VeilFront as i64)
         .bind(now_secs)
         .execute(&scores.pool)
@@ -626,9 +657,32 @@ mod tests {
     /// Fixture check for the coordinator tests: a closed store fails every query.
     #[tokio::test]
     async fn a_closed_store_fails_queries() {
-        let scores = PersistentScores::open(":memory:", 50).await.unwrap();
+        let scores = PersistentScores::open(":memory:", 50, None).await.unwrap();
         scores.close().await;
         assert!(scores.get_score(&fp(), MethodId::VeilFront).await.is_err());
         assert!(CachedScoreLookup::build(&scores, &fp()).await.is_err());
+    }
+
+    /// The stored fingerprint is a hash, never the raw bytes the caller computed
+    /// from SSID/BSSID: a scores DB without the key is opaque blobs, not a network
+    /// history. Mutation: store `fingerprint.as_bytes()` raw — this reddens.
+    #[tokio::test]
+    async fn the_stored_fingerprint_is_hashed_not_raw() {
+        let keyed = PersistentScores::open(":memory:", 50, Some([7u8; 32]))
+            .await
+            .unwrap();
+        keyed
+            .record(
+                &fp(),
+                MethodId::VeilFront,
+                ScoreOutcome::Success { latency_ms: 12 },
+            )
+            .await
+            .unwrap();
+        let stored: Vec<u8> = sqlx::query_scalar("SELECT fingerprint FROM scores LIMIT 1")
+            .fetch_one(&keyed.pool)
+            .await
+            .unwrap();
+        assert_ne!(stored, fp().as_bytes());
     }
 }

@@ -20,6 +20,7 @@
 //! This mode is designed to be mobile-safe. If the on-device benchmark
 //! shows >20ms median latency penalty, Mode 0 must NOT be the mobile default.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -249,7 +250,7 @@ impl ChaffScheduler for FrontChaffScheduler {
 /// The scheduler checks this queue first — if there's payload, no chaff.
 pub struct PayloadQueue {
     /// Pending DATA frames waiting to be written.
-    frames: Vec<Frame>,
+    frames: VecDeque<Frame>,
     /// Total bytes queued (for metrics).
     queued_bytes: u64,
 }
@@ -258,7 +259,7 @@ impl PayloadQueue {
     /// Create an empty payload queue.
     pub fn new() -> Self {
         Self {
-            frames: Vec::with_capacity(16),
+            frames: VecDeque::with_capacity(16),
             queued_bytes: 0,
         }
     }
@@ -266,16 +267,12 @@ impl PayloadQueue {
     /// Push a DATA frame into the queue.
     pub fn push(&mut self, frame: Frame) {
         self.queued_bytes += frame.payload.len() as u64;
-        self.frames.push(frame);
+        self.frames.push_back(frame);
     }
 
     /// Pop the next DATA frame (if any).
     pub fn pop(&mut self) -> Option<Frame> {
-        if self.frames.is_empty() {
-            return None;
-        }
-        let frame = self.frames.remove(0);
-        Some(frame)
+        self.frames.pop_front()
     }
 
     /// Whether there are pending payload frames.
