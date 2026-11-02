@@ -1,60 +1,18 @@
-//! Padding modes for veil-front — shape-level defense (length bucketing, chaff, jitter).
+//! Padding for veil-front — shape-level defense (length bucketing, chaff, jitter).
 //!
 //! **Division of labor:** veil-front is a dumb byte ferry — it does shape-level
 //! defense but cannot do semantic batching of application messages. Semantic
 //! batching of presence/receipts/typing is an app-layer concern.
 //!
 //! Governing asymmetry: delay hurts an interactive app far more than bandwidth —
-//! prefer spending bytes over latency.
-//!
-//! # Modes
-//!
-//! | Mode | Name | Description | Latency | Bandwidth |
-//! |------|------|-------------|---------|-----------|
-//! | 0 | FRONT-style | Front-loaded chaff at connection start, length bucketing | ~0 | ~33% |
-//! | 1 | Idle cover | Low-rate background chaff during idle periods | negligible | low |
-//! | 2 | Constant-rate | Fixed cadence regardless of payload (desktop only) | low | high |
+//! prefer spending bytes over latency. The only mode is the front-loaded chaff in
+//! [`mode0_front`] (~0 latency, ~33% bandwidth).
 
 pub mod mode0_front;
 
 use std::time::Instant;
 
-use bytes::Bytes;
-use construct_veil_protocol::{FRAME_TYPE_CHAFF, Frame, LENGTH_BUCKETS, pick_bucket};
-
-/// Padding mode selector.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(u8)]
-pub enum PaddingMode {
-    /// Front-loaded chaff + length bucketing (mobile-safe default).
-    #[default]
-    Front = 0,
-    /// Low-rate background chaff during idle periods.
-    Idle = 1,
-    /// Constant-rate cover traffic (desktop only).
-    ConstantRate = 2,
-}
-
-impl PaddingMode {
-    /// Parse from a u8 value.
-    pub fn from_u8(val: u8) -> Option<Self> {
-        match val {
-            0 => Some(Self::Front),
-            1 => Some(Self::Idle),
-            2 => Some(Self::ConstantRate),
-            _ => None,
-        }
-    }
-
-    /// Human-readable name.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Front => "front",
-            Self::Idle => "idle",
-            Self::ConstantRate => "constant-rate",
-        }
-    }
-}
+use construct_veil_protocol::{Frame, LENGTH_BUCKETS, pick_bucket};
 
 /// Round a size up to the nearest length bucket.
 ///
@@ -105,22 +63,9 @@ pub trait ChaffScheduler: Send + 'static {
     }
 }
 
-/// Create a chaff frame with random payload, bucketed to a target size.
-pub fn make_chaff_frame(target_size: usize) -> Frame {
-    use rand::{Rng, SeedableRng};
-    use rand_chacha::ChaCha8Rng;
-
-    let mut rng = ChaCha8Rng::from_entropy();
-    let mut payload = vec![0u8; target_size];
-    rng.fill(&mut payload[..]);
-
-    Frame::new(FRAME_TYPE_CHAFF, Bytes::from(payload))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use construct_veil_protocol::FRAME_TYPE_CHAFF;
 
     #[test]
     fn bucket_size_rounds_up() {
@@ -139,21 +84,5 @@ mod tests {
     #[test]
     fn bucket_size_preserves_large() {
         assert_eq!(bucket_size(20000), 20000);
-    }
-
-    #[test]
-    fn padding_mode_from_u8() {
-        assert_eq!(PaddingMode::from_u8(0), Some(PaddingMode::Front));
-        assert_eq!(PaddingMode::from_u8(1), Some(PaddingMode::Idle));
-        assert_eq!(PaddingMode::from_u8(2), Some(PaddingMode::ConstantRate));
-        assert_eq!(PaddingMode::from_u8(3), None);
-        assert_eq!(PaddingMode::from_u8(255), None);
-    }
-
-    #[test]
-    fn chaff_frame_has_correct_type() {
-        let frame = make_chaff_frame(128);
-        assert_eq!(frame.frame_type, FRAME_TYPE_CHAFF);
-        assert_eq!(frame.payload.len(), 128);
     }
 }
