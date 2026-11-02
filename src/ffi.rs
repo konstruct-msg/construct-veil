@@ -108,6 +108,12 @@ pub struct VeilStartRequest {
     /// iOS). Never derived from or sent to the relay. NULL / empty = AUTH v3 not
     /// configured.
     pub veil_sk_hex: *const c_char,
+    /// 32-byte device key (Keychain/Keystore) that keys the scores fingerprint
+    /// hash. NULL or `scoring_key_len != 32` = no key: the fingerprint falls
+    /// back to a bare SHA-256, which is only acceptable for the in-memory path.
+    pub scoring_key: *const u8,
+    /// Length of `scoring_key` (must be 32 to be used).
+    pub scoring_key_len: usize,
 }
 
 /// Result struct returned by `veil_start`.
@@ -232,6 +238,7 @@ struct StartArgs {
     veil_front_auth_v3: crate::veil::VeilFrontAuthV3,
     fingerprint: crate::veil::NetworkFingerprint,
     allowed_methods: crate::veil::MethodSet,
+    scoring_key: Option<[u8; 32]>,
 }
 
 /// Read and validate the request; `Err` is the reason for `veil_last_error`.
@@ -303,6 +310,14 @@ unsafe fn read_start_request(req: &VeilStartRequest) -> Result<StartArgs, String
         NetworkFingerprint::default()
     };
     let allowed_methods = MethodSet::from_bitmask(req.allowed_methods);
+    let scoring_key = if !req.scoring_key.is_null() && req.scoring_key_len == 32 {
+        let bytes = unsafe { std::slice::from_raw_parts(req.scoring_key, 32) };
+        let mut key = [0u8; 32];
+        key.copy_from_slice(bytes);
+        Some(key)
+    } else {
+        None
+    };
 
     Ok(StartArgs {
         relay_addr,
@@ -312,6 +327,7 @@ unsafe fn read_start_request(req: &VeilStartRequest) -> Result<StartArgs, String
         veil_front_auth_v3,
         fingerprint,
         allowed_methods,
+        scoring_key,
     })
 }
 
@@ -362,7 +378,7 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
                     let path_str =
                         unsafe { CStr::from_ptr(req.scores_path).to_str().ok().unwrap_or("") };
                     if !path_str.is_empty() {
-                        PersistentScores::open_default(path_str)
+                        PersistentScores::open(path_str, 50, args.scoring_key)
                             .await
                             .map_err(|e| format!("scores open failed: {e}"))?
                     } else {
@@ -370,7 +386,7 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
                     }
                 } else {
                     // In-memory SQLite for testing.
-                    PersistentScores::open_default(":memory:")
+                    PersistentScores::open(":memory:", 50, None)
                         .await
                         .map_err(|e| format!("scores open (memory) failed: {e}"))?
                 };
@@ -566,6 +582,8 @@ mod tests {
             veil_front_ticket_b64: std::ptr::null(),
             veil_capability_v2_b64: std::ptr::null(),
             veil_sk_hex: std::ptr::null(),
+            scoring_key: std::ptr::null(),
+            scoring_key_len: 0,
         };
         let reason = unsafe { read_start_request(&req) }
             .err()

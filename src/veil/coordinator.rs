@@ -1175,7 +1175,7 @@ mod tests {
     async fn coordinator(config: VeilConfig) -> VeilCoordinator {
         VeilCoordinator::new(
             config,
-            PersistentScores::open(":memory:", 50).await.unwrap(),
+            PersistentScores::open(":memory:", 50, None).await.unwrap(),
         )
     }
 
