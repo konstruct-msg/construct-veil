@@ -48,6 +48,10 @@ Canonical source: `~/Code/construct-docs/decisions/rules-from-the-first-year.md`
 
 1. **Prior art first.** Before any obfuscation or transport mechanism, write down what Tor,
    V2Ray / Reality, Snowflake or QUIC-based circumvention do and why we deviate.
+   Read them, do not recall them: the note links the code or spec it read, answers who may use
+   theirs and what a refused party sees, lists what in ours is our own, why, and what would let us
+   remove it, and gives the share of real traffic each new condition or exception affects.
+   `~/Code/construct-docs/scripts/check_prior_art.py` refuses a decision note without the link.
 2. **The core decides.** Session and crypto decisions belong to `construct-core`; veil moves bytes
    and decides only transport (which front, scoring, failover). It never touches ratchet or
    session state.
