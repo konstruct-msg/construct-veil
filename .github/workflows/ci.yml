@@ -78,7 +78,7 @@ jobs:
   # ── 2. macOS FFI build (matches iOS platform SDK) ────────────────────────
   build-macos:
     name: macOS FFI Build
-    runs-on: macos-14
+    runs-on: macos-15
     needs: test
     steps:
       - uses: actions/checkout@v4
