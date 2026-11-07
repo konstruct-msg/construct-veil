@@ -35,6 +35,18 @@ See construct-docs:
 | Identity | No Construct/VEIL branding; unique brand per public front |
 | Source | Private repo / private image path (not `…/construct-veil/cover`) |
 
+### Environment passed to the cover
+
+Compose passes these to the cover container; a cover may read them for its
+canonical public hostname (absolute URLs, 301 redirects). Defaults derive from
+`DOMAIN`, so a DOMAIN-only `.env` keeps working — set them in `.env` only when
+they differ:
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `SITE_HOST` | `DOMAIN` | canonical public hostname of the cover app |
+| `FRONT_HOST` | `www.<DOMAIN>` | alias hostname that redirects to `SITE_HOST` |
+
 ### Dev without a real cover
 
 ```bash
