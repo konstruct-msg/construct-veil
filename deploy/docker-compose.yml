@@ -20,6 +20,12 @@ services:
       - "80:80"
     expose:
       - "8080"
+    environment:
+      # Covers that build absolute URLs / 301 redirects need their canonical
+      # public hostname. Default to DOMAIN so a DOMAIN-only .env keeps working;
+      # set SITE_HOST / FRONT_HOST in .env only when they differ.
+      SITE_HOST: "${SITE_HOST:-${DOMAIN}}"
+      FRONT_HOST: "${FRONT_HOST:-www.${DOMAIN}}"
     volumes:
       - certbot-www:/var/www/certbot:ro
 
