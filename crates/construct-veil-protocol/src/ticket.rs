@@ -10,8 +10,10 @@
 //!   ticket's validity window;
 //! - B1 (`AuthRecordV3`): `ticket_id` for the capability's window, and `veil_pk`
 //!   for the lifetime of the install (`capability`);
-//! - independently of AUTH: a resumed TLS session — the relay issued the PSK
-//!   identity a reconnect presents (todo 311).
+//! - independently of AUTH, a resumed TLS session would: the relay issued the PSK
+//!   identity a reconnect presents. No client resumes — the Rust client and
+//!   Android build a fresh TLS context per dial (`tls_pinned::resumption` keeps
+//!   it so), iOS turns resumption off (todo 311).
 //!
 //! The relay operator — or whoever compels them — therefore sees every IP one
 //! device connected from; with the issuer's `ticket_id ↔ account` row this is the

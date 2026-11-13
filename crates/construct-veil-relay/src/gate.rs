@@ -335,10 +335,11 @@ fn try_decode_auth(
             // = wildcard), issuer signature, exporter-bound authcode (constant-time).
             // No ticket store, no network.
             if rec.verify(issuer_pubkey, relay_scope, exporter, now_unix()) {
-                debug!(
-                    ticket_id = ?hex::encode(rec.capability.ticket.ticket_id),
-                    "capability (v2) valid, routing to tunnel"
-                );
+                // No identifier of the presented access in any log line, at any level: a
+                // `ticket_id` or `veil_pk` repeats on every connection of one device, and a
+                // relay log of them is that device's IP history
+                // (construct-docs decisions/veil-relay-sees-no-stable-device-id.md §3).
+                debug!("capability (v2) valid, routing to tunnel");
                 Some(GateDecision::Tunnel {
                     leftover: decode_buf,
                 })
@@ -386,8 +387,8 @@ fn try_decode_auth(
                 role_ok && rec.verify(issuer_pubkey, relay_scope, role, exporter, now_unix());
             let (user_ok, relay_ok) = (valid && role == ROLE_USER, valid && role == ROLE_RELAY);
             if valid {
+                // Verdict and role only — see the v2 branch above.
                 debug!(
-                    ticket_id = ?hex::encode(rec.capability.ticket_id),
                     role = if relay_ok { "relay" } else { "user" },
                     "capability (v3) valid, routing to tunnel"
                 );
@@ -603,6 +604,86 @@ mod tests {
         let buf = auth_v3_buf("ru-relay", ROLE_USER);
         let decision = try_decode_auth(&buf, &EXPORTER, &pubkey, "nl-relay");
         assert!(matches!(decision, Some(GateDecision::Site)));
+    }
+
+    thread_local! {
+        static THREAD_LOG: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Every log line this thread emits at TRACE while `f` runs.
+    ///
+    /// One global TRACE subscriber for the whole test binary, writing to a per-thread buffer: a
+    /// scoped (`with_default`) subscriber races the other test threads for the callsites'
+    /// cached interest and loses events at random.
+    fn gate_log(f: impl FnOnce()) -> String {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            struct W;
+            impl std::io::Write for W {
+                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                    THREAD_LOG.with(|l| l.borrow_mut().extend_from_slice(b));
+                    Ok(b.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .with_writer(|| W)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
+        });
+        THREAD_LOG.with(|l| l.borrow_mut().clear());
+        f();
+        THREAD_LOG.with(|l| String::from_utf8(l.borrow().clone()).unwrap())
+    }
+
+    #[test]
+    fn the_gate_logs_no_identifier_of_the_presented_access() {
+        // A ticket_id or veil_pk repeats on every connection of one device; logged, it is
+        // that device's IP history (decisions/veil-relay-sees-no-stable-device-id.md §3).
+        let pubkey = issuer_public_key(&SEED);
+        let mut other = EXPORTER;
+        other[0] ^= 0x01;
+        let log = gate_log(|| {
+            for buf in [
+                auth_v2_buf(""),
+                auth_v3_buf("", ROLE_USER),
+                auth_v3_buf("", ROLE_RELAY),
+            ] {
+                try_decode_auth(&buf, &EXPORTER, &pubkey, "");
+                // An invalid frame logs at warn! once a minute and at debug! otherwise: open the
+                // limiter's window, then fail twice so both lines are written.
+                INVALID_AUTH_WARN
+                    .last
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                try_decode_auth(&buf, &other, &pubkey, "");
+                try_decode_auth(&buf, &other, &pubkey, "");
+            }
+        });
+        // The capture works: both verdicts of both versions are in it.
+        for line in [
+            "capability (v2) valid",
+            "capability (v3) valid",
+            "capability (v2) invalid",
+            "capability (v3) invalid",
+        ] {
+            assert!(log.contains(line), "missing {line:?} in:\n{log}");
+        }
+        let veil_pk = SigningKey::from_bytes(&[3u8; 32])
+            .verifying_key()
+            .to_bytes();
+        for (what, bytes) in [
+            ("ticket_id", &[0x11u8; 16][..]),
+            ("auth_key", &[0x22u8; 32][..]),
+            ("veil_pk", &veil_pk[..]),
+        ] {
+            let hex = hex::encode(bytes);
+            // Eight bytes of it would already be a stable label.
+            assert!(!log.contains(&hex[..16]), "{what} in the gate log:\n{log}");
+        }
     }
 
     #[test]
