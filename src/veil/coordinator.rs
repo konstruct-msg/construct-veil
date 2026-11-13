@@ -728,7 +728,6 @@ impl VeilCoordinator {
 
     /// Handle a successful probe: transition FSM, record score, start proxy.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn handle_probe_success(
         &self,
         method: MethodId,
