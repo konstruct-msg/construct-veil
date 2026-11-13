@@ -1,8 +1,22 @@
 //! Ticket types — per-session authorisation tokens issued over the manifest channel.
 //!
-//! A ticket does **not** identify the client; it is fungible and can be used
-//! from any IP. The `ticket_id` is an opaque server-side index into the
-//! ticket store.
+//! The `ticket_id` is an opaque server-side index into the ticket store. It is
+//! random and not derived from the client's identity, but it is **not**
+//! unlinkable: the client presents the same `ticket_id` on every connection while
+//! the ticket is valid, so a relay links all of them, whatever IP each came from.
+//!
+//! # What a relay can link
+//! - this ticket (`AuthRecord`) and B2 (`AuthRecordV2`): `ticket_id`, for the
+//!   ticket's validity window;
+//! - B1 (`AuthRecordV3`): `ticket_id` for the capability's window, and `veil_pk`
+//!   for the lifetime of the install (`capability`);
+//! - independently of AUTH: a resumed TLS session — the relay issued the PSK
+//!   identity a reconnect presents (todo 311).
+//!
+//! The relay operator — or whoever compels them — therefore sees every IP one
+//! device connected from; with the issuer's `ticket_id ↔ account` row this is the
+//! account's IP history. Rule and mechanism: construct-docs
+//! `decisions/veil-relay-sees-no-stable-device-id.md`, todo 311.
 //!
 //! # Wire format (manifest channel — JSON/base64)
 //! ```text
@@ -24,8 +38,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// A veil-front ticket, issued over the authenticated manifest channel.
 ///
-/// The ticket authorises the holder to open a tunnel. It is **not** bound to
-/// any specific client — fungibility prevents correlation across IPs.
+/// The ticket authorises the holder to open a tunnel. It is not bound to a
+/// client key, but its `ticket_id` repeats on every connection that presents it,
+/// so it links those connections across IPs (see the module docs).
 #[derive(Debug, Clone)]
 pub struct Ticket {
     /// Opaque 16-byte index into the server ticket store.

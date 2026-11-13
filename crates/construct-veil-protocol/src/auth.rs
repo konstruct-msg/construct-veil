@@ -13,7 +13,9 @@
 //! - Secret never on the wire — `auth_key` is only used as HMAC key
 //! - **Replay-proof by construction** — `exp` differs every TLS session, so
 //!   a captured `auth_rec` is useless on any new connection (stateless!)
-//! - Ticket is fungible — `ticket_id` does not identify the client
+//! - `ticket_id` is not derived from the client's identity, but it is sent on
+//!   every connection while the ticket is valid: a relay links those connections
+//!   across IPs (see `ticket` module docs, "What a relay can link")
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use hmac::{Hmac, Mac};
