@@ -496,6 +496,10 @@ pub async fn run_veil_front_ferry(
 }
 
 /// Dial TLS using uTLS with SPKI pinning.
+///
+/// The connector is built per dial and never cached: a kept config would resume the TLS
+/// session, and the relay that issued the ticket links the two connections
+/// (`tls_pinned::resumption`).
 async fn dial_utls_tcp(
     tcp: TcpStream,
     tls_sni: &str,

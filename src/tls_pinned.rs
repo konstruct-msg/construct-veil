@@ -693,3 +693,61 @@ mod key_exchange {
         assert_eq!(SEEN.load(Ordering::SeqCst), after, "removed, it does not");
     }
 }
+
+/// A veil-front client never resumes a TLS session. The relay issues the tickets, so a
+/// resumed session names the client's previous connection to that relay operator — across
+/// an IP change, independently of AUTH (construct-docs
+/// decisions/veil-relay-sees-no-stable-device-id.md, todo 311). Every dial builds its own
+/// [`client_config`] (`dial_utls_tcp` → [`build_connector`]) and with it its own session
+/// state; the default `Resumption` stays, because `Resumption::disabled()` drops the
+/// `session_ticket` extension from the ClientHello, which is a fingerprint.
+#[cfg(test)]
+mod resumption {
+    use super::harness::{handshake, pin_of, server_with};
+    use super::*;
+    use rustls::HandshakeKind;
+    use rustls::version::TLS13;
+
+    /// Handshake, then deliver what the server writes after it (TLS 1.3 tickets), and
+    /// say how the server saw the handshake.
+    fn connect(client: Arc<ClientConfig>, server: Arc<rustls::ServerConfig>) -> HandshakeKind {
+        let (mut client, mut srv) = handshake(client, server).expect("handshake");
+        let mut buf = Vec::new();
+        srv.write_tls(&mut buf).unwrap();
+        client.read_tls(&mut &buf[..]).unwrap();
+        client.process_new_packets().unwrap();
+        srv.handshake_kind().expect("handshake done")
+    }
+
+    fn fixture() -> (Arc<rustls::ServerConfig>, [u8; 32]) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let pin = parse_spki_pin(&pin_of(cert.cert.der())).unwrap();
+        // rustls's default server: stateful session cache, two TLS 1.3 tickets — what the
+        // relay runs (`construct-veil-relay/src/tls.rs`).
+        let server = server_with(
+            cert.cert.der().clone(),
+            cert.key_pair.serialize_der(),
+            &[&TLS13],
+        );
+        (server, pin)
+    }
+
+    #[test]
+    fn each_dial_starts_a_full_handshake() {
+        let (server, pin) = fixture();
+        for _ in 0..3 {
+            let client = Arc::new(client_config(Some(pin), TlsProfile::Chrome131, None).unwrap());
+            assert_eq!(connect(client, server.clone()), HandshakeKind::Full);
+        }
+    }
+
+    /// The control: one config kept across dials does resume against this server, so the
+    /// test above would see a resumption if a dial reused its predecessor's state.
+    #[test]
+    fn a_config_kept_across_dials_would_resume() {
+        let (server, pin) = fixture();
+        let client = Arc::new(client_config(Some(pin), TlsProfile::Chrome131, None).unwrap());
+        assert_eq!(connect(client.clone(), server.clone()), HandshakeKind::Full);
+        assert_eq!(connect(client, server), HandshakeKind::Resumed);
+    }
+}
