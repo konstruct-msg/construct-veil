@@ -21,7 +21,10 @@
 //!
 //! **B1 — key-bound capability** (`CapabilityV2`): removes that residual trust by
 //! binding the capability to the holder's `veil_pk` and having the holder sign the
-//! exporter (`AuthRecordV3`) instead of presenting a shared secret. Also adds a
+//! exporter (`AuthRecordV3`) instead of presenting a shared secret. It does not
+//! remove linkability: `veil_pk` is one key per install, so a relay links every
+//! connection of that install across IPs (see `ticket` module docs, "What a relay
+//! can link"; todo 311). Also adds a
 //! `role` field (`ROLE_USER` / `ROLE_RELAY`) so a capability minted for an end-user
 //! can never be presented as a chaining-relay capability (or vice versa) — needed
 //! because relay chaining (`decisions/veil-relay-topology.md` §3) makes a relay a
