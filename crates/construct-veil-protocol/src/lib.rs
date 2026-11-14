@@ -32,6 +32,7 @@ mod auth;
 mod capability;
 mod framing;
 pub mod ticket;
+mod token;
 mod varint;
 
 #[cfg(test)]
@@ -41,6 +42,7 @@ pub use auth::*;
 pub use capability::*;
 pub use framing::*;
 pub use ticket::*;
+pub use token::*;
 pub use varint::*;
 
 // ── Wire protocol constants ────────────────────────────────────────────────
@@ -88,3 +90,10 @@ pub const FRAME_TYPE_AUTH_V2: u8 = 0x03;
 /// Coexists with `FRAME_TYPE_AUTH_V2` (no flag-day); v2 retires once all live
 /// capabilities have rolled over. See `capability` module + ticket ADR B1.
 pub const FRAME_TYPE_AUTH_V3: u8 = 0x04;
+
+/// Frame type: AUTH v4 — an epoch-key certificate, a one-time blind-signed token and
+/// the token's signature over the TLS exporter (`token` module). Nothing in it
+/// repeats between two connections of one device except the certificate, which the
+/// whole pool shares (construct-docs `decisions/veil-relay-sees-no-stable-device-id.md`
+/// §5). Accepted beside v3 until every user client has moved.
+pub const FRAME_TYPE_AUTH_V4: u8 = 0x05;

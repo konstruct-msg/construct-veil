@@ -15,6 +15,15 @@ ed25519-dalek = "2"
 zeroize = { version = "1.7", features = ["derive"] }
 thiserror = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
+# AUTH v4 blind tokens: RFC 9474 RSABSSA-SHA384-PSS-Randomized (token module, todo 311).
+blind-rsa-signatures = { version = "=0.18.0", default-features = false }
+# TEMPORARY: blind-rsa-signatures 0.18.0 does not build against rsa 0.10.0 (its `pbrsa`
+# module, which we do not use, targets the 0.10.0-rc trait shapes). Remove this pin once a
+# release builds against rsa >= 0.10.0; `cargo audit` flags rc.18 (RUSTSEC-2023-0071 lists
+# `>= 0.10.0` as patched) until then. Only the issuer's blind_sign uses the private key.
+rsa = { version = "=0.10.0-rc.18", default-features = false }
+# rc.18 does not build against pkcs1 0.8.0 either; same end condition as the rsa pin.
+pkcs1 = { version = "=0.8.0-rc.4", default-features = false }
 
 [features]
 rand = ["dep:rand"]
