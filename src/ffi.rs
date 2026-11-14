@@ -178,6 +178,13 @@ pub extern "C" fn veil_front_ferry_fd(
         // Adopt both fds first so every return path closes them (unconditional owner).
         let std_local = unsafe { std::net::TcpStream::from_raw_fd(local_fd) };
         let std_relay = unsafe { std::os::unix::net::UnixStream::from_raw_fd(relay_fd) };
+        // A write to either after its peer closed — gRPC dropping its connection, or the host
+        // tearing the session down — raises SIGPIPE, which ends a host app (only a Rust `main`
+        // ignores it). std sets SO_NOSIGPIPE on sockets it creates; these the host created.
+        // tests/ferry_sigpipe.rs; todo 313.
+        if !no_sigpipe(local_fd) || !no_sigpipe(relay_fd) {
+            return -1;
+        }
 
         if exporter_ptr.is_null() || exporter_len != EXPORTER_LEN {
             return -1;
@@ -227,6 +234,28 @@ pub extern "C" fn veil_front_ferry_fd(
             Err(()) => -1,
         }
     })
+}
+
+/// Turn SIGPIPE off for writes on `fd` (Darwin's per-socket SO_NOSIGPIPE). Elsewhere a no-op:
+/// Linux has no such option, and std/mio send with MSG_NOSIGNAL on TCP sockets.
+#[cfg(target_vendor = "apple")]
+fn no_sigpipe(fd: i32) -> bool {
+    let on: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_NOSIGPIPE,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    rc == 0
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn no_sigpipe(_fd: i32) -> bool {
+    true
 }
 
 /// What `veil_start` reads out of a [`VeilStartRequest`].
