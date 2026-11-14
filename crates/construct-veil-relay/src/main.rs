@@ -23,6 +23,7 @@ mod gate;
 mod site;
 mod tls;
 mod tunnel;
+mod tunnel_stats;
 mod upstream_tls;
 
 use std::collections::HashMap;
@@ -341,8 +342,10 @@ impl ConnStats {
         let shed_per_ip = self.shed_per_ip.swap(0, Ordering::Relaxed);
         let tunnels = gate::take_tunnels_admitted();
         let auth_after_second_read = gate::take_tunnels_after_second_read();
+        let open = tunnel_stats::take();
 
-        if completed
+        // A minute with a tunnel open is worth a line even if nothing else happened in it.
+        let quiet = completed
             | handshake_timeout
             | handshake_failed
             | handler_error
@@ -350,8 +353,8 @@ impl ConnStats {
             | shed_per_ip
             | tunnels
             | auth_after_second_read
-            == 0
-        {
+            == 0;
+        if quiet && open.is_idle() {
             return;
         }
 
@@ -365,6 +368,11 @@ impl ConnStats {
             shed_per_ip,
             tunnels,
             auth_after_second_read,
+            open = open.open,
+            open_peak = open.open_peak,
+            closed_lt_1m = open.closed_lt_1m,
+            closed_lt_10m = open.closed_lt_10m,
+            closed_ge_10m = open.closed_ge_10m,
             "connection summary"
         );
     }
@@ -752,6 +760,8 @@ where
 {
     match result {
         GateResult::Tunnel { stream, leftover } => {
+            // Counted while the tunnel lives, its lifetime recorded on any exit (tunnel_stats).
+            let _open = tunnel_stats::OpenTunnel::open();
             if let Some(cfg) = chain_config {
                 // Chain relay mode — ferry through the upstream relay instead
                 // of a local backend (decisions/veil-relay-topology.md §3).
