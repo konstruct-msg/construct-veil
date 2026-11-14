@@ -10,6 +10,9 @@
 //!   ticket's validity window;
 //! - B1 (`AuthRecordV3`): `ticket_id` for the capability's window, and `veil_pk`
 //!   for the lifetime of the install (`capability`);
+//! - AUTH v4 (`AuthRecordV4`, `token` module): nothing a device does not share with its
+//!   pool — one token per connection, blind-signed; a client out of tokens reuses its
+//!   last one, and those connections are linkable by it;
 //! - independently of AUTH, a resumed TLS session would: the relay issued the PSK
 //!   identity a reconnect presents. No client resumes — the Rust client and
 //!   Android build a fresh TLS context per dial (`tls_pinned::resumption` keeps

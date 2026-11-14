@@ -37,8 +37,8 @@ use tokio_util::codec::{Decoder, Encoder};
 
 use crate::varint::{Varint, decode_varint_checked, encode_varint};
 use crate::{
-    FRAME_TYPE_AUTH, FRAME_TYPE_AUTH_V2, FRAME_TYPE_AUTH_V3, FRAME_TYPE_CHAFF, FRAME_TYPE_DATA,
-    WIRE_VER,
+    FRAME_TYPE_AUTH, FRAME_TYPE_AUTH_V2, FRAME_TYPE_AUTH_V3, FRAME_TYPE_AUTH_V4, FRAME_TYPE_CHAFF,
+    FRAME_TYPE_DATA, WIRE_VER,
 };
 
 /// Default maximum frame payload size (1 MiB).
@@ -181,6 +181,16 @@ impl Frame {
         }
     }
 
+    /// Create an AUTH v4 frame carrying a blind-signed one-time token.
+    ///
+    /// The payload is `cert_blob || token || client_sig[64]` (see `AuthRecordV4`).
+    pub fn auth_v4(payload: Bytes) -> Self {
+        Self {
+            frame_type: FRAME_TYPE_AUTH_V4,
+            payload,
+        }
+    }
+
     /// Check if this is an AUTH frame.
     pub fn is_auth(&self) -> bool {
         self.frame_type == FRAME_TYPE_AUTH
@@ -194,6 +204,11 @@ impl Frame {
     /// Check if this is an AUTH v3 (key-bound capability) frame.
     pub fn is_auth_v3(&self) -> bool {
         self.frame_type == FRAME_TYPE_AUTH_V3
+    }
+
+    /// Check if this is an AUTH v4 (blind-signed token) frame.
+    pub fn is_auth_v4(&self) -> bool {
+        self.frame_type == FRAME_TYPE_AUTH_V4
     }
 
     /// Check if this is a DATA frame.
@@ -556,6 +571,16 @@ mod tests {
 
         assert!(Frame::auth_v3(Bytes::new()).is_auth_v3());
         assert!(!Frame::auth_v3(Bytes::new()).is_auth_v2());
+        assert!(Frame::auth_v4(Bytes::new()).is_auth_v4());
+        for other in [
+            Frame::auth_v2(Bytes::new()),
+            Frame::auth_v3(Bytes::new()),
+            Frame::data(Bytes::new()),
+        ] {
+            assert!(!other.is_auth_v4());
+        }
+        assert!(!Frame::auth_v4(Bytes::new()).is_auth_v3());
+        assert_eq!(Frame::auth_v4(Bytes::new()).frame_type, 0x05);
     }
 
     #[test]

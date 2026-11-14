@@ -25,8 +25,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::BytesMut;
 use construct_veil_protocol::{
-    AuthRecordV2, AuthRecordV3, EXPORTER_LABEL, ROLE_RELAY, ROLE_USER, VeilFrontCodec,
-    scope_matches,
+    AuthRecordV2, AuthRecordV3, AuthRecordV4, EXPORTER_LABEL, ROLE_RELAY, ROLE_USER,
+    VeilFrontCodec, scope_matches,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -416,6 +416,39 @@ fn try_decode_auth(
                 Some(GateDecision::Site)
             }
         }
+        Ok(Some(frame)) if frame.is_auth_v4() => {
+            // Epoch-key certificate + one-time blind-signed token + the token's signature over
+            // the exporter. Nothing in it repeats between two connections of one device except
+            // the pool's certificate (decisions/veil-relay-sees-no-stable-device-id.md §5).
+            // User clients only: a chaining relay keeps its key-bound v3 capability.
+            let Some(rec) = AuthRecordV4::decode_payload(&frame.payload) else {
+                debug!("malformed AUTH v4 payload, routing to site");
+                return Some(GateDecision::Site);
+            };
+            match rec.verify(issuer_pubkey, relay_scope, exporter, now_unix()) {
+                Ok(()) => {
+                    // Verdict only — see the v2 branch above.
+                    debug!("token (v4) valid, routing to tunnel");
+                    Some(GateDecision::Tunnel {
+                        leftover: decode_buf,
+                    })
+                }
+                Err(reason) => {
+                    // `reason` names the failed check, never a presented value.
+                    if let Some(suppressed) = INVALID_AUTH_WARN.admit(now_unix()) {
+                        warn!(
+                            exp = %exp_h6(exporter),
+                            %reason,
+                            suppressed,
+                            "token (v4) invalid, routing to site"
+                        );
+                    } else {
+                        debug!(exp = %exp_h6(exporter), %reason, "token (v4) invalid");
+                    }
+                    Some(GateDecision::Site)
+                }
+            }
+        }
         Ok(Some(frame)) => {
             debug!(
                 frame_type = frame.frame_type,
@@ -469,8 +502,8 @@ mod tests {
     use super::*;
     use construct_veil_protocol::ticket::{AuthKey, Ticket};
     use construct_veil_protocol::{
-        AuthRecordV2, AuthRecordV3, Capability, CapabilityV2, Frame, ROLE_RELAY, ROLE_USER,
-        issuer_public_key,
+        AccessToken, AuthRecordV2, AuthRecordV3, AuthRecordV4, Capability, CapabilityV2, EpochKey,
+        Frame, ROLE_RELAY, ROLE_USER, TokenRequest, issuer_public_key,
     };
     use ed25519_dalek::SigningKey;
     use tokio_util::codec::Encoder;
@@ -517,6 +550,73 @@ mod tests {
             .encode(Frame::auth_v3(rec.encode_payload()), &mut buf)
             .unwrap();
         buf
+    }
+
+    /// One AUTH v4 token for `scope`, its epoch key certified by SEED (test fixture key).
+    fn v4_token(scope: &str) -> AccessToken {
+        let key = EpochKey::from_pkcs8_der(
+            include_bytes!("../../construct-veil-protocol/tests/fixtures/token_key_a.p8.der"),
+            0,
+            u64::MAX,
+            scope.to_string(),
+            &SEED,
+        )
+        .unwrap();
+        let (req, blinded) = TokenRequest::new(key.cert(), &issuer_public_key(&SEED)).unwrap();
+        req.finalize(&key.blind_sign(&blinded).unwrap()).unwrap()
+    }
+
+    /// A wire buffer holding one AUTH v4 frame spending `token` on EXPORTER.
+    fn auth_v4_buf(token: &AccessToken) -> BytesMut {
+        let rec = AuthRecordV4::from_token(token, &EXPORTER);
+        let mut buf = BytesMut::new();
+        VeilFrontCodec::default()
+            .encode(Frame::auth_v4(rec.encode_payload()), &mut buf)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn gate_accepts_a_v4_token_and_keeps_what_follows_it() {
+        let pubkey = issuer_public_key(&SEED);
+        let mut buf = auth_v4_buf(&v4_token(""));
+        buf.extend_from_slice(b"PRI * HTTP/2.0");
+        match try_decode_auth(&buf, &EXPORTER, &pubkey, "") {
+            Some(GateDecision::Tunnel { leftover }) => assert_eq!(&leftover[..], b"PRI * HTTP/2.0"),
+            _ => panic!("valid v4 token not tunnelled"),
+        }
+    }
+
+    #[test]
+    fn gate_rejects_v4_wrong_issuer_exporter_scope_and_garbage() {
+        let pubkey = issuer_public_key(&SEED);
+        let site = |buf: &BytesMut, exporter: &[u8; 32], issuer: &[u8; 32], scope: &str| {
+            matches!(
+                try_decode_auth(buf, exporter, issuer, scope),
+                Some(GateDecision::Site)
+            )
+        };
+        let buf = auth_v4_buf(&v4_token("ru-relay"));
+        assert!(
+            !site(&buf, &EXPORTER, &pubkey, "ru-relay"),
+            "baseline: valid"
+        );
+        assert!(site(
+            &buf,
+            &EXPORTER,
+            &issuer_public_key(&[8u8; 32]),
+            "ru-relay"
+        ));
+        assert!(site(&buf, &[0xCE; 32], &pubkey, "ru-relay"));
+        assert!(site(&buf, &EXPORTER, &pubkey, "nl-relay"));
+        let mut garbage = BytesMut::new();
+        VeilFrontCodec::default()
+            .encode(
+                Frame::auth_v4(bytes::Bytes::from_static(&[0u8; 40])),
+                &mut garbage,
+            )
+            .unwrap();
+        assert!(site(&garbage, &EXPORTER, &pubkey, ""));
     }
 
     #[test]
@@ -647,11 +747,14 @@ mod tests {
         let pubkey = issuer_public_key(&SEED);
         let mut other = EXPORTER;
         other[0] ^= 0x01;
+        let token = v4_token("");
+        let spent = AuthRecordV4::from_token(&token, &EXPORTER);
         let log = gate_log(|| {
             for buf in [
                 auth_v2_buf(""),
                 auth_v3_buf("", ROLE_USER),
                 auth_v3_buf("", ROLE_RELAY),
+                auth_v4_buf(&token),
             ] {
                 try_decode_auth(&buf, &EXPORTER, &pubkey, "");
                 // An invalid frame logs at warn! once a minute and at debug! otherwise: open the
@@ -669,6 +772,8 @@ mod tests {
             "capability (v3) valid",
             "capability (v2) invalid",
             "capability (v3) invalid",
+            "token (v4) valid",
+            "token (v4) invalid",
         ] {
             assert!(log.contains(line), "missing {line:?} in:\n{log}");
         }
@@ -679,6 +784,10 @@ mod tests {
             ("ticket_id", &[0x11u8; 16][..]),
             ("auth_key", &[0x22u8; 32][..]),
             ("veil_pk", &veil_pk[..]),
+            ("v4 eph_pk", &spent.eph_pk[..]),
+            ("v4 msg_randomizer", &spent.msg_randomizer[..]),
+            ("v4 token_sig", &spent.token_sig[..]),
+            ("v4 client_sig", &spent.client_sig[..]),
         ] {
             let hex = hex::encode(bytes);
             // Eight bytes of it would already be a stable label.
