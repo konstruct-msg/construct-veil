@@ -76,8 +76,14 @@ optional = true
 version = "2"
 optional = true
 
+# SO_NOSIGPIPE on the descriptors `veil_front_ferry_fd` adopts from the host (todo 313).
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+# The SIGPIPE stand (tests/ferry_sigpipe.rs): raw sockets as the host app makes them.
+libc = "0.2"
 # Self-signed certs for the in-memory key-exchange tests (tls_pinned.rs).
 rcgen = "0.13"
 # Used only by the ignored live veil-front gRPC round-trip diagnostic test.
