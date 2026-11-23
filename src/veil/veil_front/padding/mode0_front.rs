@@ -2,23 +2,22 @@
 //!
 //! # Design
 //!
-//! - At connection start, inject a **burst of chaff frames** to mask the setup
-//!   signature (the part of the trace an attacker keys on).
-//! - Chaff rate **tapers off** over time — heavy at start, then stops.
-//! - **Payload always takes priority** — chaff is deferred if there's payload to send.
+//! - How much chaff a connection sends, and when, is **sampled for that connection**: the number
+//!   of frames, the window they fall in and each frame's moment. A fixed burst would itself be the
+//!   mark of the protocol.
+//! - Chaff is front-loaded: moments are Rayleigh-distributed in the window, then nothing.
+//! - **Payload always takes priority** — chaff due while there is payload waits.
 //! - After each payload write, a **cooldown period** prevents chaff from
 //!   head-of-line-blocking the next payload frame.
 //! - All frame sizes are **bucketed** to a small set of discrete values.
 //!
-//! # Expected overhead
+//! Prior art: FRONT (Gong & Wang, USENIX Security 2020) samples the dummy count and the window per
+//! trace and draws moments from a Rayleigh distribution. Ours are smaller — a messenger wakes often
+//! and for little — and one-sided. `construct-docs/decisions/veil-chaff-volume-is-sampled-per-connection.md`.
 //!
-//! ~33% bandwidth overhead on typical messenger traffic. Zero added latency
-//! (confirmed by on-device benchmark — not asserted).
-//!
-//! # Mobile safety
-//!
-//! This mode is designed to be mobile-safe. If the on-device benchmark
-//! shows >20ms median latency penalty, Mode 0 must NOT be the mobile default.
+//! Until 2026-11-23 every connection sent one frame per 20 ms of idle for 3 s: ~116 KB up on 129 of
+//! 168 measured sessions, whatever it carried — more than the payload of a background wake, and a
+//! constant.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -34,22 +33,23 @@ use super::{ChaffScheduler, LENGTH_BUCKETS};
 /// This prevents chaff from head-of-line-blocking payload frames.
 const PAYLOAD_COOLDOWN: Duration = Duration::from_millis(5);
 
-/// Duration of the front-loaded chaff burst (from connection start).
-const FRONT_WINDOW: Duration = Duration::from_secs(3);
+/// A connection sends this many chaff frames at most; the number is uniform from 0.
+const MAX_CHAFF_FRAMES: usize = 32;
 
-/// Maximum number of chaff frames pre-generated in the queue.
-const MAX_CHAFF_QUEUE: usize = 64;
+/// The window is uniform between these.
+const MIN_WINDOW: Duration = Duration::from_secs(1);
+const MAX_WINDOW: Duration = Duration::from_secs(4);
 
 /// FRONT-style chaff scheduler.
 ///
-/// Injects chaff frames at the start of the connection, then tapers off.
+/// Injects chaff frames at the start of the connection, at moments sampled for it.
 /// Payload always takes priority — chaff is sent only during idle periods.
 pub struct FrontChaffScheduler {
-    /// Pre-generated chaff frames, ready to send.
-    chaff_queue: Vec<Frame>,
-    /// Index into the chaff queue (round-robin after drain).
-    queue_index: usize,
-    /// When the connection started (first call to poll).
+    /// When each frame is due, from the connection's start, in order.
+    due: Vec<Duration>,
+    /// How many of them were sent.
+    sent: usize,
+    /// When the connection started (first call to `next_due`).
     connection_start: Option<Instant>,
     /// When the last payload frame was sent.
     last_payload_at: Option<Instant>,
@@ -57,108 +57,45 @@ pub struct FrontChaffScheduler {
     chaff_bytes: u64,
     /// Total payload bytes sent.
     payload_bytes: u64,
-    /// Number of chaff frames sent so far.
-    chaff_frames_sent: u64,
-    /// RNG for generating chaff on the fly (after queue drains).
+    /// RNG for frame sizes and contents.
     rng: ChaCha8Rng,
-    /// Whether the front window has closed.
-    front_window_closed: bool,
 }
 
 impl FrontChaffScheduler {
-    /// Create a new FrontChaffScheduler.
-    ///
-    /// Pre-generates a queue of chaff frames at bucketed sizes.
+    /// A scheduler with a plan sampled for one connection.
     pub fn new() -> Self {
-        let mut rng = ChaCha8Rng::from_entropy();
-        let chaff_queue = Self::generate_chaff_queue(&mut rng);
+        Self::from_rng(ChaCha8Rng::from_entropy())
+    }
 
+    fn from_rng(mut rng: ChaCha8Rng) -> Self {
+        let due = sample_plan(&mut rng);
         Self {
-            chaff_queue,
-            queue_index: 0,
+            due,
+            sent: 0,
             connection_start: None,
             last_payload_at: None,
             chaff_bytes: 0,
             payload_bytes: 0,
-            chaff_frames_sent: 0,
             rng,
-            front_window_closed: false,
         }
     }
 
-    /// Generate the initial chaff queue with bucketed sizes.
-    ///
-    /// The sizes are chosen to match the expected first-response length
-    /// distribution of the cover site, so AUTH and site responses share
-    /// a length distribution (§6.6 of the sketch).
-    fn generate_chaff_queue(rng: &mut ChaCha8Rng) -> Vec<Frame> {
-        // Chaff sizes are biased toward the lower buckets (matching messenger startup).
-        // Distribution: 40% in [64, 256], 40% in [256, 1024], 20% in [1024, 4096].
-        let mut queue = Vec::with_capacity(MAX_CHAFF_QUEUE);
-
-        for _ in 0..MAX_CHAFF_QUEUE {
-            let size = sample_chaff_size(rng);
-            let mut payload = vec![0u8; size];
-            rng.fill(&mut payload[..]);
-            queue.push(Frame::new(FRAME_TYPE_CHAFF, Bytes::from(payload)));
-        }
-
-        queue
+    /// Whether this scheduler is finished: every planned frame was sent, so it will never produce
+    /// another. A driver may then wait for payload alone, with no timer.
+    pub fn is_done(&self) -> bool {
+        self.sent >= self.due.len()
     }
 
-    /// Check if we should allow chaff right now.
-    ///
-    /// Returns `false` if:
-    /// - We're in cooldown after a recent payload write (HOL blocking guard)
-    /// - The front window has closed and there's no more chaff in queue
-    fn should_inject_chaff(&self, now: Instant) -> bool {
-        // Check cooldown after payload.
+    /// How long until the next frame may go: zero when it may go now, `None` when none is left.
+    /// The connection starts at the first call.
+    pub fn next_due(&mut self, now: Instant) -> Option<Duration> {
+        let start = *self.connection_start.get_or_insert(now);
+        let due = *self.due.get(self.sent)?;
+        let mut at = start + due;
         if let Some(last_payload) = self.last_payload_at {
-            let elapsed = now.saturating_duration_since(last_payload);
-            if elapsed < PAYLOAD_COOLDOWN {
-                return false; // Still in cooldown — don't block payload.
-            }
+            at = at.max(last_payload + PAYLOAD_COOLDOWN);
         }
-
-        // After the front window, only inject if we still have queued chaff.
-        // Once the queue drains, stop injecting (Mode 0 is front-loaded, not constant).
-        if self.front_window_closed {
-            return self.queue_index < self.chaff_queue.len();
-        }
-
-        true
-    }
-
-    /// Whether this scheduler is finished: the front window is over and the queued
-    /// chaff is sent, so it will never produce another frame. Mode 0 is front-loaded —
-    /// once done it stays done — and a driver may then wait for payload alone, with no
-    /// timer. Before the first poll the window has not started, so it is not done.
-    pub fn is_done(&self, now: Instant) -> bool {
-        let window_over = self.front_window_closed
-            || self
-                .connection_start
-                .is_some_and(|start| now.saturating_duration_since(start) >= FRONT_WINDOW);
-        window_over && self.queue_index >= self.chaff_queue.len()
-    }
-
-    /// Get the next chaff frame from the queue.
-    fn next_chaff_frame(&mut self) -> Option<Frame> {
-        if self.queue_index >= self.chaff_queue.len() {
-            return None;
-        }
-
-        let frame = self.chaff_queue[self.queue_index].clone();
-        self.queue_index += 1;
-        Some(frame)
-    }
-
-    /// Generate a single on-the-fly chaff frame (used after queue drains
-    /// but still within the front window).
-    fn generate_chaff(&mut self) -> Frame {
-        let size = sample_chaff_size(&mut self.rng);
-        let mut payload = vec![0u8; size];
-        self.rng.fill(&mut payload[..]);
-        Frame::new(FRAME_TYPE_CHAFF, Bytes::from(payload))
+        Some(at.saturating_duration_since(now))
     }
 }
 
@@ -166,6 +103,24 @@ impl Default for FrontChaffScheduler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The moments of one connection's chaff, in order: their number uniform in `0..=MAX_CHAFF_FRAMES`,
+/// the window uniform in `MIN_WINDOW..=MAX_WINDOW`, each moment Rayleigh with the scale half the
+/// window (its mean at 0.63 of it), and none later than the window.
+fn sample_plan(rng: &mut impl Rng) -> Vec<Duration> {
+    let count = rng.gen_range(0..=MAX_CHAFF_FRAMES);
+    let window = rng.gen_range(MIN_WINDOW.as_secs_f64()..=MAX_WINDOW.as_secs_f64());
+    let mut due: Vec<Duration> = (0..count)
+        .map(|_| {
+            // Inverse transform, cut at the window: `u` stops where the distribution reaches it.
+            let reach = 1.0 - (-2.0f64).exp();
+            let u = rng.gen_range(0.0..reach);
+            Duration::from_secs_f64(window / 2.0 * (-2.0 * (1.0 - u).ln()).sqrt())
+        })
+        .collect();
+    due.sort_unstable();
+    due
 }
 
 /// Sample a chaff frame size from the target distribution.
@@ -196,42 +151,19 @@ impl ChaffScheduler for FrontChaffScheduler {
     }
 
     fn poll_chaff(&mut self, now: Instant) -> Option<Frame> {
-        // Initialize connection start on first poll.
-        if self.connection_start.is_none() {
-            self.connection_start = Some(now);
-        }
-
-        // Check if the front window has closed.
-        let elapsed = now.saturating_duration_since(self.connection_start.unwrap());
-        if elapsed >= FRONT_WINDOW {
-            self.front_window_closed = true;
-        }
-
-        // Decide whether to inject.
-        if !self.should_inject_chaff(now) {
+        if self.next_due(now)? > Duration::ZERO {
             return None;
         }
-
-        // Try the queue first.
-        if let Some(frame) = self.next_chaff_frame() {
-            self.chaff_bytes += frame.payload.len() as u64;
-            self.chaff_frames_sent += 1;
-            return Some(frame);
-        }
-
-        // Queue drained but still in front window — generate on the fly.
-        if !self.front_window_closed {
-            let frame = self.generate_chaff();
-            self.chaff_bytes += frame.payload.len() as u64;
-            self.chaff_frames_sent += 1;
-            return Some(frame);
-        }
-
-        None
+        let size = sample_chaff_size(&mut self.rng);
+        let mut payload = vec![0u8; size];
+        self.rng.fill(&mut payload[..]);
+        self.sent += 1;
+        self.chaff_bytes += size as u64;
+        Some(Frame::new(FRAME_TYPE_CHAFF, Bytes::from(payload)))
     }
 
     fn has_pending(&self) -> bool {
-        self.queue_index < self.chaff_queue.len()
+        !self.is_done()
     }
 
     fn chaff_bytes_sent(&self) -> u64 {
@@ -374,10 +306,13 @@ impl WriteStrategy {
         self.payload_queue.has_pending() || self.chaff_scheduler.has_pending()
     }
 
-    /// Whether nothing can be due until new payload arrives: no payload queued and
-    /// the chaff scheduler finished ([`FrontChaffScheduler::is_done`]).
-    pub fn waits_for_payload(&self, now: Instant) -> bool {
-        !self.payload_queue.has_pending() && self.chaff_scheduler.is_done(now)
+    /// How long until something is due without new payload: zero now, `None` never — no payload
+    /// queued and the chaff all sent.
+    pub fn next_due(&mut self, now: Instant) -> Option<Duration> {
+        if self.payload_queue.has_pending() {
+            return Some(Duration::ZERO);
+        }
+        self.chaff_scheduler.next_due(now)
     }
 }
 
@@ -392,30 +327,111 @@ mod tests {
     use super::*;
     use construct_veil_protocol::{FRAME_TYPE_CHAFF, FRAME_TYPE_DATA};
 
-    #[test]
-    fn scheduler_creates_chaff_queue() {
-        let scheduler = FrontChaffScheduler::new();
-        assert_eq!(scheduler.chaff_queue.len(), MAX_CHAFF_QUEUE);
-        assert!(scheduler.has_pending());
+    fn seeded(seed: u64) -> FrontChaffScheduler {
+        FrontChaffScheduler::from_rng(ChaCha8Rng::seed_from_u64(seed))
     }
 
+    /// What an idle connection sends, polled as a driver does: at each moment asked for.
+    fn run_idle(mut s: FrontChaffScheduler) -> (Vec<Duration>, u64) {
+        let t0 = Instant::now();
+        let mut now = t0;
+        let mut at = Vec::new();
+        while let Some(wait) = s.next_due(now) {
+            now += wait;
+            assert!(s.poll_chaff(now).is_some(), "due is due");
+            at.push(now - t0);
+        }
+        assert!(s.is_done() && s.poll_chaff(now).is_none());
+        (at, s.chaff_bytes_sent())
+    }
+
+    /// The number, the window and the moments differ from one connection to the next, inside their
+    /// bounds, over the whole range. Mutations: a fixed count, a fixed window, even spacing.
+    #[test]
+    fn each_connection_has_its_own_plan() {
+        let plans: Vec<Vec<Duration>> = (0..2000).map(|seed| run_idle(seeded(seed)).0).collect();
+        let counts: Vec<usize> = plans.iter().map(Vec::len).collect();
+        for n in 0..=MAX_CHAFF_FRAMES {
+            assert!(counts.contains(&n), "{n} frames never happens");
+        }
+        assert!(counts.iter().all(|&n| n <= MAX_CHAFF_FRAMES));
+        assert!(plans.iter().flatten().all(|&t| t <= MAX_WINDOW));
+
+        let mean = counts.iter().sum::<usize>() as f64 / counts.len() as f64;
+        assert!((14.5..17.5).contains(&mean), "mean {mean}");
+        // Windows differ: some connections end their chaff within one second, some after three.
+        let last: Vec<Duration> = plans
+            .iter()
+            .filter(|p| p.len() > 20)
+            .map(|p| p[p.len() - 1])
+            .collect();
+        assert!(last.iter().any(|&t| t < Duration::from_millis(1400)));
+        assert!(last.iter().any(|&t| t > Duration::from_millis(3200)));
+        // Moments are spread, not a rhythm: the gaps of one plan are not equal.
+        let full = plans.iter().find(|p| p.len() > 20).unwrap();
+        let gaps: Vec<_> = full.windows(2).map(|w| w[1] - w[0]).collect();
+        let (min, max) = (gaps.iter().min().unwrap(), gaps.iter().max().unwrap());
+        assert!(*max > *min * 5, "{min:?} {max:?}");
+    }
+
+    /// Front-loaded: the middle of a long plan falls before the middle of the window. Mutation:
+    /// moments uniform in the window reach further.
+    #[test]
+    fn moments_follow_rayleigh_in_the_window() {
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let mut all = Vec::new();
+        for _ in 0..4000 {
+            let plan = sample_plan(&mut rng);
+            all.extend(plan.iter().map(Duration::as_secs_f64));
+        }
+        let mean = all.iter().sum::<f64>() / all.len() as f64;
+        // E[window]=2.5 s; a Rayleigh of scale w/2 cut at w has its mean at 0.53 of w.
+        assert!((1.22..1.42).contains(&mean), "{mean}");
+        let early = all.iter().filter(|&&t| t < 0.1).count() as f64 / all.len() as f64;
+        assert!(early < 0.02, "a Rayleigh starts at zero density: {early}");
+    }
+
+    /// What a connection costs on average, and that it is no constant: the point of it.
+    #[test]
+    fn the_volume_is_small_and_varies() {
+        let bytes: Vec<u64> = (0..2000).map(|seed| run_idle(seeded(seed)).1).collect();
+        let mean = bytes.iter().sum::<u64>() as f64 / bytes.len() as f64;
+        assert!((11_000.0..17_000.0).contains(&mean), "mean {mean}");
+        let near_mean = bytes
+            .iter()
+            .filter(|&&b| (b as f64 - mean).abs() < mean * 0.2)
+            .count();
+        assert!(
+            near_mean < bytes.len() / 4,
+            "{near_mean} of {} near the mean",
+            bytes.len()
+        );
+    }
+
+    /// Chaff due during the cooldown after payload waits it out, and is not lost.
     #[test]
     fn payload_causes_cooldown() {
-        let now = Instant::now();
-        let mut scheduler = FrontChaffScheduler::new();
-        scheduler.connection_start = Some(now);
+        let t0 = Instant::now();
+        let mut s = (0..).map(seeded).find(|s| s.due.len() > 2).unwrap();
+        s.connection_start = Some(t0);
+        let due = t0 + s.due[0];
+        s.on_payload_sent(due, 100);
+        assert!(s.has_pending());
+        assert_eq!(s.next_due(due), Some(PAYLOAD_COOLDOWN));
+        assert!(s.poll_chaff(due).is_none());
+        assert!(s.poll_chaff(due + PAYLOAD_COOLDOWN).is_some());
+        assert_eq!(s.sent, 1);
+    }
 
-        // Before cooldown — should allow chaff.
-        assert!(scheduler.should_inject_chaff(now));
-
-        // Simulate payload sent.
-        scheduler.on_payload_sent(now, 100);
-
-        // Immediately after (same instant) — cooldown should block chaff.
-        assert!(!scheduler.should_inject_chaff(now));
-
-        // Once the cooldown has elapsed, chaff is allowed again.
-        assert!(scheduler.should_inject_chaff(now + PAYLOAD_COOLDOWN));
+    /// Nothing goes before its moment. Mutation: ignore the plan's time.
+    #[test]
+    fn nothing_goes_before_its_moment() {
+        let t0 = Instant::now();
+        let mut s = (0..).map(seeded).find(|s| s.due.len() > 2).unwrap();
+        assert!(s.poll_chaff(t0).is_none() || s.due[0].is_zero());
+        let due = s.due[0];
+        assert!(s.poll_chaff(t0 + due - Duration::from_micros(1)).is_none());
+        assert!(s.poll_chaff(t0 + due).is_some());
     }
 
     #[test]
@@ -427,26 +443,6 @@ mod tests {
 
         assert_eq!(scheduler.payload_bytes_sent(), 800);
         assert_eq!(scheduler.chaff_bytes_sent(), 0);
-    }
-
-    #[test]
-    fn chaff_queue_drains() {
-        let now = Instant::now();
-        let mut scheduler = FrontChaffScheduler::new();
-        scheduler.connection_start = Some(now);
-
-        let mut count = 0;
-        while let Some(_frame) = scheduler.poll_chaff(now) {
-            count += 1;
-            // Prevent infinite loop by simulating front window close after enough chaff.
-            if count > MAX_CHAFF_QUEUE + 100 {
-                break;
-            }
-        }
-
-        // Should have drained at least the queue.
-        assert!(count >= MAX_CHAFF_QUEUE);
-        assert!(scheduler.chaff_bytes_sent() > 0);
     }
 
     #[test]
@@ -470,10 +466,12 @@ mod tests {
     fn write_strategy_chaff_when_idle() {
         let now = Instant::now();
         let mut strategy = WriteStrategy::new();
+        strategy.chaff_scheduler = (0..).map(seeded).find(|s| !s.due.is_empty()).unwrap();
         strategy.chaff_scheduler.connection_start = Some(now);
 
-        // No payload in queue — should return chaff.
-        let frame = strategy.next_frame(now).expect("should have chaff");
+        // No payload in queue — should return chaff at its moment.
+        let due = now + strategy.next_due(now).expect("chaff is planned");
+        let frame = strategy.next_frame(due).expect("should have chaff");
         assert_eq!(frame.frame_type, FRAME_TYPE_CHAFF);
     }
 

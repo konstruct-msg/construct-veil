@@ -360,20 +360,15 @@ where
         let mut rbuf = [0u8; 8192];
 
         loop {
-            // Service the local stream FIRST every iteration — a busy chaff
-            // schedule must never starve real payload. While chaff is still owed the
-            // short timeout lets it fill idle gaps; once the front-loaded chaff is done
-            // nothing is due until local bytes arrive, so wait for them with no timer.
-            // Until 2026-10-03 the 20 ms tick ran for the life of the tunnel: ~100
-            // wake-ups a second on an idle Android client (two tunnels), ~1.9 s of CPU a
-            // minute with the screen off.
+            // Service the local stream FIRST every iteration — chaff must never starve real
+            // payload. Wait for local bytes until the next chaff is due; once the chaff is
+            // sent nothing is due until local bytes arrive, so wait with no timer. Until
+            // 2026-10-03 a 20 ms tick ran for the life of the tunnel: ~100 wake-ups a second
+            // on an idle Android client (two tunnels), ~1.9 s of CPU a minute, screen off.
             let read = local_rd.read(&mut rbuf);
-            let read = if up_session.waits_for_local(Instant::now()) {
-                Some(read.await)
-            } else {
-                tokio::time::timeout(Duration::from_millis(20), read)
-                    .await
-                    .ok()
+            let read = match up_session.next_due(Instant::now()) {
+                None => Some(read.await),
+                Some(wait) => tokio::time::timeout(wait, read).await.ok(),
             };
             match read {
                 Some(Ok(0)) => break, // EOF
