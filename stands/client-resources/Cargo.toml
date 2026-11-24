@@ -1,0 +1,41 @@
+[package]
+name = "client-resources"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+construct-veil = { path = "../..", features = ["ffi"] }
+construct-veil-protocol = { path = "../../crates/construct-veil-protocol" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rcgen = "0.13"
+bytes = "1"
+base64 = "0.22"
+hex = "0.4"
+sha2 = "0.10"
+ed25519-dalek = "2"
+libc = "0.2"
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+
+# construct-core's [profile.release], verbatim: what the apps link.
+[profile.release]
+opt-level = "z"
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"
+[profile.release.build-override]
+strip = false
+
+[profile.o3]
+inherits = "release"
+opt-level = 3
+
+[profile.unwind]
+inherits = "release"
+panic = "unwind"
