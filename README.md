@@ -53,8 +53,7 @@ src/
 ├── tls_pinned.rs               ← SPKI-pinned rustls connector
 └── veil/
     ├── coordinator.rs          ← VeilCoordinator: runs the FSM, probes, local proxy
-    ├── fsm/                    ← pure reducer: states, events, effects, candidate scoring
-    ├── scoring.rs              ← PersistentScores: per-network scores in SQLite
+    ├── fsm/                    ← pure reducer: states, events, effects
     ├── obfuscator.rs           ← Obfuscator trait, ProbeRequest, ObfuscatorError
     ├── veil_front_adapter.rs   ← VeilFrontObfuscator: probe + ferry
     ├── veil_front/             ← session framing and Mode 0 chaff
@@ -78,10 +77,10 @@ crates/construct-veil-relay/src/
 ## Coordinator
 
 `VeilCoordinator` (feature `coordinator`) is an FSM that races the registered
-methods, keeps per-network scores, and serves the winner on a local port.
-veil-front is the only registered method today. `MethodId` still lists obfs4,
-WebTunnel and MASQUE: their numbers are stored in the scores database and in the
-`allowed_methods` bitmask of `VeilStartRequest`.
+methods and serves the winner on a local port. veil-front is the only registered
+method today. `MethodId` still lists obfs4, WebTunnel and MASQUE: their numbers are
+the `allowed_methods` bitmask of `VeilStartRequest`. It keeps nothing on disk; the
+per-network score database was removed on 2026-11-24.
 
 ## Features
 
@@ -89,7 +88,7 @@ WebTunnel and MASQUE: their numbers are stored in the scores database and in the
 |---------|--------------|
 | `tls` | rustls and the ClientHello profiles (`TlsProfile`) |
 | `utls` | `tls` + JA3 helpers |
-| `coordinator` | the FSM, scoring (SQLite) and the veil-front adapter; implies `utls` |
+| `coordinator` | the FSM and the veil-front adapter; implies `utls` |
 | `ffi` | the C ABI; implies `coordinator`. This is what construct-core links |
 
 ## Build & test

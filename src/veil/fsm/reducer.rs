@@ -1,24 +1,28 @@
 //! The FSM reducer — pure transition function and tests.
 
-use std::{
-    collections::HashMap,
-    time::{Instant, SystemTime},
-};
+use std::{collections::HashMap, time::Instant};
 
-use super::scoring::{ScoreLookup, select_probe_candidates};
 use super::types::*;
 
-/// The FSM reducer: `(state, event, scores, config, now) → (state, effects)`.
+/// The methods one session probes: the allowed ones, in [`MethodId::all`] order, at
+/// most `top_k_probes` of them.
+///
+/// Nothing ranks them by history. Until 2026-11-24 a per-network SQLite score did, and
+/// with the one method that ships it returned that method whatever the score said,
+/// "blocked" included (todo 341).
+pub fn probe_candidates(allowed: MethodSet, cfg: &VeilConfig) -> Vec<MethodId> {
+    allowed.iter_allowed().take(cfg.top_k_probes).collect()
+}
+
+/// The FSM reducer: `(state, event, config, now) → (state, effects)`.
 ///
 /// Pure function — no I/O, no side effects.
 #[allow(clippy::too_many_lines)]
 pub fn reduce(
     state: VeilState,
     event: VeilEvent,
-    scores: &dyn ScoreLookup,
     cfg: &VeilConfig,
     now: Instant,
-    now_sys: SystemTime,
 ) -> (VeilState, Vec<VeilEffect>) {
     match (&state, event) {
         // ── Idle ─────────────────────────────────────────────────────────
@@ -26,12 +30,10 @@ pub fn reduce(
             VeilState::Idle,
             VeilEvent::Start {
                 relay,
-                ref fingerprint,
                 allowed_methods,
             },
         ) => {
-            let candidates =
-                select_probe_candidates(fingerprint, allowed_methods, scores, cfg, now_sys);
+            let candidates = probe_candidates(allowed_methods, cfg);
 
             // Nothing to probe (the host allowed no method, or none is registered):
             // there is no probe race to run, so this is "all probes failed" right
@@ -81,11 +83,7 @@ pub fn reduce(
                 attempts: _,
                 started_at: _,
             },
-            VeilEvent::ProbeSucceeded {
-                method,
-                port,
-                latency_ms,
-            },
+            VeilEvent::ProbeSucceeded { method, port },
         ) => {
             if !candidates.contains(&method) {
                 // Probe from a different session — ignore.
@@ -99,13 +97,7 @@ pub fn reduce(
                 consecutive_failures: 0,
             };
 
-            let mut effects = vec![VeilEffect::CancelOtherProbes { winner: method }];
-
-            effects.push(VeilEffect::RecordScore {
-                method,
-                fingerprint: NetworkFingerprint::default(), // placeholder — caller fills
-                outcome: ScoreOutcome::Success { latency_ms },
-            });
+            let effects = vec![VeilEffect::CancelOtherProbes { winner: method }];
 
             (new_state, effects)
         }
@@ -116,7 +108,7 @@ pub fn reduce(
                 attempts,
                 started_at,
             },
-            VeilEvent::ProbeFailed { method, reason },
+            VeilEvent::ProbeFailed { method },
         ) => {
             if !candidates.contains(&method) {
                 return (state, vec![]);
@@ -130,22 +122,12 @@ pub fn reduce(
                 .collect();
 
             if new_candidates.is_empty() {
-                // All probes failed. The last failure is scored like every other
-                // one — until 2026-10-22 it was not, so with a single candidate
-                // (the shipping veil-front-only build) no failure was ever recorded
-                // and penalties, blocks and consecutive_failures never accumulated.
+                // All probes failed.
                 let until = now + cfg.cooldown_duration;
                 let new_state = VeilState::Cooldown { until };
-                let effects = vec![
-                    VeilEffect::RecordScore {
-                        method,
-                        fingerprint: NetworkFingerprint::default(),
-                        outcome: ScoreOutcome::Failure { reason },
-                    },
-                    VeilEffect::ScheduleCooldown {
-                        duration: cfg.cooldown_duration,
-                    },
-                ];
+                let effects = vec![VeilEffect::ScheduleCooldown {
+                    duration: cfg.cooldown_duration,
+                }];
                 return (new_state, effects);
             }
 
@@ -159,13 +141,7 @@ pub fn reduce(
                 started_at: *started_at,
             };
 
-            let effects = vec![VeilEffect::RecordScore {
-                method,
-                fingerprint: NetworkFingerprint::default(),
-                outcome: ScoreOutcome::Failure { reason },
-            }];
-
-            (new_state, effects)
+            (new_state, vec![])
         }
 
         (
@@ -322,27 +298,6 @@ mod tests {
         Instant::now()
     }
 
-    fn now_sys() -> SystemTime {
-        SystemTime::now()
-    }
-
-    /// No-op score lookup for basic tests.
-    struct NoScores;
-    impl ScoreLookup for NoScores {
-        fn get(&self, _fp: &NetworkFingerprint, _method: MethodId) -> Option<ScoreEntry> {
-            None
-        }
-        fn is_permanently_blocked(
-            &self,
-            _fp: &NetworkFingerprint,
-            _method: MethodId,
-            _ttl: Duration,
-            _now: SystemTime,
-        ) -> bool {
-            false
-        }
-    }
-
     // ── Idle transitions ──────────────────────────────────────────────────
 
     /// No allowed method → straight to Cooldown, never `StartProbes { [] }`.
@@ -354,13 +309,10 @@ mod tests {
             VeilState::Idle,
             VeilEvent::Start {
                 relay: "relay:443".into(),
-                fingerprint: NetworkFingerprint::default(),
                 allowed_methods: MethodSet::none(),
             },
-            &NoScores,
             &VeilConfig::default(),
             now(),
-            now_sys(),
         );
         assert!(
             matches!(new_state, VeilState::Cooldown { .. }),
@@ -374,58 +326,6 @@ mod tests {
         );
     }
 
-    /// The last candidate's failure is scored. Mutation: emit only
-    /// `ScheduleCooldown` in the all-failed branch (the code until 2026-10-22).
-    #[test]
-    fn last_candidate_failure_is_recorded() {
-        let cfg = VeilConfig::legacy(); // top_k = 1: one candidate, as shipped
-        let (state, effects) = reduce(
-            VeilState::Idle,
-            VeilEvent::Start {
-                relay: "relay:443".into(),
-                fingerprint: NetworkFingerprint::default(),
-                allowed_methods: MethodSet::all(),
-            },
-            &NoScores,
-            &cfg,
-            now(),
-            now_sys(),
-        );
-        let method = match &effects[0] {
-            VeilEffect::StartProbes { methods, .. } => {
-                assert_eq!(methods.len(), 1);
-                methods[0]
-            }
-            other => panic!("expected StartProbes, got {other:?}"),
-        };
-
-        let (state, effects) = reduce(
-            state,
-            VeilEvent::ProbeFailed {
-                method,
-                reason: ProbeFailureReason::ConnectionFailed,
-            },
-            &NoScores,
-            &cfg,
-            now(),
-            now_sys(),
-        );
-        assert!(matches!(state, VeilState::Cooldown { .. }), "{state:?}");
-        assert!(
-            effects.iter().any(|e| matches!(
-                e,
-                VeilEffect::RecordScore {
-                    method: m,
-                    outcome: ScoreOutcome::Failure {
-                        reason: ProbeFailureReason::ConnectionFailed
-                    },
-                    ..
-                } if *m == method
-            )),
-            "{effects:?}"
-        );
-    }
-
     #[test]
     fn idle_start_goes_to_probing() {
         let state = VeilState::Idle;
@@ -433,13 +333,10 @@ mod tests {
             state,
             VeilEvent::Start {
                 relay: "relay:443".into(),
-                fingerprint: NetworkFingerprint::default(),
                 allowed_methods: MethodSet::all(),
             },
-            &NoScores,
             &VeilConfig::default(),
             now(),
-            now_sys(),
         );
 
         match new_state {
@@ -464,10 +361,8 @@ mod tests {
         let (new_state, effects) = reduce(
             VeilState::Idle,
             VeilEvent::Stop,
-            &NoScores,
             &VeilConfig::default(),
             now(),
-            now_sys(),
         );
         assert!(matches!(new_state, VeilState::Idle));
         assert!(effects.is_empty());
@@ -493,12 +388,9 @@ mod tests {
             VeilEvent::ProbeSucceeded {
                 method: MethodId::Obfs4,
                 port: 12345,
-                latency_ms: 500,
             },
-            &NoScores,
             &VeilConfig::default(),
             now(),
-            now_sys(),
         );
 
         match new_state {
@@ -509,8 +401,7 @@ mod tests {
             _ => panic!("expected Active, got {:?}", new_state),
         }
 
-        // Should emit CancelOtherProbes + RecordScore
-        assert_eq!(effects.len(), 2);
+        assert_eq!(effects.len(), 1);
         assert!(
             matches!(&effects[0], VeilEffect::CancelOtherProbes { winner } if *winner == MethodId::Obfs4)
         );
@@ -533,12 +424,9 @@ mod tests {
             state,
             VeilEvent::ProbeFailed {
                 method: MethodId::WebTunnel,
-                reason: ProbeFailureReason::FingerprintBlocked,
             },
-            &NoScores,
             &VeilConfig::default(),
             now(),
-            now_sys(),
         );
 
         match new_state {
@@ -567,12 +455,9 @@ mod tests {
             state,
             VeilEvent::ProbeFailed {
                 method: MethodId::Obfs4,
-                reason: ProbeFailureReason::ConnectionFailed,
             },
-            &NoScores,
             &VeilConfig::default(),
             now(),
-            now_sys(),
         );
 
         assert!(matches!(new_state, VeilState::Cooldown { .. }));
@@ -599,10 +484,8 @@ mod tests {
         let (new_state, effects) = reduce(
             state,
             VeilEvent::AllProbesFailed,
-            &NoScores,
             &VeilConfig::default(),
             now(),
-            now_sys(),
         );
 
         assert!(matches!(new_state, VeilState::Cooldown { .. }));
@@ -626,14 +509,7 @@ mod tests {
             started_at: now(),
         };
 
-        let (new_state, effects) = reduce(
-            state,
-            VeilEvent::Stop,
-            &NoScores,
-            &VeilConfig::default(),
-            now(),
-            now_sys(),
-        );
+        let (new_state, effects) = reduce(state, VeilEvent::Stop, &VeilConfig::default(), now());
         assert!(matches!(new_state, VeilState::Idle));
         assert!(effects.iter().any(|e| matches!(e, VeilEffect::StopActive)));
     }
@@ -654,10 +530,8 @@ mod tests {
             VeilEvent::TransportFailure {
                 kind: TransportFailureKind::StreamTimeout,
             },
-            &NoScores,
             &VeilConfig::default(),
             now(),
-            now_sys(),
         );
 
         match new_state {
@@ -685,10 +559,8 @@ mod tests {
             VeilEvent::TransportFailure {
                 kind: TransportFailureKind::FingerprintBlocked,
             },
-            &NoScores,
             &VeilConfig::default(),
             now(),
-            now_sys(),
         );
 
         assert!(matches!(
@@ -714,10 +586,8 @@ mod tests {
             VeilEvent::TransportFailure {
                 kind: TransportFailureKind::TlsCertProblem,
             },
-            &NoScores,
             &VeilConfig::default(),
             now(),
-            now_sys(),
         );
 
         assert!(matches!(new_state, VeilState::Active { .. }));
@@ -742,10 +612,8 @@ mod tests {
             VeilEvent::TransportFailure {
                 kind: TransportFailureKind::StreamTimeout,
             },
-            &NoScores,
             &cfg,
             now(),
-            now_sys(),
         );
 
         assert!(matches!(new_state, VeilState::Degraded { .. }));
@@ -760,14 +628,7 @@ mod tests {
             consecutive_failures: 0,
         };
 
-        let (new_state, effects) = reduce(
-            state,
-            VeilEvent::Stop,
-            &NoScores,
-            &VeilConfig::default(),
-            now(),
-            now_sys(),
-        );
+        let (new_state, effects) = reduce(state, VeilEvent::Stop, &VeilConfig::default(), now());
         assert!(matches!(new_state, VeilState::Idle));
         assert!(effects.iter().any(|e| matches!(e, VeilEffect::StopActive)));
     }
@@ -787,10 +648,8 @@ mod tests {
             VeilEvent::TransportFailure {
                 kind: TransportFailureKind::StreamTimeout,
             },
-            &NoScores,
             &VeilConfig::default(),
             now(),
-            now_sys(),
         );
 
         // Threshold reached (2 >= 2) → goes to Idle with StopActive.
@@ -808,10 +667,8 @@ mod tests {
         let (new_state, _) = reduce(
             state,
             VeilEvent::CooldownElapsed,
-            &NoScores,
             &VeilConfig::default(),
             now(),
-            now_sys(),
         );
 
         assert!(matches!(new_state, VeilState::Idle));
@@ -825,10 +682,8 @@ mod tests {
         let (new_state, _) = reduce(
             state.clone(),
             VeilEvent::CooldownElapsed,
-            &NoScores,
             &VeilConfig::default(),
             now(),
-            now_sys(),
         );
 
         assert!(matches!(new_state, VeilState::Cooldown { .. }));
@@ -839,178 +694,30 @@ mod tests {
         let until = now() + Duration::from_secs(30);
         let state = VeilState::Cooldown { until };
 
-        let (new_state, _) = reduce(
-            state,
-            VeilEvent::Stop,
-            &NoScores,
-            &VeilConfig::default(),
-            now(),
-            now_sys(),
-        );
+        let (new_state, _) = reduce(state, VeilEvent::Stop, &VeilConfig::default(), now());
         assert!(matches!(new_state, VeilState::Idle));
     }
 
     // ── Candidate selection ───────────────────────────────────────────────
 
+    /// The allowed methods in their fixed order, cut to `top_k_probes`. Mutation: drop
+    /// the `take` (four candidates), or iterate `MethodId::all()` without the filter.
     #[test]
-    fn select_candidates_returns_top_k() {
-        struct MockScores;
-        impl ScoreLookup for MockScores {
-            fn get(&self, _fp: &NetworkFingerprint, method: MethodId) -> Option<ScoreEntry> {
-                match method {
-                    MethodId::Obfs4 => Some(ScoreEntry {
-                        successes: 10,
-                        failures: 1,
-                        last_success_at: Some(SystemTime::now() - Duration::from_secs(60)),
-                        last_failure_at: None,
-                        median_latency_ms: 800,
-                        blocked_at: None,
-                        consecutive_failures: 0,
-                    }),
-                    MethodId::WebTunnel => Some(ScoreEntry {
-                        successes: 2,
-                        failures: 5,
-                        last_success_at: None,
-                        last_failure_at: Some(SystemTime::now() - Duration::from_secs(3600)),
-                        median_latency_ms: 2000,
-                        blocked_at: None,
-                        consecutive_failures: 3,
-                    }),
-                    _ => None,
-                }
-            }
-            fn is_permanently_blocked(
-                &self,
-                _fp: &NetworkFingerprint,
-                _method: MethodId,
-                _ttl: Duration,
-                _now: SystemTime,
-            ) -> bool {
-                false
-            }
-        }
-
-        let cfg = VeilConfig {
-            top_k_probes: 2,
-            ..VeilConfig::default()
-        };
-        let candidates = select_probe_candidates(
-            &NetworkFingerprint::default(),
-            MethodSet::all(),
-            &MockScores,
-            &cfg,
-            now_sys(),
+    fn candidates_are_the_allowed_methods_in_order_up_to_top_k() {
+        let cfg = VeilConfig::default(); // top_k = 2
+        assert_eq!(
+            probe_candidates(MethodSet::all(), &cfg),
+            vec![MethodId::Obfs4, MethodId::WebTunnel]
         );
-
-        assert_eq!(candidates.len(), 2);
-        // Obfs4 should be first (higher score).
-        assert_eq!(candidates[0], MethodId::Obfs4);
-    }
-
-    #[test]
-    fn select_candidates_skips_permanently_blocked() {
-        struct BlockedScores;
-        impl ScoreLookup for BlockedScores {
-            fn get(&self, _fp: &NetworkFingerprint, method: MethodId) -> Option<ScoreEntry> {
-                match method {
-                    MethodId::WebTunnel => Some(ScoreEntry {
-                        successes: 0,
-                        failures: 10,
-                        last_success_at: None,
-                        last_failure_at: Some(SystemTime::now()),
-                        median_latency_ms: 0,
-                        blocked_at: Some(SystemTime::now() - Duration::from_secs(3600)),
-                        consecutive_failures: 10,
-                    }),
-                    _ => None,
-                }
-            }
-            fn is_permanently_blocked(
-                &self,
-                _fp: &NetworkFingerprint,
-                method: MethodId,
-                _ttl: Duration,
-                _now: SystemTime,
-            ) -> bool {
-                method == MethodId::WebTunnel
-            }
-        }
-
-        let cfg = VeilConfig {
-            top_k_probes: 2,
-            ..VeilConfig::default()
-        };
-        let candidates = select_probe_candidates(
-            &NetworkFingerprint::default(),
-            MethodSet::all(),
-            &BlockedScores,
-            &cfg,
-            now_sys(),
+        assert_eq!(
+            probe_candidates(MethodSet::from_bitmask(MethodId::Obfs4.bit()), &cfg),
+            vec![MethodId::WebTunnel, MethodId::Masque]
         );
-
-        // WebTunnel should be skipped; Obfs4 and Masque (both no data = 50.0) remain.
-        assert_eq!(candidates.len(), 2);
-        assert!(!candidates.contains(&MethodId::WebTunnel));
-        // Obfs4 should be first (tied score, but appears earlier in MethodId::all()).
-        assert_eq!(candidates[0], MethodId::Obfs4);
-    }
-
-    #[test]
-    fn select_candidates_empty_fallback() {
-        struct AllBlockedScores;
-        impl ScoreLookup for AllBlockedScores {
-            fn get(&self, _fp: &NetworkFingerprint, _method: MethodId) -> Option<ScoreEntry> {
-                Some(ScoreEntry {
-                    successes: 0,
-                    failures: 5,
-                    last_success_at: None,
-                    last_failure_at: Some(SystemTime::now()),
-                    median_latency_ms: 0,
-                    blocked_at: Some(SystemTime::now() - Duration::from_secs(86400)),
-                    consecutive_failures: 5,
-                })
-            }
-            fn is_permanently_blocked(
-                &self,
-                _fp: &NetworkFingerprint,
-                _method: MethodId,
-                _ttl: Duration,
-                _now: SystemTime,
-            ) -> bool {
-                true
-            }
-        }
-
-        let cfg = VeilConfig {
-            top_k_probes: 2,
-            ..VeilConfig::default()
-        };
-        let candidates = select_probe_candidates(
-            &NetworkFingerprint::default(),
-            MethodSet::all(),
-            &AllBlockedScores,
-            &cfg,
-            now_sys(),
+        assert_eq!(
+            probe_candidates(MethodSet::all(), &VeilConfig::legacy()),
+            vec![MethodId::Obfs4]
         );
-
-        // Should pick the least-recently-blocked method as a fallback.
-        assert!(!candidates.is_empty());
-    }
-
-    // ── Legacy (top_k=1) behaviour ────────────────────────────────────────
-
-    #[test]
-    fn legacy_config_selects_one_candidate() {
-        let cfg = VeilConfig::legacy();
-        let candidates = select_probe_candidates(
-            &NetworkFingerprint::default(),
-            MethodSet::all(),
-            &NoScores,
-            &cfg,
-            now_sys(),
-        );
-
-        assert_eq!(candidates.len(), 1);
+        assert!(probe_candidates(MethodSet::none(), &cfg).is_empty());
     }
 
     // ── Method set ────────────────────────────────────────────────────────
@@ -1066,60 +773,9 @@ mod tests {
             ms.iter_allowed().collect::<Vec<_>>(),
             vec![MethodId::VeilFront]
         );
-    }
-
-    #[test]
-    fn veil_front_is_a_candidate() {
-        struct VeilFrontOnlyScores;
-        impl ScoreLookup for VeilFrontOnlyScores {
-            fn get(&self, _fp: &NetworkFingerprint, method: MethodId) -> Option<ScoreEntry> {
-                match method {
-                    MethodId::VeilFront => Some(ScoreEntry {
-                        successes: 5,
-                        failures: 0,
-                        last_success_at: Some(SystemTime::now() - Duration::from_secs(60)),
-                        last_failure_at: None,
-                        median_latency_ms: 300,
-                        blocked_at: None,
-                        consecutive_failures: 0,
-                    }),
-                    // All other methods are blocked.
-                    MethodId::Obfs4 | MethodId::WebTunnel | MethodId::Masque => Some(ScoreEntry {
-                        successes: 0,
-                        failures: 10,
-                        last_success_at: None,
-                        last_failure_at: Some(SystemTime::now()),
-                        median_latency_ms: 0,
-                        blocked_at: Some(SystemTime::now() - Duration::from_secs(3600)),
-                        consecutive_failures: 10,
-                    }),
-                }
-            }
-            fn is_permanently_blocked(
-                &self,
-                _fp: &NetworkFingerprint,
-                method: MethodId,
-                _ttl: Duration,
-                _now: SystemTime,
-            ) -> bool {
-                method != MethodId::VeilFront
-            }
-        }
-
-        let cfg = VeilConfig {
-            top_k_probes: 2,
-            ..VeilConfig::default()
-        };
-        let candidates = select_probe_candidates(
-            &NetworkFingerprint::default(),
-            MethodSet::all(),
-            &VeilFrontOnlyScores,
-            &cfg,
-            now_sys(),
+        assert_eq!(
+            probe_candidates(ms, &VeilConfig::default()),
+            vec![MethodId::VeilFront]
         );
-
-        // VeilFront should be the only candidate (others are blocked).
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0], MethodId::VeilFront);
     }
 }

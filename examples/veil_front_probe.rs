@@ -12,8 +12,7 @@
 use std::time::{Duration, Instant};
 
 use construct_veil::veil::{
-    MethodSet, NetworkFingerprint, VeilConfig, VeilCoordinator, VeilFrontAuthV3,
-    VeilFrontObfuscator, scoring::PersistentScores,
+    MethodSet, VeilConfig, VeilCoordinator, VeilFrontAuthV3, VeilFrontObfuscator,
 };
 use tokio::io::AsyncWriteExt;
 
@@ -113,11 +112,8 @@ async fn main() {
         _ => usage(),
     };
 
-    // Mirror ffi::veil_start: veil-front-only coordinator, in-memory scores.
-    let scores = PersistentScores::open_default(":memory:")
-        .await
-        .expect("scores");
-    let mut coord = VeilCoordinator::new(VeilConfig::default(), scores);
+    // Mirror ffi::veil_start: veil-front-only coordinator.
+    let mut coord = VeilCoordinator::new(VeilConfig::default());
     coord.register(Box::new(VeilFrontObfuscator::new()));
 
     // v3 (key-bound) when a secret key is given; otherwise v2 bearer capability
@@ -138,7 +134,6 @@ async fn main() {
     let res = coord
         .start_session_with_params(
             relay.clone(),
-            NetworkFingerprint::default(),
             MethodSet::from_bitmask(0),
             sni,
             spki,

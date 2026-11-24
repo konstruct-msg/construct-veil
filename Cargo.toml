@@ -7,7 +7,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "3.5.0"
+version = "4.0.0"
 authors = ["Construct Team"]
 edition = "2024"
 rust-version = "1.100"
@@ -37,7 +37,6 @@ required-features = ["coordinator", "utls"]
 construct-veil-protocol = { path = "crates/construct-veil-protocol" }
 
 # Crypto
-hmac = "0.12"
 sha2 = "0.10"
 rand_chacha = "0.3"
 rand = "0.8"
@@ -54,13 +53,6 @@ thiserror = "1"
 
 [dependencies.tracing]
 version = "0.1"
-optional = true
-
-# VEIL Coordinator — FSM-based obfuscator selection with happy-eyeballs probing
-# Requires the "coordinator" feature flag (brings in sqlite + async-trait)
-[dependencies.sqlx]
-version = "0.8"
-features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"]
 optional = true
 
 [dependencies.async-trait]
@@ -92,10 +84,9 @@ http = "1"
 
 [features]
 default = []
-# Enable VEIL Coordinator — FSM-based obfuscator selection with happy-eyeballs
-# probing, per-network scoring, and persistent state.
+# Enable VEIL Coordinator — FSM-based obfuscator selection with happy-eyeballs probing.
 coordinator = [
-  "dep:sqlx", "dep:async-trait", "dep:tokio-util", "dep:bitflags", "dep:tracing",
+  "dep:async-trait", "dep:tokio-util", "dep:bitflags", "dep:tracing",
   "utls",
 ]
 # C FFI for the iOS and Android apps (veil_start, veil_front_ferry_fd, …).

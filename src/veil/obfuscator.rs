@@ -185,7 +185,7 @@ mod tls_classification {
 
     /// Alert 40 is the DPI signal; a certificate verdict is a pin/MitM signal;
     /// the two must never be confused — a pin mismatch used to be classified by
-    /// substring and landed in `Tls`, which the coordinator scores as a block.
+    /// substring and landed in `Tls`, which the coordinator read as a block.
     #[test]
     fn classifies_by_type_not_by_message() {
         assert!(matches!(

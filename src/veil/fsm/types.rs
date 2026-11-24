@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 // ── Method identification ────────────────────────────────────────────────────
@@ -12,9 +12,9 @@ use std::{
 #[repr(u8)]
 pub enum MethodId {
     // Obfs4 and WebTunnel have no adapter since 2026-10-22 (decision
-    // veil-front-only-retire-obfs4). The ids stay: the discriminants are stored in
-    // the scores database and the bitmask ABI of `VeilStartRequest::allowed_methods`,
-    // and the reducer's tests race them as stand-in methods.
+    // veil-front-only-retire-obfs4). The ids stay: the discriminants are the bitmask ABI
+    // of `VeilStartRequest::allowed_methods` and `VeilStartResult::method`, and the
+    // reducer's tests race them as stand-in methods.
     /// obfs4 — retired, no adapter.
     Obfs4 = 0,
     /// WebTunnel — retired, no adapter.
@@ -28,7 +28,7 @@ pub enum MethodId {
 }
 
 impl MethodId {
-    /// All known methods, in priority order for scoring.
+    /// All known methods, in probe order.
     pub fn all() -> &'static [Self] {
         &[Self::Obfs4, Self::WebTunnel, Self::Masque, Self::VeilFront]
     }
@@ -57,47 +57,6 @@ impl std::fmt::Display for MethodId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.name())
     }
-}
-
-// ── Network fingerprint ──────────────────────────────────────────────────────
-
-/// Opaque network identifier used as the key for per-network scoring.
-///
-/// Computed by the caller (Swift/Kotlin) from SSID, BSSID, carrier info, etc.
-/// ICE treats this as opaque bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct NetworkFingerprint {
-    bytes: Vec<u8>,
-}
-
-impl NetworkFingerprint {
-    /// Create from raw bytes.
-    pub fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes }
-    }
-
-    /// Access raw bytes.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
-impl Default for NetworkFingerprint {
-    /// Default fingerprint used when caller doesn't provide one.
-    fn default() -> Self {
-        Self { bytes: vec![0; 16] }
-    }
-}
-
-// ── Scoring outcomes ─────────────────────────────────────────────────────────
-
-/// Outcome recorded in persistent scores.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScoreOutcome {
-    /// Probe succeeded.
-    Success { latency_ms: u32 },
-    /// Probe failed.
-    Failure { reason: ProbeFailureReason },
 }
 
 // ── Failure classification ───────────────────────────────────────────────────
@@ -196,25 +155,17 @@ pub enum VeilEvent {
     /// Caller requests ICE to start.
     Start {
         relay: String,
-        fingerprint: NetworkFingerprint,
         allowed_methods: MethodSet,
     },
 
     /// Caller requests ICE to stop.
     Stop,
 
-    /// A probe succeeded with the given latency.
-    ProbeSucceeded {
-        method: MethodId,
-        port: u16,
-        latency_ms: u32,
-    },
+    /// A probe succeeded.
+    ProbeSucceeded { method: MethodId, port: u16 },
 
     /// A probe failed.
-    ProbeFailed {
-        method: MethodId,
-        reason: ProbeFailureReason,
-    },
+    ProbeFailed { method: MethodId },
 
     /// All parallel probes failed without success.
     AllProbesFailed,
@@ -245,13 +196,6 @@ pub enum VeilEffect {
 
     /// Schedule a CooldownElapsed event after the given duration.
     ScheduleCooldown { duration: Duration },
-
-    /// Record a score outcome for a method on a specific network.
-    RecordScore {
-        method: MethodId,
-        fingerprint: NetworkFingerprint,
-        outcome: ScoreOutcome,
-    },
 }
 
 // ── Method set (allowed methods bitmask) ─────────────────────────────────────
@@ -312,10 +256,6 @@ pub struct VeilConfig {
     pub degraded_threshold: u8,
     /// Cooldown duration after all probes fail.
     pub cooldown_duration: Duration,
-    /// TTL for permanently_blocked entries.
-    pub block_ttl: Duration,
-    /// Max fingerprints in PersistentScores.
-    pub max_fingerprints: usize,
 }
 
 impl Default for VeilConfig {
@@ -326,8 +266,6 @@ impl Default for VeilConfig {
             probe_timeout: Duration::from_secs(8),
             degraded_threshold: 2,
             cooldown_duration: Duration::from_secs(30),
-            block_ttl: Duration::from_secs(7 * 24 * 3600), // 7 days
-            max_fingerprints: 50,
         }
     }
 }
@@ -340,16 +278,4 @@ impl VeilConfig {
             ..Self::default()
         }
     }
-}
-
-/// A score entry for scoring computation.
-#[derive(Debug, Clone, Default)]
-pub struct ScoreEntry {
-    pub successes: u32,
-    pub failures: u32,
-    pub last_success_at: Option<SystemTime>,
-    pub last_failure_at: Option<SystemTime>,
-    pub median_latency_ms: u32,
-    pub blocked_at: Option<SystemTime>,
-    pub consecutive_failures: u8,
 }

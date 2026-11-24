@@ -70,7 +70,9 @@ static COORDINATOR: OnceLock<std::sync::Arc<crate::veil::VeilCoordinator>> = Onc
 ///
 /// The layout is the ABI the apps compile against, so the fields of the retired
 /// transports stay in place and are ignored: `bundle` (obfs4), `host_header` and
-/// `wt_base_path` (WebTunnel).
+/// `wt_base_path` (WebTunnel). So do the fields of the per-network score database, removed
+/// on 2026-11-24 (todo 341): `network_fingerprint`, `scores_path`, `scoring_key` and their
+/// lengths. They are never dereferenced.
 #[repr(C)]
 pub struct VeilStartRequest {
     /// Relay address: "host:port" (required).
@@ -85,13 +87,13 @@ pub struct VeilStartRequest {
     pub host_header: *const c_char,
     /// Ignored (was the WebTunnel base path). May be NULL.
     pub wt_base_path: *const c_char,
-    /// Network fingerprint bytes (opaque, caller-computed). NULL = default.
+    /// Ignored (was the network the scores were kept under). May be NULL.
     pub network_fingerprint: *const u8,
-    /// Length of the network fingerprint buffer.
+    /// Ignored (was the length of `network_fingerprint`).
     pub network_fingerprint_len: usize,
     /// Bitmask of allowed methods (0 = all). Bit N = MethodId(N).
     pub allowed_methods: u32,
-    /// Path to the SQLite scores database. NULL = in-memory (no persistence).
+    /// Ignored (was the path of the SQLite scores database). May be NULL.
     pub scores_path: *const c_char,
     /// Base64-encoded veil-front ticket (65 bytes binary, AUTH v2). Empty / NULL
     /// with no AUTH v3 material below means the probe fails at ticket parsing.
@@ -108,11 +110,9 @@ pub struct VeilStartRequest {
     /// iOS). Never derived from or sent to the relay. NULL / empty = AUTH v3 not
     /// configured.
     pub veil_sk_hex: *const c_char,
-    /// 32-byte device key (Keychain/Keystore) that keys the scores fingerprint
-    /// hash. NULL or `scoring_key_len != 32` = no key: the fingerprint falls
-    /// back to a bare SHA-256, which is only acceptable for the in-memory path.
+    /// Ignored (was the device key of the scores fingerprint hash). May be NULL.
     pub scoring_key: *const u8,
-    /// Length of `scoring_key` (must be 32 to be used).
+    /// Ignored (was the length of `scoring_key`).
     pub scoring_key_len: usize,
 }
 
@@ -265,19 +265,17 @@ struct StartArgs {
     spki_hex: String,
     veil_front_ticket_b64: String,
     veil_front_auth_v3: crate::veil::VeilFrontAuthV3,
-    fingerprint: crate::veil::NetworkFingerprint,
     allowed_methods: crate::veil::MethodSet,
-    scoring_key: Option<[u8; 32]>,
 }
 
 /// Read and validate the request; `Err` is the reason for `veil_last_error`.
 ///
 /// # Safety
 ///
-/// Every non-NULL pointer in `req` points to what its field documents: a
-/// NUL-terminated string, or `network_fingerprint_len` readable bytes.
+/// Every non-NULL pointer in `req` that is not documented as ignored points to a
+/// NUL-terminated string.
 unsafe fn read_start_request(req: &VeilStartRequest) -> Result<StartArgs, String> {
-    use crate::veil::{MethodSet, NetworkFingerprint, VeilFrontAuthV3};
+    use crate::veil::{MethodSet, VeilFrontAuthV3};
 
     let relay_addr = unsafe {
         req.relay_addr
@@ -330,33 +328,14 @@ unsafe fn read_start_request(req: &VeilStartRequest) -> Result<StartArgs, String
         capability_v2_b64: veil_capability_v2_b64,
         veil_sk_hex,
     };
-    let fingerprint = if !req.network_fingerprint.is_null() && req.network_fingerprint_len > 0 {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(req.network_fingerprint, req.network_fingerprint_len)
-        };
-        NetworkFingerprint::new(bytes.to_vec())
-    } else {
-        NetworkFingerprint::default()
-    };
     let allowed_methods = MethodSet::from_bitmask(req.allowed_methods);
-    let scoring_key = if !req.scoring_key.is_null() && req.scoring_key_len == 32 {
-        let bytes = unsafe { std::slice::from_raw_parts(req.scoring_key, 32) };
-        let mut key = [0u8; 32];
-        key.copy_from_slice(bytes);
-        Some(key)
-    } else {
-        None
-    };
-
     Ok(StartArgs {
         relay_addr,
         tls_sni,
         spki_hex,
         veil_front_ticket_b64,
         veil_front_auth_v3,
-        fingerprint,
         allowed_methods,
-        scoring_key,
     })
 }
 
@@ -367,7 +346,7 @@ unsafe fn read_start_request(req: &VeilStartRequest) -> Result<StartArgs, String
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -> i32 {
     ffi_guard(-1, || {
-        use crate::veil::{VeilConfig, VeilCoordinator, scoring::PersistentScores};
+        use crate::veil::{VeilConfig, VeilCoordinator};
 
         // One start at a time. Two overlapping calls used to race on the coordinator
         // (`COORDINATOR.set` → "already set (race)") and on its active session; the
@@ -402,25 +381,7 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
             let coord = if let Some(c) = COORDINATOR.get() {
                 c.clone()
             } else {
-                // Open scores database.
-                let scores = if !req.scores_path.is_null() {
-                    let path_str =
-                        unsafe { CStr::from_ptr(req.scores_path).to_str().ok().unwrap_or("") };
-                    if !path_str.is_empty() {
-                        PersistentScores::open(path_str, 50, args.scoring_key)
-                            .await
-                            .map_err(|e| format!("scores open failed: {e}"))?
-                    } else {
-                        return Err("scores_path empty".to_string());
-                    }
-                } else {
-                    // In-memory SQLite for testing.
-                    PersistentScores::open(":memory:", 50, None)
-                        .await
-                        .map_err(|e| format!("scores open (memory) failed: {e}"))?
-                };
-
-                let mut coordinator = VeilCoordinator::new(config, scores);
+                let mut coordinator = VeilCoordinator::new(config);
                 // veil-front is the only transport (decision veil-front-only-retire-obfs4).
                 coordinator.register(Box::new(crate::veil::VeilFrontObfuscator::new()));
 
@@ -434,7 +395,6 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
             let session_result = coord
                 .start_session_with_params(
                     args.relay_addr,
-                    args.fingerprint,
                     args.allowed_methods,
                     args.tls_sni,
                     args.spki_hex,
@@ -618,5 +578,59 @@ mod tests {
             .err()
             .unwrap_or_default();
         assert!(reason.contains("SPKI"), "{reason:?}");
+    }
+
+    /// The fields of the removed score database are never read: pointers no one could
+    /// dereference do not stop the request from being accepted. Mutation: read any of
+    /// them again (`CStr::from_ptr(req.scores_path)`) — the test process dies on SIGSEGV.
+    #[test]
+    fn the_score_database_fields_are_not_dereferenced() {
+        let relay = CString::new("127.0.0.1:9").unwrap();
+        let pin = CString::new("ab".repeat(32)).unwrap();
+        let wild = std::ptr::dangling::<u8>();
+        let req = VeilStartRequest {
+            relay_addr: relay.as_ptr(),
+            bundle: std::ptr::null(),
+            tls_sni: std::ptr::null(),
+            spki_hex: pin.as_ptr(),
+            host_header: std::ptr::null(),
+            wt_base_path: std::ptr::null(),
+            network_fingerprint: wild,
+            network_fingerprint_len: 1 << 20,
+            allowed_methods: 0,
+            scores_path: wild.cast(),
+            veil_front_ticket_b64: std::ptr::null(),
+            veil_capability_v2_b64: std::ptr::null(),
+            veil_sk_hex: std::ptr::null(),
+            scoring_key: wild,
+            scoring_key_len: 32,
+        };
+        assert!(unsafe { read_start_request(&req) }.is_ok());
+        // The exported call too: it gets as far as dialling the closed port. Its reason is
+        // not asserted, `veil_last_error` is process-global and other tests write it.
+        let mut out = VeilStartResult {
+            port: 0,
+            method: 0,
+            latency_ms: 0,
+        };
+        assert_eq!(veil_start(req, &mut out), -1);
+    }
+
+    /// The layout the apps were compiled against: no field moved or left when its reader
+    /// did. Mutation: move `scores_path` below `veil_sk_hex`.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn the_start_request_layout_is_the_abi() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<VeilStartRequest>(), 120);
+        assert_eq!(offset_of!(VeilStartRequest, network_fingerprint), 48);
+        assert_eq!(offset_of!(VeilStartRequest, network_fingerprint_len), 56);
+        assert_eq!(offset_of!(VeilStartRequest, allowed_methods), 64);
+        assert_eq!(offset_of!(VeilStartRequest, scores_path), 72);
+        assert_eq!(offset_of!(VeilStartRequest, veil_front_ticket_b64), 80);
+        assert_eq!(offset_of!(VeilStartRequest, veil_capability_v2_b64), 88);
+        assert_eq!(offset_of!(VeilStartRequest, veil_sk_hex), 96);
+        assert_eq!(offset_of!(VeilStartRequest, scoring_key), 104);
+        assert_eq!(offset_of!(VeilStartRequest, scoring_key_len), 112);
     }
 }
