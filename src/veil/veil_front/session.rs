@@ -12,7 +12,7 @@
 //! `decisions/sans-io-core-platform-adapters.md`).
 
 use std::io;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use construct_veil_protocol::{FRAME_TYPE_DATA, Frame, LENGTH_BUCKETS, VeilFrontCodec};
@@ -79,11 +79,11 @@ impl VeilFrontUp {
         self.strategy.has_pending()
     }
 
-    /// Whether nothing can be due until more local bytes are queued: no payload
-    /// waiting and the front-loaded chaff finished. A driver then waits on the local
-    /// read alone, with no timer — an idle tunnel must not wake the device.
-    pub fn waits_for_local(&self, now: Instant) -> bool {
-        self.strategy.waits_for_payload(now)
+    /// How long until something is due without more local bytes: zero now, `None` never. A driver
+    /// waits on the local read for that long — with no timer once the chaff is sent: an idle tunnel
+    /// must not wake the device.
+    pub fn next_due(&mut self, now: Instant) -> Option<Duration> {
+        self.strategy.next_due(now)
     }
 
     /// Consume the up half, returning the [`WriteStrategy`] for overhead metrics.
@@ -163,53 +163,30 @@ mod tests {
         );
     }
 
-    /// An idle up half asks to be woken only while chaff is still owed: during the
-    /// front window and until its queued chaff is sent. Then nothing is due until
-    /// local bytes arrive, and queued payload makes it due again. Mutation: keep
-    /// asking for the tick after the chaff is done (the 20 ms wake-up for the life of
-    /// the tunnel) — this reddens.
+    /// An idle up half asks to be woken exactly when its next chaff is due, and not at all once it
+    /// is sent; queued payload is due now. Mutation: ask for a tick after the chaff is done — this
+    /// reddens.
     #[test]
-    fn up_waits_for_local_only_once_chaff_is_done() {
-        let (mut up, _down) = VeilFrontSession::new();
-        let t0 = Instant::now();
-        assert!(!up.waits_for_local(t0), "the front window has not run yet");
-        assert!(
-            up.next_wire(t0).unwrap().is_some(),
-            "chaff is due at the start"
-        );
-        assert!(!up.waits_for_local(t0), "chaff is owed inside the window");
-
-        let later = t0 + std::time::Duration::from_secs(4);
-        while up.next_wire(later).unwrap().is_some() {}
-        assert!(
-            up.waits_for_local(later),
-            "chaff done: nothing due until local bytes"
-        );
+    fn up_asks_to_be_woken_only_for_chaff_it_owes() {
+        let (mut up, mut down) = VeilFrontSession::new();
+        let mut now = Instant::now();
+        let t0 = now;
+        let mut frames = 0;
+        while let Some(wait) = up.next_due(now) {
+            now += wait;
+            let wire = up.next_wire(now).unwrap().expect("due is due");
+            down.feed(&wire);
+            frames += 1;
+        }
+        assert!(frames <= 32);
+        assert!(now - t0 <= Duration::from_secs(4), "chaff is front-loaded");
+        assert_eq!(down.next_payload().unwrap(), None, "chaff is not payload");
+        assert!(!up.has_pending());
 
         up.queue_local(b"payload");
-        assert!(!up.waits_for_local(later), "queued payload is due");
-        assert!(up.next_wire(later).unwrap().is_some());
-        assert!(up.waits_for_local(later));
-    }
-
-    /// With nothing queued, the up half emits chaff during the front window, and
-    /// that chaff carries no DATA payload downstream.
-    #[test]
-    fn up_emits_chaff_when_idle() {
-        let start = Instant::now();
-        let (mut up, mut down) = VeilFrontSession::new();
-        assert!(up.has_pending(), "front-loaded chaff is pending at start");
-
-        let wire = up
-            .next_wire(start)
-            .expect("encode ok")
-            .expect("chaff is due at connection start");
-        down.feed(&wire);
-        assert_eq!(
-            down.next_payload().expect("decode ok"),
-            None,
-            "an idle-window frame is chaff, not DATA"
-        );
+        assert_eq!(up.next_due(now), Some(Duration::ZERO));
+        assert!(up.next_wire(now).unwrap().is_some());
+        assert_eq!(up.next_due(now), None);
     }
 
     /// The down half reassembles frames split across arbitrary feed boundaries and
