@@ -21,6 +21,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::veil::dial::DialObserver;
 use crate::veil::fsm::{
     MethodId, MethodSet, ProbeFailureReason, TransportFailureKind, VeilConfig, VeilEffect,
     VeilEvent, VeilState, reduce,
@@ -86,6 +87,7 @@ pub struct VeilCoordinator {
     config: VeilConfig,
     obfuscators: HashMap<MethodId, Arc<dyn Obfuscator>>,
     active: Arc<Mutex<Option<ActiveSession>>>,
+    on_dial: Option<DialObserver>,
     next_session_id: std::sync::atomic::AtomicU64,
 }
 
@@ -96,6 +98,7 @@ impl VeilCoordinator {
             config,
             obfuscators: HashMap::new(),
             active: Arc::new(Mutex::new(None)),
+            on_dial: None,
             next_session_id: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -104,6 +107,11 @@ impl VeilCoordinator {
     pub fn register(&mut self, obfuscator: Box<dyn Obfuscator>) {
         self.obfuscators
             .insert(obfuscator.method_id(), Arc::from(obfuscator));
+    }
+
+    /// Who to tell what each dial to a front came to: the probes' and every tunnel's.
+    pub fn observe_dials(&mut self, observer: DialObserver) {
+        self.on_dial = Some(observer);
     }
 
     /// Start an VEIL session with full TLS parameters.
@@ -442,6 +450,7 @@ impl VeilCoordinator {
             let spki_hex_str = spki_hex.to_owned();
             let veil_front_ticket_b64_str = veil_front_ticket_b64.to_owned();
             let veil_front_auth_v3_owned = veil_front_auth_v3.clone();
+            let on_dial = self.on_dial.clone();
             let probe_timeout = self.config.probe_timeout;
             let obfuscator = self.obfuscators.get(&method);
             let has_obfuscator = obfuscator.is_some();
@@ -484,6 +493,7 @@ impl VeilCoordinator {
 
                 let probe_start = Instant::now();
                 let req = ProbeRequest {
+                    on_dial,
                     relay_addr: relay_str,
                     tls_sni: tls_sni_str,
                     spki_hex: spki_hex_str,
@@ -709,9 +719,10 @@ impl VeilCoordinator {
         }
 
         let active = self.active.clone();
+        let on_dial = self.on_dial.clone();
         tokio::spawn(async move {
             run_proxy_loop(listener, shutdown_rx, tunnels, move |local| {
-                handle_proxy_connection(local, params.clone())
+                handle_proxy_connection(local, params.clone(), on_dial.clone())
             })
             .await;
             let mut guard = active.lock().await;
@@ -784,6 +795,7 @@ impl VeilCoordinator {
         };
 
         let req = ProbeRequest {
+            on_dial: self.on_dial.clone(),
             relay_addr: relay.to_owned(),
             tls_sni: tls_sni.to_owned(),
             spki_hex: spki_hex.to_owned(),
@@ -821,10 +833,13 @@ impl VeilCoordinator {
         }
     }
 
-    /// Check if a session is currently active.
+    /// Whether a session is active and its port is still listened on.
+    ///
+    /// The slot alone is not enough: iOS takes the listening socket from a suspended process and
+    /// tells no one, and the session looked alive with nothing behind its port.
     pub async fn is_alive(&self) -> bool {
         let guard = self.active.lock().await;
-        guard.is_some()
+        guard.as_ref().is_some_and(|s| listener_is_there(s.port))
     }
 
     /// Get the active session port.
@@ -843,6 +858,22 @@ impl VeilCoordinator {
             kind,
         );
     }
+}
+
+/// Whether something listens on this loopback port, asked of the system and not of the port:
+/// connecting to it would open a tunnel to the front. Binding it (and not listening) is refused
+/// while a listener holds it. A port of ours that can be bound has none.
+fn listener_is_there(port: u16) -> bool {
+    let Ok(socket) = tokio::net::TcpSocket::new_v4() else {
+        return true;
+    };
+    // Tunnels still open on the port, or lingering after it, do not refuse the bind then. On
+    // Windows the option means "take the port from whoever has it", and it is not needed there.
+    #[cfg(unix)]
+    if socket.set_reuseaddr(true).is_err() {
+        return true;
+    }
+    socket.bind(([127, 0, 0, 1], port).into()).is_err()
 }
 
 /// Parameters needed to run the data-plane proxy for the winning method.
@@ -908,18 +939,23 @@ async fn run_proxy_loop<F, Fut>(
 
 /// Handle a single proxy connection by dispatching to the winning method's
 /// data plane: local → <method> → relay.
-async fn handle_proxy_connection(local: TcpStream, params: ProxyParams) {
+async fn handle_proxy_connection(
+    local: TcpStream,
+    params: ProxyParams,
+    on_dial: Option<DialObserver>,
+) {
     match params.method {
         #[cfg(feature = "utls")]
         MethodId::VeilFront => {
             // veil-front: framed h2c ferry over the authenticated TLS tunnel.
-            if let Err(e) = crate::veil::veil_front_adapter::run_veil_front_ferry(
+            if let Err(e) = crate::veil::veil_front_adapter::run_veil_front_ferry_observed(
                 local,
                 &params.relay_addr,
                 &params.tls_sni,
                 &params.spki_hex,
                 &params.veil_front_ticket_b64,
                 &params.veil_front_auth_v3,
+                on_dial.as_ref(),
             )
             .await
             {
@@ -1112,6 +1148,177 @@ mod tests {
             .await
             .expect("proxy loop did not end")
             .unwrap();
+    }
+
+    type Dials = Arc<std::sync::Mutex<Vec<(String, crate::veil::DialOutcome)>>>;
+
+    fn observed(config: VeilConfig) -> (VeilCoordinator, Dials) {
+        let mut coord = coordinator(config);
+        coord.register(Box::new(Fake {
+            method: MethodId::VeilFront,
+            ok: true,
+        }));
+        let dials = Dials::default();
+        let log = dials.clone();
+        coord.observe_dials(Arc::new(move |relay, outcome| {
+            log.lock().unwrap().push((relay.to_owned(), outcome));
+        }));
+        (coord, dials)
+    }
+
+    async fn start_at(coord: &VeilCoordinator, relay: &str) -> u16 {
+        coord
+            .start_session_with_params(
+                relay.to_owned(),
+                MethodSet::all(),
+                "localhost".into(),
+                "ab".repeat(32),
+                String::new(),
+                VeilFrontAuthV3::default(),
+            )
+            .await
+            .unwrap()
+            .port
+    }
+
+    /// Every local connection is a dial of its own, and each that fails is told, with the
+    /// front it went to. Mutation: run the tunnel without the observer.
+    #[cfg(feature = "utls")]
+    #[tokio::test]
+    async fn a_tunnels_failed_dial_reaches_the_observer() {
+        use tokio::io::AsyncReadExt;
+        let refused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = refused.local_addr().unwrap().to_string();
+        drop(refused);
+        let (coord, dials) = observed(VeilConfig::legacy());
+        let port = start_at(&coord, &relay).await;
+        assert_eq!(*dials.lock().unwrap(), [], "the fake probe dials nothing");
+        for n in 1..=2 {
+            let mut local = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let _ = local.read(&mut [0u8; 1]).await; // the tunnel gave up
+            assert_eq!(dials.lock().unwrap().len(), n);
+        }
+        assert!(
+            dials
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|d| *d == (relay.clone(), crate::veil::DialOutcome::Failed))
+        );
+    }
+
+    /// Our own stop, in the middle of a dial, is not the front's failure.
+    #[cfg(feature = "utls")]
+    #[tokio::test]
+    async fn a_dial_ended_by_stop_is_not_told() {
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = silent.local_addr().unwrap().to_string();
+        let (coord, dials) = observed(VeilConfig::legacy());
+        let port = start_at(&coord, &relay).await;
+        let _local = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (_held, _) = silent.accept().await.unwrap(); // dialing now
+        assert!(coord.stop().await);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(*dials.lock().unwrap(), []);
+    }
+
+    /// A probe is told of its observer on both paths, one candidate and a race.
+    #[tokio::test]
+    async fn a_probe_is_given_the_observer() {
+        struct Says;
+        #[async_trait::async_trait]
+        impl Obfuscator for Says {
+            fn method_id(&self) -> MethodId {
+                MethodId::VeilFront
+            }
+            async fn start(
+                &self,
+                req: &ProbeRequest,
+                _cancel: CancellationToken,
+            ) -> Result<ObfuscatorHandle, ObfuscatorError> {
+                if let Some(tell) = &req.on_dial {
+                    tell(&req.relay_addr, crate::veil::DialOutcome::Up);
+                }
+                Err(ObfuscatorError::ConnectionRefused)
+            }
+        }
+        for (config, race) in [(VeilConfig::legacy(), false), (VeilConfig::default(), true)] {
+            let (mut coord, dials) = observed(config);
+            if race {
+                coord.register(Box::new(Fake {
+                    method: MethodId::Obfs4,
+                    ok: false,
+                }));
+            }
+            coord.register(Box::new(Says));
+            assert!(start(&coord).await.is_err());
+            assert_eq!(
+                *dials.lock().unwrap(),
+                [("relay:443".to_owned(), crate::veil::DialOutcome::Up)]
+            );
+        }
+    }
+
+    /// The listener gone behind the session's back, as iOS takes it from a suspended process
+    /// (2026-10-02): the accept loop never hears of it, the slot still holds the session.
+    /// `dup2` puts another file under the listener's descriptor, which is as silent.
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    async fn session_with_a_reclaimed_listener(keep_tunnel: bool) -> VeilCoordinator {
+        use std::os::fd::AsRawFd;
+        let mut coord = coordinator(VeilConfig::legacy());
+        coord.register(Box::new(Fake {
+            method: MethodId::VeilFront,
+            ok: true,
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let raw = listener.as_raw_fd();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let tunnels = CancellationToken::new();
+        *coord.active.lock().await = Some(ActiveSession {
+            id: 1,
+            port: addr.port(),
+            method: MethodId::VeilFront,
+            shutdown_tx,
+            tunnels: tunnels.clone(),
+        });
+        tokio::spawn(run_proxy_loop(
+            listener,
+            shutdown_rx,
+            tunnels,
+            |local| async move {
+                let _keep = local;
+                std::future::pending::<()>().await;
+            },
+        ));
+        assert!(coord.is_alive().await, "a listening session is alive");
+        if keep_tunnel {
+            let client = TcpStream::connect(addr).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await; // accepted
+            assert!(coord.is_alive().await, "a tunnel does not end it");
+            std::mem::forget(client);
+        }
+        let null = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(unsafe { libc::dup2(null.as_raw_fd(), raw) }, raw);
+        coord
+    }
+
+    /// Mutation: answer from the slot alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_session_whose_listener_is_gone_is_not_alive() {
+        let coord = session_with_a_reclaimed_listener(false).await;
+        assert!(!coord.is_alive().await);
+    }
+
+    /// A tunnel still open on the port is not a listener. Mutation: probe without
+    /// `SO_REUSEADDR`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_tunnel_does_not_stand_in_for_the_listener() {
+        let coord = session_with_a_reclaimed_listener(true).await;
+        assert!(!coord.is_alive().await);
     }
 
     /// Mutation: map `Tls(_)` back to `FingerprintBlocked`.

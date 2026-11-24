@@ -133,6 +133,8 @@ pub struct VeilFrontAuthV3 {
 /// Information passed to an obfuscator to start a probe.
 #[derive(Clone, Default)]
 pub struct ProbeRequest {
+    /// Told what each dial of the probe came to.
+    pub on_dial: Option<crate::veil::dial::DialObserver>,
     /// Relay address (e.g. "relay.example.com:443").
     pub relay_addr: String,
     /// TLS SNI hostname. Empty = no SNI.

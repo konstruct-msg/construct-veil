@@ -6,6 +6,9 @@
 //! int32_t  veil_stop(void);
 //! int32_t  veil_is_alive(void);
 //! uint16_t veil_port(void);
+//! // What each dial to a front came to; outcome: 0 up, 1 failed, 2 another key.
+//! typedef void (*veil_dial_observer)(const char *relay_addr, int32_t outcome, void *context);
+//! int32_t  veil_observe_dials(veil_dial_observer observer, void *context);
 //! // Host-terminated TLS (iOS NWConnection, Android Conscrypt): one ferry per
 //! // accepted local connection.
 //! int32_t  veil_front_ferry_fd(int32_t local_fd, int32_t relay_fd,
@@ -19,8 +22,8 @@
 //! client called them. See `decisions/veil-front-only-retire-obfs4`.
 
 use std::{
-    ffi::{CStr, c_char},
-    sync::{Mutex, OnceLock},
+    ffi::{CStr, CString, c_char, c_void},
+    sync::{Mutex, OnceLock, mpsc},
 };
 
 use tokio::runtime::Runtime;
@@ -385,6 +388,7 @@ pub extern "C" fn veil_start(req: VeilStartRequest, out: *mut VeilStartResult) -
                 c.clone()
             } else {
                 let mut coordinator = VeilCoordinator::new(config);
+                coordinator.observe_dials(std::sync::Arc::new(tell_dial));
                 // veil-front is the only transport (decision veil-front-only-retire-obfs4).
                 coordinator.register(Box::new(crate::veil::VeilFrontObfuscator::new()));
 
@@ -504,10 +508,176 @@ pub extern "C" fn veil_port() -> u16 {
     })
 }
 
+// ── Dial outcomes ─────────────────────────────────────────────────────────────
+
+/// Told what a dial to `relay_addr` (valid for the call) came to: 0 the front answered under its
+/// pinned key, 1 it did not answer, 2 something answered under another key. `context` comes back
+/// as it was given.
+pub type VeilDialObserver =
+    extern "C" fn(relay_addr: *const c_char, outcome: i32, context: *mut c_void);
+
+/// Where the coordinator's dials go: to the thread that calls the host's observer.
+static DIALS: Mutex<Option<mpsc::Sender<(CString, i32)>>> = Mutex::new(None);
+
+/// Hear what every dial of the coordinator's session came to: the probe's, and one for each local
+/// connection. A dial the host ended itself (`veil_stop`, another `veil_start`) is not told.
+/// `veil_front_ferry_fd` dials nothing; there the host knows.
+///
+/// The observer is called on a thread of its own, one call at a time, in the order the dials
+/// ended, and may call any function here. (On the runtime's threads it could not: `veil_stop`
+/// blocks on the runtime, and blocking on it from inside panics, which ends a shipped app.)
+///
+/// A second call replaces the observer. NULL stops telling. The function and its context stay
+/// valid for the life of the process: an outcome already on its way still reaches the observer
+/// it was told to. Returns 0, or -1 when the thread cannot be started.
+#[unsafe(no_mangle)]
+pub extern "C" fn veil_observe_dials(
+    observer: Option<VeilDialObserver>,
+    context: *mut c_void,
+) -> i32 {
+    ffi_guard(-1, || {
+        let mut dials = DIALS.lock().unwrap_or_else(|p| p.into_inner());
+        *dials = None;
+        let Some(observer) = observer else {
+            return 0;
+        };
+        let (tx, rx) = mpsc::channel::<(CString, i32)>();
+        // The host's pointer, handed back and never read here.
+        let context = context as usize;
+        let started = std::thread::Builder::new()
+            .name("veil-dials".into())
+            .spawn(move || {
+                for (relay, outcome) in rx {
+                    observer(relay.as_ptr(), outcome, context as *mut c_void);
+                }
+            });
+        if started.is_err() {
+            return -1;
+        }
+        *dials = Some(tx);
+        0
+    })
+}
+
+fn tell_dial(relay: &str, outcome: crate::veil::DialOutcome) {
+    use crate::veil::DialOutcome;
+    let outcome = match outcome {
+        DialOutcome::Up => 0,
+        DialOutcome::Failed => 1,
+        DialOutcome::PinMismatch => 2,
+    };
+    // A relay address came in as a C string, so it has no NUL of its own.
+    let Ok(relay) = CString::new(relay) else {
+        return;
+    };
+    if let Some(tx) = DIALS.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        let _ = tx.send((relay, outcome));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
+
+    /// The observer and the coordinator are one per process; tests that dial take turns.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    /// The C side of the observer, with the one slot this process has.
+    mod dials {
+        use super::*;
+        use crate::veil::DialOutcome;
+        use std::time::Duration;
+
+        type Told = (String, i32, usize, Option<String>);
+        static TOLD: Mutex<Vec<Told>> = Mutex::new(Vec::new());
+
+        extern "C" fn record(relay: *const c_char, outcome: i32, context: *mut c_void) {
+            let relay = unsafe { CStr::from_ptr(relay) }
+                .to_str()
+                .unwrap()
+                .to_owned();
+            // Blocks on the runtime: a panic (and an abort in an app) from one of its threads.
+            let _ = veil_is_alive();
+            TOLD.lock().unwrap().push((
+                relay,
+                outcome,
+                context as usize,
+                std::thread::current().name().map(str::to_owned),
+            ));
+        }
+
+        fn told(n: usize) -> Vec<Told> {
+            for _ in 0..200 {
+                if TOLD.lock().unwrap().len() >= n {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(50)); // nothing more comes
+            std::mem::take(&mut *TOLD.lock().unwrap())
+        }
+
+        /// Every outcome under its number, in order, on one thread, with the context given.
+        /// Mutations: swap two numbers; call the observer from `tell_dial` itself.
+        #[test]
+        fn outcomes_reach_the_host_in_order_off_the_runtime() {
+            let _slot = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(
+                veil_observe_dials(Some(record), std::ptr::without_provenance_mut(42)),
+                0
+            );
+            get_runtime().block_on(async {
+                tokio::spawn(async {
+                    tell_dial("a:1", DialOutcome::Up);
+                    tell_dial("b:2", DialOutcome::Failed);
+                    tell_dial("c:3", DialOutcome::PinMismatch);
+                })
+                .await
+                .unwrap();
+            });
+            let told = told(3);
+            let seen: Vec<_> = told.iter().map(|t| (t.0.as_str(), t.1, t.2)).collect();
+            assert_eq!(seen, [("a:1", 0, 42), ("b:2", 1, 42), ("c:3", 2, 42)]);
+            assert!(told.iter().all(|t| t.3.as_deref() == Some("veil-dials")));
+            assert_eq!(veil_observe_dials(None, std::ptr::null_mut()), 0);
+        }
+
+        /// The one set last, and no one after NULL.
+        #[test]
+        fn the_last_observer_is_told_and_null_stops_it() {
+            let _slot = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
+            veil_observe_dials(Some(record), std::ptr::without_provenance_mut(1));
+            veil_observe_dials(Some(record), std::ptr::without_provenance_mut(2));
+            tell_dial("a:1", DialOutcome::Up);
+            assert_eq!(told(1).iter().map(|t| t.2).collect::<Vec<_>>(), [2]);
+            veil_observe_dials(None, std::ptr::null_mut());
+            tell_dial("a:1", DialOutcome::Up);
+            assert_eq!(told(0).len(), 0);
+        }
+
+        /// `veil_start` is the producer: its probe's dial is told. Mutation: build the
+        /// coordinator without the observer.
+        #[test]
+        fn a_start_tells_its_dial() {
+            let _slot = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
+            let refused = {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                l.local_addr().unwrap().to_string()
+            };
+            veil_observe_dials(Some(record), std::ptr::null_mut());
+            let relay = CString::new(refused.clone()).unwrap();
+            let pin = CString::new("ab".repeat(32)).unwrap();
+            let sni = CString::new("localhost").unwrap();
+            let mut req: VeilStartRequest = unsafe { std::mem::zeroed() };
+            req.relay_addr = relay.as_ptr();
+            req.spki_hex = pin.as_ptr();
+            req.tls_sni = sni.as_ptr();
+            assert_eq!(veil_start(req, std::ptr::null_mut()), -1);
+            let seen: Vec<_> = told(1).into_iter().map(|t| (t.0, t.1)).collect();
+            assert_eq!(seen, [(refused, 1)]);
+            veil_observe_dials(None, std::ptr::null_mut());
+        }
+    }
 
     /// Holds where panics unwind, as in tests; a shipped app aborts (see `ffi_guard`).
     /// Mutation: call `body()` without `catch_unwind` — the panic escapes.
@@ -589,6 +759,7 @@ mod tests {
     /// them again (`CStr::from_ptr(req.scores_path)`) — the test process dies on SIGSEGV.
     #[test]
     fn the_score_database_fields_are_not_dereferenced() {
+        let _slot = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
         let relay = CString::new("127.0.0.1:9").unwrap();
         let pin = CString::new("ab".repeat(32)).unwrap();
         let wild = std::ptr::dangling::<u8>();
