@@ -25,6 +25,7 @@
 
 pub mod coordinator;
 pub mod diag;
+pub mod dial;
 pub mod fsm;
 pub mod obfuscator;
 pub mod veil_front; // Padding modes shared between client and relay
@@ -33,6 +34,7 @@ pub mod veil_front; // Padding modes shared between client and relay
 pub mod veil_front_adapter;
 
 pub use coordinator::*;
+pub use dial::{DialObserver, DialOutcome};
 pub use fsm::*;
 pub use obfuscator::*;
 

@@ -20,6 +20,7 @@ use tokio::net::TcpStream;
 use tokio_util::codec::{Decoder, Encoder};
 use tokio_util::sync::CancellationToken;
 
+use crate::veil::dial::{DialObserver, DialOutcome, outcome_of_tls_error};
 use crate::veil::fsm::MethodId;
 use crate::veil::obfuscator::{
     Obfuscator, ObfuscatorError, ObfuscatorHandle, ProbeRequest, VeilFrontAuthV3,
@@ -93,13 +94,15 @@ impl Obfuscator for VeilFrontObfuscator {
 /// (ticket B1) — no flag-day, both paths coexist.
 ///
 /// Returns the authenticated TLS stream with the AUTH frame already written and
-/// flushed. The caller drives the tunnel (probe round-trip or data ferry).
+/// flushed. The caller drives the tunnel (probe round-trip or data ferry). `on_dial` is told
+/// what TCP and TLS came to, once, before AUTH.
 async fn dial_and_authenticate(
     relay_addr: &str,
     tls_sni: &str,
     spki_hex: &str,
     capability_b64: &str,
     auth_v3: &VeilFrontAuthV3,
+    on_dial: Option<&DialObserver>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ObfuscatorError> {
     dial_and_authenticate_within(
         relay_addr,
@@ -108,6 +111,7 @@ async fn dial_and_authenticate(
         capability_b64,
         auth_v3,
         TLS_AND_AUTH_TIMEOUT,
+        on_dial,
     )
     .await
 }
@@ -120,6 +124,7 @@ async fn dial_and_authenticate(
 /// outer timeout — hanging per local connection, forever.
 const TLS_AND_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[allow(clippy::too_many_arguments)]
 async fn dial_and_authenticate_within(
     relay_addr: &str,
     tls_sni: &str,
@@ -127,29 +132,63 @@ async fn dial_and_authenticate_within(
     capability_b64: &str,
     auth_v3: &VeilFrontAuthV3,
     tls_and_auth_timeout: Duration,
+    on_dial: Option<&DialObserver>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ObfuscatorError> {
-    // TCP connect with timeout.
-    let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(relay_addr))
-        .await
-        .map_err(|_| ObfuscatorError::Timeout)?
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                ObfuscatorError::ConnectionRefused
-            } else {
-                ObfuscatorError::Io(e)
-            }
-        })?;
-    tcp.set_nodelay(true).map_err(ObfuscatorError::Io)?;
+    // Ours to get right (a malformed pin or name), so not a dial.
+    let (connector, server_name) = utls_connector(tls_sni, spki_hex, relay_addr)?;
+    let dialed = dial_tls(relay_addr, connector, server_name, tls_and_auth_timeout).await;
+    if let Some(observer) = on_dial {
+        let outcome = match &dialed {
+            Ok(_) => DialOutcome::Up,
+            Err((outcome, _)) => *outcome,
+        };
+        observer(relay_addr, outcome);
+    }
+    let (mut tls_stream, deadline) = dialed.map_err(|(_, e)| e)?;
 
-    // TLS handshake with SPKI pinning, then AUTH — bounded together.
-    tokio::time::timeout(tls_and_auth_timeout, async {
-        let mut tls_stream = dial_utls_tcp(tcp, tls_sni, spki_hex, relay_addr).await?;
+    tokio::time::timeout_at(deadline, async {
         let exporter = derive_exporter(&tls_stream)?;
         authenticate_over(&mut tls_stream, &exporter, capability_b64, auth_v3).await?;
         Ok(tls_stream)
     })
     .await
     .map_err(|_| ObfuscatorError::Timeout)?
+}
+
+type TlsToFront = tokio_rustls::client::TlsStream<TcpStream>;
+
+/// TCP (5 s) and TLS; what is left of `tls_and_auth_timeout` comes back as the deadline for AUTH.
+async fn dial_tls(
+    relay_addr: &str,
+    connector: tokio_rustls::TlsConnector,
+    server_name: rustls::pki_types::ServerName<'static>,
+    tls_and_auth_timeout: Duration,
+) -> Result<(TlsToFront, tokio::time::Instant), (DialOutcome, ObfuscatorError)> {
+    let failed = |e| (DialOutcome::Failed, e);
+    let tcp = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(relay_addr))
+        .await
+        .map_err(|_| failed(ObfuscatorError::Timeout))?
+        .map_err(|e| {
+            failed(if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                ObfuscatorError::ConnectionRefused
+            } else {
+                ObfuscatorError::Io(e)
+            })
+        })?;
+    tcp.set_nodelay(true)
+        .map_err(|e| failed(ObfuscatorError::Io(e)))?;
+
+    let deadline = tokio::time::Instant::now() + tls_and_auth_timeout;
+    let tls = tokio::time::timeout_at(deadline, connector.connect(server_name, tcp))
+        .await
+        .map_err(|_| failed(ObfuscatorError::Timeout))?
+        .map_err(|e| {
+            (
+                outcome_of_tls_error(&e),
+                ObfuscatorError::from_tls_connect(&e),
+            )
+        })?;
+    Ok((tls, deadline))
 }
 
 /// Build and send the veil-front AUTH frame over an already-established relay
@@ -221,6 +260,7 @@ async fn probe_veil_front(req: &ProbeRequest) -> Result<(), ObfuscatorError> {
         &req.spki_hex,
         &req.veil_front_ticket_b64,
         &req.auth_v3,
+        req.on_dial.as_ref(),
     )
     .await?;
 
@@ -324,8 +364,24 @@ pub async fn run_veil_front_ferry_with_metrics(
     ticket_b64: &str,
     auth_v3: &VeilFrontAuthV3,
 ) -> Result<WriteStrategy, ObfuscatorError> {
+    run_veil_front_ferry_observed(
+        local, relay_addr, tls_sni, spki_hex, ticket_b64, auth_v3, None,
+    )
+    .await
+}
+
+/// [`run_veil_front_ferry_with_metrics`], with `on_dial` told what its dial came to.
+pub(crate) async fn run_veil_front_ferry_observed(
+    local: TcpStream,
+    relay_addr: &str,
+    tls_sni: &str,
+    spki_hex: &str,
+    ticket_b64: &str,
+    auth_v3: &VeilFrontAuthV3,
+    on_dial: Option<&DialObserver>,
+) -> Result<WriteStrategy, ObfuscatorError> {
     let tls_stream =
-        dial_and_authenticate(relay_addr, tls_sni, spki_hex, ticket_b64, auth_v3).await?;
+        dial_and_authenticate(relay_addr, tls_sni, spki_hex, ticket_b64, auth_v3, on_dial).await?;
     run_ferry(tls_stream, local).await
 }
 
@@ -490,18 +546,22 @@ pub async fn run_veil_front_ferry(
     Ok(())
 }
 
-/// Dial TLS using uTLS with SPKI pinning.
+/// The uTLS connector with SPKI pinning, for one dial.
 ///
-/// The connector is built per dial and never cached: a kept config would resume the TLS
-/// session, and the relay that issued the ticket links the two connections
-/// (`tls_pinned::resumption`).
-async fn dial_utls_tcp(
-    tcp: TcpStream,
+/// Built per dial and never cached: a kept config would resume the TLS session, and the relay
+/// that issued the ticket links the two connections (`tls_pinned::resumption`).
+fn utls_connector(
     tls_sni: &str,
     spki_hex: &str,
     relay_addr: &str,
-) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ObfuscatorError> {
-    let (connector, server_name) = crate::tls_pinned::build_connector(
+) -> Result<
+    (
+        tokio_rustls::TlsConnector,
+        rustls::pki_types::ServerName<'static>,
+    ),
+    ObfuscatorError,
+> {
+    crate::tls_pinned::build_connector(
         tls_sni,
         spki_hex,
         relay_addr,
@@ -509,12 +569,7 @@ async fn dial_utls_tcp(
         // veil-front uses HTTP/2 (h2c inner, h2 on wire).
         Some(vec![b"h2".to_vec()]),
     )
-    .map_err(|e| ObfuscatorError::Tls(e.to_string()))?;
-
-    connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| ObfuscatorError::from_tls_connect(&e))
+    .map_err(|e| ObfuscatorError::Tls(e.to_string()))
 }
 
 /// Derive the TLS exporter keying material (32 bytes).
@@ -707,11 +762,129 @@ mod probe_logic {
                 "",
                 &VeilFrontAuthV3::default(),
                 Duration::from_millis(200),
+                None,
             ),
         )
         .await
         .expect("dial hung past its own timeout");
         assert!(matches!(result, Err(ObfuscatorError::Timeout)));
+    }
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, DialOutcome)>>>;
+
+    fn observer() -> (DialObserver, Seen) {
+        let seen = Seen::default();
+        let log = seen.clone();
+        (
+            std::sync::Arc::new(move |relay: &str, outcome| {
+                log.lock().unwrap().push((relay.to_owned(), outcome));
+            }),
+            seen,
+        )
+    }
+
+    /// A front with a key of its own: its address and the pin of that key.
+    async fn tls_front() -> (String, String) {
+        use sha2::Digest;
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let pin = hex::encode(sha2::Sha256::digest(cert.key_pair.public_key_der()));
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                if let Ok(mut tls) = acceptor.accept(tcp).await {
+                    let _ = tls.read(&mut [0u8; 64]).await;
+                }
+            }
+        });
+        (addr, pin)
+    }
+
+    async fn dial(relay: &str, pin: &str, on_dial: &DialObserver) -> Result<(), ObfuscatorError> {
+        dial_and_authenticate_within(
+            relay,
+            "localhost",
+            pin,
+            "",
+            &VeilFrontAuthV3::default(),
+            Duration::from_millis(500),
+            Some(on_dial),
+        )
+        .await
+        .map(drop)
+    }
+
+    /// The front answered under its key; that our own pass is missing is not its fault.
+    /// Mutation: tell the outcome after AUTH.
+    #[tokio::test]
+    async fn a_front_that_answers_is_up_even_when_our_pass_fails() {
+        let (relay, pin) = tls_front().await;
+        let (on_dial, seen) = observer();
+        assert!(dial(&relay, &pin, &on_dial).await.is_err());
+        assert_eq!(*seen.lock().unwrap(), [(relay, DialOutcome::Up)]);
+    }
+
+    #[tokio::test]
+    async fn another_key_is_told_apart_from_no_answer() {
+        let (relay, _) = tls_front().await;
+        let (on_dial, seen) = observer();
+        let result = dial(&relay, &"ab".repeat(32), &on_dial).await;
+        assert!(matches!(result, Err(ObfuscatorError::CertProblem(_))));
+        assert_eq!(*seen.lock().unwrap(), [(relay, DialOutcome::PinMismatch)]);
+    }
+
+    /// Refused, closed mid-handshake, silent: the three ways a front does not answer.
+    #[tokio::test]
+    async fn a_front_that_does_not_answer_has_failed_once_each_time() {
+        let (on_dial, seen) = observer();
+        let pin = "ab".repeat(32);
+        let refused = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closing = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (silent_addr, closing_addr) = (
+            silent.local_addr().unwrap().to_string(),
+            closing.local_addr().unwrap().to_string(),
+        );
+        tokio::spawn(async move { while closing.accept().await.is_ok() {} });
+        for relay in [&refused, &closing_addr, &silent_addr] {
+            assert!(dial(relay, &pin, &on_dial).await.is_err());
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                (refused, DialOutcome::Failed),
+                (closing_addr, DialOutcome::Failed),
+                (silent_addr, DialOutcome::Failed),
+            ]
+        );
+    }
+
+    /// Stopped before it ended, or never a dial: nothing is told of the front.
+    #[tokio::test]
+    async fn what_is_not_a_finished_dial_is_not_told() {
+        let (on_dial, seen) = observer();
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = silent.local_addr().unwrap().to_string();
+        let pin = "ab".repeat(32);
+        let stopped = tokio::time::timeout(Duration::from_millis(100), dial(&addr, &pin, &on_dial));
+        assert!(stopped.await.is_err(), "the dial ended on its own");
+        assert!(dial(&addr, "not a pin", &on_dial).await.is_err());
+        assert_eq!(*seen.lock().unwrap(), []);
     }
 
     /// Mutation: drop the `ensure_valid_now` calls — the expired capability is
@@ -787,6 +960,7 @@ mod tests {
                 }
             };
             let req = ProbeRequest {
+                on_dial: None,
                 relay_addr: relay.clone(),
                 tls_sni: sni,
                 spki_hex: spki,
@@ -798,7 +972,7 @@ mod tests {
                 let t0 = std::time::Instant::now();
                 let tls = dial_and_authenticate(
                     &req.relay_addr, &req.tls_sni, &req.spki_hex, &req.veil_front_ticket_b64,
-                    &req.auth_v3,
+                    &req.auth_v3, None,
                 ).await.expect("dial+auth");
                 let t_auth = t0.elapsed();
 

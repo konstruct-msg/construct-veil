@@ -698,7 +698,7 @@ mod key_exchange {
 /// resumed session names the client's previous connection to that relay operator — across
 /// an IP change, independently of AUTH (construct-docs
 /// decisions/veil-relay-sees-no-stable-device-id.md, todo 311). Every dial builds its own
-/// [`client_config`] (`dial_utls_tcp` → [`build_connector`]) and with it its own session
+/// [`client_config`] (`utls_connector` → [`build_connector`]) and with it its own session
 /// state; the default `Resumption` stays, because `Resumption::disabled()` drops the
 /// `session_ticket` extension from the ClientHello, which is a fingerprint.
 #[cfg(test)]
