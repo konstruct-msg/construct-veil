@@ -35,15 +35,18 @@ fn get_runtime() -> &'static Runtime {
     })
 }
 
-/// Run an exported function's body; a panic becomes `fallback` instead of
-/// unwinding into the host.
+/// Run an exported function's body; where panics unwind, one becomes `fallback` instead
+/// of reaching the host.
 ///
-/// An `extern "C"` function that panics aborts the process (edition 2024), so a
-/// panic anywhere under one of these calls — `block_on` from a tokio thread, a
-/// bug in the coordinator, an `expect` — used to kill the iOS/Android app. Every
-/// exported function now goes through here and returns its documented failure
-/// value. Panics inside spawned tasks are unaffected: tokio already contains them
-/// to the task.
+/// **Not in a shipped app.** construct-core builds the iOS and Android libraries with
+/// `panic = "abort"`, where nothing is caught: a panic here, or in a spawned task, ends the
+/// process. The owner kept it so on 2026-11-24 (todo 341): under `unwind` UniFFI would catch
+/// panics in the core too, and the core would go on with a half-advanced ratchet. So a path
+/// reachable from an exported function returns its error; it does not rely on this.
+///
+/// Where it does work (tests, debug builds, hosts that build with `unwind`), a panic under
+/// one of these calls, `block_on` from a tokio thread for one, returns the function's
+/// documented failure value, and tokio contains a panic in a spawned task to that task.
 fn ffi_guard<T>(fallback: T, body: impl FnOnce() -> T) -> T {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         Ok(v) => v,
@@ -506,6 +509,7 @@ mod tests {
     use super::*;
     use std::ffi::CString;
 
+    /// Holds where panics unwind, as in tests; a shipped app aborts (see `ffi_guard`).
     /// Mutation: call `body()` without `catch_unwind` — the panic escapes.
     #[test]
     fn a_panicking_body_returns_the_fallback() {
