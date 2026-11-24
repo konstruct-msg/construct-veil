@@ -22,7 +22,7 @@ WebTunnel were removed on 2026-10-22; do not bring them back without a new decis
 | Everything else | `~/Code/construct-docs` (vault; its own `AGENTS.md` is authoritative) · `security/` for VEIL |
 
 Layout: `src/ffi.rs` (C ABI: `veil_start`, `veil_front_ferry_fd`, …) · `src/veil/` (coordinator
-FSM, scoring, adapter) · `src/tls_pinned.rs` (SPKI-pinned rustls connector).
+FSM, adapter) · `src/tls_pinned.rs` (SPKI-pinned rustls connector).
 
 ## The Zen of Konstruct
 
@@ -53,7 +53,7 @@ Canonical source: `~/Code/construct-docs/decisions/rules-from-the-first-year.md`
    remove it, and gives the share of real traffic each new condition or exception affects.
    `~/Code/construct-docs/scripts/check_prior_art.py` refuses a decision note without the link.
 2. **The core decides.** Session and crypto decisions belong to `construct-core`; veil moves bytes
-   and decides only transport (which front, scoring, failover). It never touches ratchet or
+   and decides only transport (which front, failover). It never touches ratchet or
    session state.
 3. **Frames and handshakes name the state they mean** (AUTH version, ticket, capability). A fix
    that adds a timer or retry budget in place of an address is a signal to stop.

@@ -15,7 +15,7 @@
 //! ## Layout
 //!
 //! - [`veil`] (feature `coordinator`) — the FSM that chooses and probes a method,
-//!   per-network scoring, and the veil-front adapter (feature `utls`).
+//!   and the veil-front adapter (feature `utls`).
 //! - `ffi` (feature `ffi`) — the C ABI the iOS and Android apps call
 //!   (`veil_start`, `veil_front_ferry_fd`, …).
 //! - [`tls_fingerprint`] (feature `tls`) — browser-shaped ClientHello profiles.
@@ -37,8 +37,7 @@ pub(crate) mod tls_pinned;
 #[cfg(feature = "tls")]
 pub mod tls_fingerprint;
 
-/// VEIL Coordinator — FSM-based obfuscator selection with happy-eyeballs probing,
-/// per-network scoring, and persistent state.
+/// VEIL Coordinator — FSM-based obfuscator selection with happy-eyeballs probing.
 #[cfg(feature = "coordinator")]
 pub mod veil;
 

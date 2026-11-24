@@ -2,12 +2,8 @@
 #
 # Security policy for dependency auditing.
 #
-# NOTE on the ignores below: cargo-audit is NOT feature-aware — it scans
-# Cargo.lock literally, which pins every *optional* transitive dependency edge
-# even when no enabled feature ever compiles it. Advisories listed here are for
-# optional deps present in the lock but absent from our resolved build graph
-# (verified with `cargo tree`). Each ignore documents that verification and the
-# upstream condition under which it should be removed.
+# cargo-audit is not feature-aware: it scans Cargo.lock, optional dependencies included.
+# Each ignore says why it is safe and what removes it.
 #
 # Kept in sync with construct-core/.cargo/audit.toml — construct-veil is linked
 # into ConstructCore.xcframework, so an advisory dismissed here must be
@@ -15,27 +11,14 @@
 
 [advisories]
 ignore = [
-    # RUSTSEC-2023-0071: rsa 0.9.10 — Marvin timing sidechannel (MEDIUM, no fixed
-    # upgrade available). NOT COMPILED: rsa arrives only via `sqlx-mysql`, an
-    # optional sqlx driver. We enable sqlx with the sqlite driver only
-    # (`features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"]`,
-    # itself gated behind the optional `coordinator` feature); the mysql driver
-    # is never selected.
-    # Verified 2026-07-28: `cargo tree -i rsa --all-features --target all`
-    #   → "nothing to print" (no path even with every feature enabled).
-    # REMOVE THIS IGNORE when: sqlx stops pinning sqlx-mysql in the lock for a
-    # sqlite-only consumer (sqlx feature-resolution fix), or rsa ships a
-    # constant-time fix.
-    # Tracking: decisions/cargo-audit-not-compiled-advisories.md
-    #
-    # SECOND MATCH, COMPILED (2026-11-14, todo 311): rsa 0.10.0-rc.18 via
+    # RUSTSEC-2023-0071, COMPILED (2026-11-14, todo 311): rsa 0.10.0-rc.18 via
     # blind-rsa-signatures (AUTH v4 tokens, construct-veil-protocol `token`). The advisory
     # lists ">= 0.10.0" as patched, and a pre-release sorts below it. rc.18 already carries
     # the fix (read in its source): crypto-bigint constant-time arithmetic, RSA blinding of
     # the private-key operation and a check of its result (`rsa_decrypt_and_check`). And no
     # veil binary runs a private-key operation: relay and client only verify, blind and
     # finalize (public key); `EpochKey::blind_sign` runs on the issuer.
-    # REMOVE THIS PART when blind-rsa-signatures builds against rsa >= 0.10.0 and the pin
+    # REMOVE THIS IGNORE when blind-rsa-signatures builds against rsa >= 0.10.0 and the pin
     # in construct-veil-protocol/Cargo.toml goes.
     "RUSTSEC-2023-0071",
 ]

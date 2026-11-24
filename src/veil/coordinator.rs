@@ -2,7 +2,7 @@
 //! and manages the active proxy.
 //!
 //! This is the bridge between the pure FSM (`reduce()`) and real I/O:
-//! - Executes `VeilEffect`s (start probes, cancel, record scores, schedule cooldown)
+//! - Executes `VeilEffect`s (start probes, cancel, schedule cooldown)
 //! - Feeds `VeilEvent`s back to the FSM based on probe results
 //! - Manages the active proxy loop once a method wins the probe race
 
@@ -11,7 +11,7 @@
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 
 use tokio::{
@@ -19,14 +19,13 @@ use tokio::{
     sync::{Mutex, mpsc, oneshot},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::veil::fsm::{
-    MethodId, MethodSet, NetworkFingerprint, ProbeFailureReason, TransportFailureKind, VeilConfig,
-    VeilEffect, VeilEvent, VeilState, reduce,
+    MethodId, MethodSet, ProbeFailureReason, TransportFailureKind, VeilConfig, VeilEffect,
+    VeilEvent, VeilState, reduce,
 };
 use crate::veil::obfuscator::{Obfuscator, ObfuscatorError, ProbeRequest, VeilFrontAuthV3};
-use crate::veil::scoring::{CachedScoreLookup, PersistentScores};
 
 /// Result of a single probe attempt.
 struct ProbeResult {
@@ -85,18 +84,16 @@ impl ActiveSession {
 /// and runs the proxy loop for the winning method.
 pub struct VeilCoordinator {
     config: VeilConfig,
-    scores: Arc<PersistentScores>,
     obfuscators: HashMap<MethodId, Arc<dyn Obfuscator>>,
     active: Arc<Mutex<Option<ActiveSession>>>,
     next_session_id: std::sync::atomic::AtomicU64,
 }
 
 impl VeilCoordinator {
-    /// Create a new coordinator with the given config and scores store.
-    pub fn new(config: VeilConfig, scores: PersistentScores) -> Self {
+    /// Create a new coordinator with the given config.
+    pub fn new(config: VeilConfig) -> Self {
         Self {
             config,
-            scores: Arc::new(scores),
             obfuscators: HashMap::new(),
             active: Arc::new(Mutex::new(None)),
             next_session_id: std::sync::atomic::AtomicU64::new(0),
@@ -118,7 +115,6 @@ impl VeilCoordinator {
     pub async fn start_session_with_params(
         &self,
         relay: String,
-        fingerprint: NetworkFingerprint,
         allowed_methods: MethodSet,
         tls_sni: String,
         spki_hex: String,
@@ -168,29 +164,12 @@ impl VeilCoordinator {
         // when CooldownElapsed → Idle. Device heat log 2026-07-21: first start
         // 15:32→16:15 "session was stopped" after a suspended internal cooldown.
         loop {
-            // Build cached score lookup for this iteration.
-            // Scores are telemetry for ordering the probes; they never gate
-            // connectivity. An unreadable store (locked, full disk, corrupt file)
-            // means "probe without history", not "fail the start".
-            let scores_cache = match CachedScoreLookup::build(&self.scores, &fingerprint).await {
-                Ok(cache) => cache,
-                Err(e) => {
-                    warn!(
-                        target: "ice::coordinator",
-                        "scores unreadable, probing without history: {e}"
-                    );
-                    CachedScoreLookup::empty(&fingerprint)
-                }
-            };
-
             let now = Instant::now();
-            let now_sys = SystemTime::now();
 
             // Determine the next event based on current state.
             let event = match &state {
                 VeilState::Idle => VeilEvent::Start {
                     relay: relay.clone(),
-                    fingerprint: fingerprint.clone(),
                     allowed_methods,
                 },
                 // Unreachable for the one-shot path: we return on Cooldown below.
@@ -215,18 +194,15 @@ impl VeilCoordinator {
             };
 
             // Run the FSM reducer.
-            let (new_state, effects) =
-                reduce(state, event, &scores_cache, &self.config, now, now_sys);
+            let (new_state, effects) = reduce(state, event, &self.config, now);
             state = new_state;
 
             // Execute effects.
             for effect in &effects {
                 self.execute_effect_with_params(
                     effect,
-                    &fingerprint,
                     &relay,
                     &mut state,
-                    &scores_cache,
                     &tls_sni,
                     &spki_hex,
                     &veil_front_ticket_b64,
@@ -284,12 +260,10 @@ impl VeilCoordinator {
     pub async fn start_session(
         &self,
         relay: String,
-        fingerprint: NetworkFingerprint,
         allowed_methods: MethodSet,
     ) -> Result<CoordinatorStartResult, CoordinatorError> {
         self.start_session_with_params(
             relay,
-            fingerprint,
             allowed_methods,
             String::new(),
             String::new(),
@@ -304,10 +278,8 @@ impl VeilCoordinator {
     async fn execute_effect_with_params(
         &self,
         effect: &VeilEffect,
-        fingerprint: &NetworkFingerprint,
         relay: &str,
         state: &mut VeilState,
-        scores_cache: &CachedScoreLookup,
         tls_sni: &str,
         spki_hex: &str,
         veil_front_ticket_b64: &str,
@@ -326,10 +298,8 @@ impl VeilCoordinator {
                     // Single probe — sequential path (Phase 1, legacy).
                     self.run_sequential_probes(
                         methods,
-                        fingerprint,
                         relay,
                         state,
-                        scores_cache,
                         tls_sni,
                         spki_hex,
                         veil_front_ticket_b64,
@@ -340,10 +310,8 @@ impl VeilCoordinator {
                     // Multiple probes — parallel happy-eyeballs path (Phase 2).
                     self.run_parallel_probes(
                         methods,
-                        fingerprint,
                         relay,
                         state,
-                        scores_cache,
                         tls_sni,
                         spki_hex,
                         veil_front_ticket_b64,
@@ -376,22 +344,6 @@ impl VeilCoordinator {
                     duration.as_secs(),
                 );
             }
-
-            VeilEffect::RecordScore {
-                method,
-                fingerprint: fp,
-                outcome,
-            } => {
-                let fp_to_use = if fp.as_bytes().iter().all(|&b| b == 0) {
-                    fingerprint
-                } else {
-                    fp
-                };
-                self.scores
-                    .record(fp_to_use, *method, *outcome)
-                    .await
-                    .map_err(|e| CoordinatorError::Scoring(e.to_string()))?;
-            }
         }
 
         Ok(())
@@ -402,10 +354,8 @@ impl VeilCoordinator {
     async fn run_sequential_probes(
         &self,
         methods: &[MethodId],
-        fingerprint: &NetworkFingerprint,
         relay: &str,
         state: &mut VeilState,
-        scores_cache: &CachedScoreLookup,
         tls_sni: &str,
         spki_hex: &str,
         veil_front_ticket_b64: &str,
@@ -431,29 +381,20 @@ impl VeilCoordinator {
                     self.handle_probe_success(
                         method,
                         latency_ms,
-                        fingerprint,
                         relay,
                         tls_sni,
                         spki_hex,
                         veil_front_ticket_b64,
                         veil_front_auth_v3,
                         state,
-                        scores_cache,
                     )
                     .await?;
                     return Ok(());
                 }
                 Err(reason) => {
                     let latency_ms = probe_start.elapsed().as_millis() as u32;
-                    self.handle_probe_failure(
-                        method,
-                        reason,
-                        latency_ms,
-                        fingerprint,
-                        state,
-                        scores_cache,
-                    )
-                    .await;
+                    self.handle_probe_failure(method, reason, latency_ms, state)
+                        .await;
 
                     if matches!(*state, VeilState::Cooldown { .. } | VeilState::Idle) {
                         break;
@@ -462,7 +403,7 @@ impl VeilCoordinator {
             }
         }
 
-        self.handle_all_probes_failed(state, scores_cache);
+        self.handle_all_probes_failed(state);
         Ok(())
     }
 
@@ -474,10 +415,8 @@ impl VeilCoordinator {
     async fn run_parallel_probes(
         &self,
         methods: &[MethodId],
-        fingerprint: &NetworkFingerprint,
         relay: &str,
         state: &mut VeilState,
-        scores_cache: &CachedScoreLookup,
         tls_sni: &str,
         spki_hex: &str,
         veil_front_ticket_b64: &str,
@@ -614,12 +553,12 @@ impl VeilCoordinator {
 
         // Collect results: first success wins, track failures.
         let mut failures: Vec<(MethodId, ProbeFailureReason, u32)> = Vec::new();
-        let mut winner: Option<(MethodId, u32)> = None;
+        let mut winner: Option<MethodId> = None;
 
         while let Some(probe_result) = rx.recv().await {
             match probe_result.outcome {
                 ProbeOutcome::Success { latency_ms, .. } => {
-                    winner = Some((probe_result.method, latency_ms));
+                    winner = Some(probe_result.method);
                     info!(
                         target: "ice::fsm",
                         "probe succeeded  method={} latency_ms={}",
@@ -646,7 +585,7 @@ impl VeilCoordinator {
             cancel.cancel();
         }
 
-        if let Some((winning_method, latency_ms)) = winner {
+        if let Some(winning_method) = winner {
             // Bind local listener for the proxy.
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
@@ -655,45 +594,16 @@ impl VeilCoordinator {
 
             // Feed ProbeSucceeded into FSM.
             let now = Instant::now();
-            let now_sys = SystemTime::now();
-            let (new_state, effects) = reduce(
+            let (new_state, _) = reduce(
                 state.clone(),
                 VeilEvent::ProbeSucceeded {
                     method: winning_method,
                     port,
-                    latency_ms,
                 },
-                scores_cache,
                 &self.config,
                 now,
-                now_sys,
             );
             *state = new_state;
-
-            // Execute effects (RecordScore). A store that cannot be written is
-            // logged, not returned: the probe has already won.
-            for sub_effect in &effects {
-                if let VeilEffect::RecordScore {
-                    method: sm,
-                    outcome,
-                    ..
-                } = sub_effect
-                {
-                    self.record_score(fingerprint, *sm, *outcome).await;
-                }
-            }
-
-            // Record failures for other probes.
-            for (failed_method, reason, _latency_ms) in &failures {
-                let _ = self
-                    .scores
-                    .record(
-                        fingerprint,
-                        *failed_method,
-                        crate::veil::fsm::ScoreOutcome::Failure { reason: *reason },
-                    )
-                    .await;
-            }
 
             let proxy_params = ProxyParams {
                 method: winning_method,
@@ -708,38 +618,29 @@ impl VeilCoordinator {
             return Ok(());
         }
 
-        // All probes failed: feed each failure through the FSM and score it from
-        // the reducer's effects — the same path the sequential probes take.
+        // All probes failed: feed each failure through the FSM — the same path the
+        // sequential probes take.
         for (method, reason, latency_ms) in &failures {
-            self.handle_probe_failure(
-                *method,
-                *reason,
-                *latency_ms,
-                fingerprint,
-                state,
-                scores_cache,
-            )
-            .await;
+            self.handle_probe_failure(*method, *reason, *latency_ms, state)
+                .await;
         }
 
-        self.handle_all_probes_failed(state, scores_cache);
+        self.handle_all_probes_failed(state);
         Ok(())
     }
 
-    /// Handle a successful probe: transition FSM, record score, start proxy.
+    /// Handle a successful probe: transition FSM, start proxy.
     #[allow(clippy::too_many_arguments)]
     async fn handle_probe_success(
         &self,
         method: MethodId,
         latency_ms: u32,
-        fingerprint: &NetworkFingerprint,
         relay: &str,
         tls_sni: &str,
         spki_hex: &str,
         veil_front_ticket_b64: &str,
         veil_front_auth_v3: &VeilFrontAuthV3,
         state: &mut VeilState,
-        scores_cache: &CachedScoreLookup,
     ) -> Result<(), CoordinatorError> {
         // Bind a local listener for the proxy.
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -756,33 +657,13 @@ impl VeilCoordinator {
 
         // Feed ProbeSucceeded back into FSM.
         let now = Instant::now();
-        let now_sys = SystemTime::now();
-        let (new_state, effects) = reduce(
+        let (new_state, _) = reduce(
             state.clone(),
-            VeilEvent::ProbeSucceeded {
-                method,
-                port,
-                latency_ms,
-            },
-            scores_cache,
+            VeilEvent::ProbeSucceeded { method, port },
             &self.config,
             now,
-            now_sys,
         );
         *state = new_state;
-
-        // Execute the new effects. A store that cannot be written is logged, not
-        // returned: the probe has already won.
-        for sub_effect in &effects {
-            if let VeilEffect::RecordScore {
-                method: sm,
-                outcome,
-                ..
-            } = sub_effect
-            {
-                self.record_score(fingerprint, *sm, *outcome).await;
-            }
-        }
 
         let proxy_params = ProxyParams {
             method,
@@ -840,15 +721,13 @@ impl VeilCoordinator {
         });
     }
 
-    /// Handle a failed probe: transition FSM, record score.
+    /// Handle a failed probe: transition FSM.
     async fn handle_probe_failure(
         &self,
         method: MethodId,
         reason: ProbeFailureReason,
         latency_ms: u32,
-        fingerprint: &NetworkFingerprint,
         state: &mut VeilState,
-        scores_cache: &CachedScoreLookup,
     ) {
         info!(
             target: "ice::fsm",
@@ -860,67 +739,21 @@ impl VeilCoordinator {
 
         // Feed ProbeFailed back into FSM.
         let now = Instant::now();
-        let now_sys = SystemTime::now();
-        let (new_state, effects) = reduce(
+        let (new_state, _) = reduce(
             state.clone(),
-            VeilEvent::ProbeFailed { method, reason },
-            scores_cache,
+            VeilEvent::ProbeFailed { method },
             &self.config,
             now,
-            now_sys,
         );
         *state = new_state;
-
-        // Record score.
-        for sub_effect in &effects {
-            if let VeilEffect::RecordScore {
-                method: sm,
-                outcome,
-                ..
-            } = sub_effect
-            {
-                self.record_score(fingerprint, *sm, *outcome).await;
-            }
-        }
-    }
-
-    /// Write one outcome to the store; a failure is logged and otherwise
-    /// ignored, because scores never gate connectivity.
-    async fn record_score(
-        &self,
-        fingerprint: &NetworkFingerprint,
-        method: MethodId,
-        outcome: crate::veil::fsm::ScoreOutcome,
-    ) {
-        if let Err(e) = self.scores.record(fingerprint, method, outcome).await {
-            warn!(
-                target: "ice::coordinator",
-                "score not recorded  method={} outcome={:?}: {e}",
-                method.name(),
-                outcome,
-            );
-        }
-    }
-
-    /// The scores store, for tests that read back what a session recorded.
-    #[cfg(test)]
-    pub(crate) fn scores(&self) -> &PersistentScores {
-        &self.scores
     }
 
     /// Handle all probes failed: transition to Cooldown.
-    fn handle_all_probes_failed(&self, state: &mut VeilState, scores_cache: &CachedScoreLookup) {
+    fn handle_all_probes_failed(&self, state: &mut VeilState) {
         if matches!(state, VeilState::Probing { .. }) {
             let now = Instant::now();
-            let now_sys = SystemTime::now();
-            let (new_state, effects) = reduce(
-                state.clone(),
-                VeilEvent::AllProbesFailed,
-                scores_cache,
-                &self.config,
-                now,
-                now_sys,
-            );
+            let (new_state, effects) =
+                reduce(state.clone(), VeilEvent::AllProbesFailed, &self.config, now);
             *state = new_state;
             for effect in &effects {
                 if let VeilEffect::ScheduleCooldown { duration } = effect {
@@ -1109,8 +942,7 @@ fn classify_obfuscator_error(e: &ObfuscatorError) -> ProbeFailureReason {
         ObfuscatorError::ConnectionRefused => ProbeFailureReason::ConnectionFailed,
         ObfuscatorError::Handshake(_) => ProbeFailureReason::ConnectionFailed,
         // A TLS error that is neither alert 40 nor a certificate verdict (reset,
-        // EOF, another alert): a failed connection, not a DPI verdict — which the
-        // scorer would turn into a week-long block after five of them.
+        // EOF, another alert): a failed connection, not a DPI verdict.
         ObfuscatorError::Tls(_) => ProbeFailureReason::ConnectionFailed,
         ObfuscatorError::Io(_) => ProbeFailureReason::ConnectionFailed,
         ObfuscatorError::Unknown(_) => ProbeFailureReason::Unknown,
@@ -1122,9 +954,6 @@ fn classify_obfuscator_error(e: &ObfuscatorError) -> ProbeFailureReason {
 pub enum CoordinatorError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("scoring error: {0}")]
-    Scoring(String),
 
     #[error("session was stopped")]
     Stopped,
@@ -1171,20 +1000,13 @@ mod tests {
         }
     }
 
-    async fn coordinator(config: VeilConfig) -> VeilCoordinator {
-        VeilCoordinator::new(
-            config,
-            PersistentScores::open(":memory:", 50, None).await.unwrap(),
-        )
-    }
-
-    fn fingerprint() -> NetworkFingerprint {
-        NetworkFingerprint::new(vec![3; 32])
+    fn coordinator(config: VeilConfig) -> VeilCoordinator {
+        VeilCoordinator::new(config)
     }
 
     async fn start(coord: &VeilCoordinator) -> Result<CoordinatorStartResult, CoordinatorError> {
         coord
-            .start_session("relay:443".into(), fingerprint(), MethodSet::all())
+            .start_session("relay:443".into(), MethodSet::all())
             .await
     }
 
@@ -1192,86 +1014,46 @@ mod tests {
     /// the `NoMethods` returns — the parallel path panics.
     #[tokio::test]
     async fn no_registered_method_is_an_error_not_a_panic() {
-        let coord = coordinator(VeilConfig::default()).await;
+        let coord = coordinator(VeilConfig::default());
         assert!(matches!(
             start(&coord).await,
             Err(CoordinatorError::NoMethods)
         ));
     }
 
-    /// One candidate (the shipping veil-front-only build), one failure: it is
-    /// recorded. Mutation: the reducer's all-failed branch without `RecordScore`.
+    /// Every probe failing is `AllProbesFailed` on both paths, one candidate and a race.
+    /// Mutation: in either path, return `Ok(())` without `handle_all_probes_failed` and
+    /// without feeding the failures — the start does not end in `AllProbesFailed`.
     #[tokio::test]
-    async fn a_single_failing_probe_is_scored() {
-        let mut coord = coordinator(VeilConfig::legacy()).await;
-        coord.register(Box::new(Fake {
+    async fn failing_probes_end_in_all_probes_failed() {
+        let mut one = coordinator(VeilConfig::legacy());
+        one.register(Box::new(Fake {
             method: MethodId::VeilFront,
             ok: false,
         }));
         assert!(matches!(
-            start(&coord).await,
+            start(&one).await,
             Err(CoordinatorError::AllProbesFailed)
         ));
-        let entry = coord
-            .scores()
-            .get_score(&fingerprint(), MethodId::VeilFront)
-            .await
-            .unwrap()
-            .expect("the failure was not recorded");
-        assert_eq!((entry.failures, entry.consecutive_failures), (1, 1));
-    }
 
-    /// The parallel path scores the losers the same way. Mutation: skip the
-    /// `handle_probe_failure` loop after the race.
-    #[tokio::test]
-    async fn parallel_failures_are_scored() {
-        let mut coord = coordinator(VeilConfig {
+        let mut race = coordinator(VeilConfig {
             inter_probe_delay: Duration::from_millis(1),
             ..VeilConfig::default()
-        })
-        .await;
+        });
         for method in [MethodId::VeilFront, MethodId::Obfs4] {
-            coord.register(Box::new(Fake { method, ok: false }));
+            race.register(Box::new(Fake { method, ok: false }));
         }
         assert!(matches!(
-            start(&coord).await,
+            start(&race).await,
             Err(CoordinatorError::AllProbesFailed)
         ));
-        for method in [MethodId::VeilFront, MethodId::Obfs4] {
-            let entry = coord
-                .scores()
-                .get_score(&fingerprint(), method)
-                .await
-                .unwrap()
-                .unwrap_or_else(|| panic!("{} failure not recorded", method.name()));
-            assert_eq!(entry.failures, 1, "{}", method.name());
-        }
-    }
-
-    /// A store that cannot be read or written does not stop a reachable front
-    /// from being used. Mutation: restore the `?` on `CachedScoreLookup::build`.
-    #[tokio::test]
-    async fn an_unusable_scores_store_does_not_block_the_session() {
-        let mut coord = coordinator(VeilConfig::legacy()).await;
-        coord.register(Box::new(Fake {
-            method: MethodId::VeilFront,
-            ok: true,
-        }));
-        coord.scores().close().await;
-
-        let started = start(&coord)
-            .await
-            .expect("session must start without the scores store");
-        assert_ne!(started.port, 0);
-        assert_eq!(started.method, MethodId::VeilFront);
-        assert!(coord.stop().await);
     }
 
     /// A second session replacing the first stays alive after the first one's
     /// proxy task exits. Mutation: clear the slot unconditionally on exit.
     #[tokio::test]
     async fn a_replaced_session_does_not_wipe_its_successor() {
-        let mut coord = coordinator(VeilConfig::legacy()).await;
+        let mut coord = coordinator(VeilConfig::legacy());
         coord.register(Box::new(Fake {
             method: MethodId::VeilFront,
             ok: true,
